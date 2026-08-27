@@ -1,0 +1,181 @@
+<Window x:Class="MacroMaker.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Macro Maker"
+        Icon="/Assets/MacroMaker.ico"
+        Width="1420"
+        Height="880"
+        MinWidth="1080"
+        MinHeight="680"
+        Background="{DynamicResource BgBrush}"
+        Foreground="{DynamicResource TextBrush}"
+        FontFamily="Segoe UI"
+        WindowStartupLocation="CenterScreen"
+        Closing="Window_Closing">
+
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <!-- FILE BAR -->
+        <Border Grid.Row="0" Background="{DynamicResource TopBarBrush}" BorderBrush="{DynamicResource BorderBrushSoft}" BorderThickness="0,0,0,1" Padding="12,9">
+            <DockPanel LastChildFill="True">
+                <StackPanel DockPanel.Dock="Left" Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,18,0">
+                    <Border Width="32" Height="32" CornerRadius="8" Margin="0,0,9,0">
+                        <Image Source="/Assets/MacroMakerIcon.png" Stretch="Uniform"/>
+                    </Border>
+                    <TextBlock Text="MacroMaker" FontSize="16" FontWeight="SemiBold" VerticalAlignment="Center" Foreground="{DynamicResource TextBrush}"/>
+                </StackPanel>
+
+                <TextBlock x:Name="ProjectTitleText"
+                           DockPanel.Dock="Right"
+                           Text="Untitled Macro"
+                           Foreground="{DynamicResource MutedTextBrush}"
+                           VerticalAlignment="Center"
+                           Margin="20,0,4,0"/>
+
+                <StackPanel Orientation="Horizontal">
+                    <Button Content="New" Width="68" Click="NewProject_Click"/>
+                    <Button Content="Open" Width="68" Margin="7,0,0,0" Click="OpenProject_Click"/>
+                    <Button Content="Save" Width="68" Margin="7,0,0,0" Click="SaveProject_Click"/>
+                    <Button Content="Save As" Width="82" Margin="7,0,0,0" Click="SaveProjectAs_Click"/>
+                    <Button Content="Settings" Width="86" Margin="7,0,0,0" Click="SettingsButton_Click"/>
+                </StackPanel>
+            </DockPanel>
+        </Border>
+
+        <!-- SEQUENCE TABS -->
+        <Border Grid.Row="1" Background="{DynamicResource TopBarBrush}" BorderBrush="{DynamicResource BorderBrushSoft}" BorderThickness="0,0,0,1" Padding="12,10">
+            <DockPanel LastChildFill="True">
+                <StackPanel Orientation="Horizontal" DockPanel.Dock="Right" Margin="12,0,0,0">
+                    <Button x:Name="DeleteTabButton" Content="Delete Tab" Height="38" Click="DeleteTabButton_Click"/>
+                    <Button x:Name="AddTabButton"
+                            Content="+"
+                            Width="46"
+                            Height="38"
+                            FontSize="21"
+                            FontWeight="SemiBold"
+                            Padding="0"
+                            HorizontalContentAlignment="Center"
+                            VerticalContentAlignment="Center"
+                            Margin="8,0,0,0"
+                            Click="AddTabButton_Click"/>
+                </StackPanel>
+
+                <ScrollViewer HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Disabled">
+                    <StackPanel x:Name="TabPanel" Orientation="Horizontal"/>
+                </ScrollViewer>
+            </DockPanel>
+        </Border>
+
+        <!-- MAIN -->
+        <Grid Grid.Row="2" Margin="14">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" MinWidth="650"/>
+                <ColumnDefinition Width="14"/>
+                <ColumnDefinition Width="400" MinWidth="350"/>
+            </Grid.ColumnDefinitions>
+
+            <!-- COMMAND EDITOR -->
+            <Border Grid.Column="0" Style="{StaticResource CardBorderStyle}" Padding="15">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                        <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
+
+                    <DockPanel Grid.Row="0" Margin="0,0,0,12">
+                        <Border DockPanel.Dock="Left" Width="5" Height="24" CornerRadius="3" Background="{DynamicResource AccentBrush}" Margin="0,0,10,0"/>
+                        <TextBlock x:Name="SequenceTitleText" Text="Starting Sequence" FontSize="22" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                    </DockPanel>
+
+                    <!-- QUICK ADD replaces typed-command box -->
+                    <Border Grid.Row="1" Background="{DynamicResource TopBarBrush}" BorderBrush="{DynamicResource BorderBrushSoft}" BorderThickness="1" CornerRadius="10" Padding="10" Margin="0,0,0,12">
+                        <DockPanel LastChildFill="True">
+                            <TextBlock DockPanel.Dock="Left" Text="Quick add" Foreground="{DynamicResource MutedTextBrush}" FontWeight="SemiBold" VerticalAlignment="Center" Margin="2,0,12,0"/>
+                            <WrapPanel x:Name="QuickAddPanel"/>
+                        </DockPanel>
+                    </Border>
+
+                    <ListBox x:Name="CommandList"
+                             Grid.Row="2"
+                             Background="Transparent"
+                             BorderThickness="0"
+                             SelectionChanged="CommandList_SelectionChanged"
+                             MouseDoubleClick="CommandList_MouseDoubleClick">
+                        <ListBox.ItemTemplate>
+                            <DataTemplate>
+                                <TextBlock x:Name="RowText"
+                                           Text="{Binding Display}"
+                                           Margin="{Binding Indent}"
+                                           TextWrapping="Wrap"/>
+                                <DataTemplate.Triggers>
+                                    <DataTrigger Binding="{Binding IsHeader}" Value="True">
+                                        <Setter TargetName="RowText" Property="Foreground" Value="{DynamicResource AccentBrush}"/>
+                                        <Setter TargetName="RowText" Property="FontWeight" Value="SemiBold"/>
+                                    </DataTrigger>
+                                </DataTemplate.Triggers>
+                            </DataTemplate>
+                        </ListBox.ItemTemplate>
+                    </ListBox>
+
+                    <Border Grid.Row="3" Background="{DynamicResource TopBarBrush}" BorderBrush="{DynamicResource BorderBrushSoft}" BorderThickness="1" CornerRadius="10" Padding="9" Margin="0,12,0,0">
+                        <WrapPanel>
+                            <Button Style="{StaticResource AccentButtonStyle}" Content="+ Add Command" Width="128" Click="AddCommandButton_Click"/>
+                            <Button x:Name="AddBlockButton" Content="+ Add to Block" Width="122" Margin="7,0,0,0" Click="AddInsideButton_Click"/>
+                            <Button x:Name="AddElseButton" Content="+ Add Else" Width="100" Margin="7,0,0,0" Click="AddElseButton_Click"/>
+                            <Button Content="Duplicate" Width="92" Margin="7,0,0,0" Click="DuplicateCommandButton_Click"/>
+                            <Button Content="↑" Width="42" Margin="7,0,0,0" Click="MoveUpButton_Click"/>
+                            <Button Content="↓" Width="42" Margin="7,0,0,0" Click="MoveDownButton_Click"/>
+                            <Button Content="Delete" Width="78" Margin="7,0,0,0" Click="DeleteCommandButton_Click"/>
+                        </WrapPanel>
+                    </Border>
+                </Grid>
+            </Border>
+
+            <!-- PROPERTIES -->
+            <Border Grid.Column="2" Style="{StaticResource CardBorderStyle}" Padding="16">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                    </Grid.RowDefinitions>
+
+                    <StackPanel Grid.Row="0" Margin="0,0,0,13">
+                        <StackPanel Orientation="Horizontal">
+                            <Border Width="5" Height="22" CornerRadius="3" Background="{DynamicResource AccentBrush}" Margin="0,0,9,0"/>
+                            <TextBlock Text="Properties" FontSize="20" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                        </StackPanel>
+                        <TextBlock x:Name="PropertiesHintText" Text="Select a command to edit it." Foreground="{DynamicResource MutedTextBrush}" Margin="14,5,0,0"/>
+                    </StackPanel>
+
+                    <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                        <StackPanel x:Name="PropertiesPanel" Margin="0,0,4,0"/>
+                    </ScrollViewer>
+                </Grid>
+            </Border>
+        </Grid>
+
+        <!-- RUN BAR -->
+        <Border Grid.Row="3" Background="{DynamicResource TopBarBrush}" BorderBrush="{DynamicResource BorderBrushSoft}" BorderThickness="0,1,0,0" Padding="12,10">
+            <DockPanel>
+                <Border DockPanel.Dock="Right" Background="{DynamicResource TopBarBrush}" BorderBrush="{DynamicResource BorderBrushSoft}" BorderThickness="1" CornerRadius="8" Padding="11,7">
+                    <TextBlock x:Name="StatusText" Text="Ready" Foreground="{DynamicResource MutedTextBrush}" VerticalAlignment="Center" MinWidth="130" TextAlignment="Right"/>
+                </Border>
+
+                <StackPanel Orientation="Horizontal">
+                    <Button x:Name="RunStartButton" Style="{StaticResource AccentButtonStyle}" Content="▶ Run Start" Width="110" Click="RunStartButton_Click"/>
+                    <Button x:Name="RunCurrentButton" Content="▶ Run Current" Width="118" Margin="7,0,0,0" Click="RunCurrentButton_Click"/>
+                    <Button x:Name="PauseButton" Content="⏸ Pause" Width="96" Margin="7,0,0,0" Click="PauseButton_Click"/>
+                    <Button x:Name="StopButton" Content="■ Stop" Width="90" Margin="7,0,0,0" Click="StopButton_Click"/>
+                </StackPanel>
+            </DockPanel>
+        </Border>
+    </Grid>
+</Window>

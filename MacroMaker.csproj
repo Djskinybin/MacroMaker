@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+
+    <!-- App identity -->
+    <AssemblyName>MacroMaker</AssemblyName>
+    <RootNamespace>MacroMaker</RootNamespace>
+    <Title>Macro Maker</Title>
+    <Product>Macro Maker</Product>
+    <Description>Visual Windows macro recorder and automation builder.</Description>
+    <Company>MacroMaker</Company>
+    <Authors>MacroMaker</Authors>
+    <ApplicationIcon>Assets\MacroMaker.ico</ApplicationIcon>
+    <Version>1.0.0</Version>
+    <AssemblyVersion>1.0.0.0</AssemblyVersion>
+    <FileVersion>1.0.0.0</FileVersion>
+
+    <!-- Release publishing: normal users only need MacroMaker.exe -->
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <PublishTrimmed>false</PublishTrimmed>
+    <DebugType>None</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+  </PropertyGroup>
+  <ItemGroup>
+    <Resource Include="Assets\MacroMakerIcon.png" />
+    <Resource Include="Assets\MacroMaker.ico" />
+  </ItemGroup>
+</Project>
