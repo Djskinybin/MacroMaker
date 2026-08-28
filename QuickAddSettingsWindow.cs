@@ -16,6 +16,7 @@ public sealed class QuickAddSettingsWindow : Window
 
     public QuickAddSettingsWindow(IEnumerable<CommandType> current)
     {
+        WindowTheme.Attach(this);
         _selected = current.Where(CommandCatalog.CanQuickAdd).ToHashSet();
 
         Title = "Quick Add Editor";

@@ -10,7 +10,7 @@ OUTPUTS
 - dist\MacroMaker.exe
   Portable single-file app. Users do not need VS Code or a separate .NET runtime.
 
-- dist\MacroMaker-Portable-v1.0.0.zip
+- dist\MacroMaker-Portable-v1.1.1.zip
   Easy file to send/store as the portable version.
 
 - dist\MacroMaker-Setup.exe
@@ -42,3 +42,9 @@ The app is not digitally code-signed yet. Windows SmartScreen may warn on a
 copy downloaded from the internet, especially on another person's PC. A real
 code-signing certificate is the later step that removes the "Unknown publisher"
 part of the install experience.
+
+GitHub updater:
+- Repository: https://github.com/Djskinybin/MacroMaker
+- Releases should use tags like v1.0.1, v1.0.4, v1.1.1
+- Always attach dist\MacroMaker-Setup.exe with the exact asset name MacroMaker-Setup.exe
+- The built-in updater is included starting with app version 1.0.1.

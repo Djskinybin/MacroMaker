@@ -20,6 +20,7 @@ public sealed class CommandDefaultsWindow : Window
 
     public CommandDefaultsWindow(IEnumerable<CommandDefaultProfile> current)
     {
+        WindowTheme.Attach(this);
         _profiles = current.ToDictionary(x => x.Type, x => x.DeepClone());
         foreach (var option in CommandCatalog.AllOptions)
         {
@@ -333,8 +334,18 @@ public sealed class CommandDefaultsWindow : Window
                 break;
 
             case CommandType.WaitUntilKeyPressed:
+            case CommandType.WaitUntilKeyReleased:
                 AddText("Key", p.Key, v => p.Key = v);
                 AddPolling(p, true);
+                break;
+
+            case CommandType.IfKeyPressed:
+                AddText("Key", p.Key, v => p.Key = v);
+                break;
+
+            case CommandType.LoopWhileKeyPressed:
+                AddText("Key", p.Key, v => p.Key = v);
+                AddInt("Idle poll ms", p.PollMs, 10, 5000, v => p.PollMs = v);
                 break;
 
             case CommandType.Wait:
@@ -377,10 +388,17 @@ public sealed class CommandDefaultsWindow : Window
                 break;
 
             case CommandType.ClickColor:
+            case CommandType.FindColorToVariables:
                 AddText("Target color", p.ColorHex, v => p.ColorHex = NormalizeColor(v));
                 AddInt("Color tolerance (0-255)", p.ColorTolerance, 0, 255, v => p.ColorTolerance = v);
                 AddSearchAreaDefaults(p);
-                AddMouseMovement(p);
+                if (type == CommandType.ClickColor) AddMouseMovement(p);
+                else { AddText("Store X variable", p.StoreXVariable, v => p.StoreXVariable = v); AddText("Store Y variable", p.StoreYVariable, v => p.StoreYVariable = v); }
+                break;
+
+            case CommandType.SampleColorToVariable:
+                AddLocation(p);
+                AddText("Save color into variable", p.StoreTextVariable, v => p.StoreTextVariable = v);
                 break;
 
             case CommandType.IfImage:
@@ -405,11 +423,23 @@ public sealed class CommandDefaultsWindow : Window
                 break;
 
             case CommandType.LoopUntilImage:
+            case CommandType.LoopWhileImage:
                 AddImageDefaults(p);
                 AddInt("Idle poll ms (empty loop)", p.PollMs, 10, 5000, v => p.PollMs = v);
                 break;
 
+            case CommandType.FindImageToVariables:
+                AddImageDefaults(p);
+                AddText("Store X variable", p.StoreXVariable, v => p.StoreXVariable = v);
+                AddText("Store Y variable", p.StoreYVariable, v => p.StoreYVariable = v);
+                break;
+
+            case CommandType.IfWindow:
             case CommandType.FocusWindow:
+            case CommandType.MinimizeWindow:
+            case CommandType.MaximizeWindow:
+            case CommandType.RestoreWindow:
+            case CommandType.CloseWindow:
                 AddText("Window title contains", p.WindowTitle, v => p.WindowTitle = v);
                 break;
 
@@ -419,8 +449,62 @@ public sealed class CommandDefaultsWindow : Window
                 AddPolling(p, true);
                 break;
 
+            case CommandType.SetVariable:
+            case CommandType.AddVariable:
+                AddText("Variable name", p.VariableName, v => p.VariableName = v);
+                AddText(type == CommandType.SetVariable ? "Value" : "Amount / text to add", p.VariableValue, v => p.VariableValue = v);
+                break;
+
+            case CommandType.RandomNumber:
+                AddText("Variable name", p.VariableName, v => p.VariableName = v);
+                AddText("Minimum", p.VariableValue, v => p.VariableValue = v);
+                AddText("Maximum", p.VariableValue2, v => p.VariableValue2 = v);
+                break;
+
+            case CommandType.IfVariable:
+            case CommandType.WaitUntilVariable:
+            case CommandType.LoopWhileVariable:
+            case CommandType.LoopUntilVariable:
+                AddText("Variable name", p.VariableName, v => p.VariableName = v);
+                AddVariableCompare(p);
+                AddText("Compare to", p.VariableValue, v => p.VariableValue = v);
+                if (type == CommandType.WaitUntilVariable) AddPolling(p, true);
+                else if (type is CommandType.LoopWhileVariable or CommandType.LoopUntilVariable) AddInt("Idle poll ms", p.PollMs, 10, 5000, v => p.PollMs = v);
+                break;
+
+            case CommandType.SetClipboard:
+                AddText("Clipboard text", p.Text, v => p.Text = v, true);
+                break;
+
+            case CommandType.ClipboardToVariable:
+                AddText("Variable name", p.VariableName, v => p.VariableName = v);
+                break;
+
+            case CommandType.ReadTextFile:
+                AddText("File path", p.FilePath, v => p.FilePath = v);
+                AddText("Variable name", p.VariableName, v => p.VariableName = v);
+                break;
+
+            case CommandType.WriteTextFile:
+                AddText("File path", p.FilePath, v => p.FilePath = v);
+                AddText("Text", p.Text, v => p.Text = v, true);
+                var appendFile = new CheckBox { Content = "Append instead of replace", IsChecked = p.AppendFile, Margin = new Thickness(0,0,0,10) };
+                appendFile.Checked += (_, _) => p.AppendFile = true;
+                appendFile.Unchecked += (_, _) => p.AppendFile = false;
+                _propertiesPanel.Children.Add(appendFile);
+                break;
+
+            case CommandType.PromptText:
+            case CommandType.PromptYesNo:
+                AddText("Question", p.PromptText, v => p.PromptText = v, true);
+                AddText("Variable name", p.VariableName, v => p.VariableName = v);
+                if (type == CommandType.PromptText) AddText("Default answer", p.VariableValue, v => p.VariableValue = v);
+                break;
+
             case CommandType.RunProgram:
                 AddText("Program, file, folder, or URL", p.ProgramPath, v => p.ProgramPath = v);
+                AddText("Arguments (optional)", p.ProgramArguments, v => p.ProgramArguments = v);
+                AddText("Working directory (optional)", p.WorkingDirectory, v => p.WorkingDirectory = v);
                 break;
 
             case CommandType.LoopTimes:
@@ -430,6 +514,45 @@ public sealed class CommandDefaultsWindow : Window
             default:
                 AddNoDefaults(type);
                 break;
+        }
+
+        if (CommandCatalog.CanFail(type))
+            AddFailureDefaults(p);
+    }
+
+    private void AddVariableCompare(CommandDefaultProfile p)
+    {
+        AddLabel("Comparison");
+        var combo = new ComboBox { ItemsSource = Enum.GetValues<VariableCompareMode>(), SelectedItem = p.VariableCompareMode, Margin = new Thickness(0,0,0,10) };
+        combo.SelectionChanged += (_, _) => { if (combo.SelectedItem is VariableCompareMode mode) p.VariableCompareMode = mode; };
+        _propertiesPanel.Children.Add(combo);
+    }
+
+    private void AddCoordinateMode(CommandDefaultProfile p)
+    {
+        AddLabel("Coordinates relative to");
+        var combo = new ComboBox { ItemsSource = Enum.GetValues<CoordinateMode>(), SelectedItem = p.CoordinateMode, Margin = new Thickness(0,0,0,10) };
+        combo.SelectionChanged += (_, _) => { if (combo.SelectedItem is CoordinateMode mode) p.CoordinateMode = mode; };
+        _propertiesPanel.Children.Add(combo);
+    }
+
+    private void AddFailureDefaults(CommandDefaultProfile p)
+    {
+        AddLabel("If command fails / times out");
+        var combo = new ComboBox { ItemsSource = Enum.GetValues<FailureAction>(), SelectedItem = p.FailureAction, Margin = new Thickness(0,0,0,10) };
+        combo.SelectionChanged += (_, _) =>
+        {
+            if (combo.SelectedItem is FailureAction action && action != p.FailureAction)
+            {
+                p.FailureAction = action;
+                ShowCommand(_currentType);
+            }
+        };
+        _propertiesPanel.Children.Add(combo);
+        if (p.FailureAction == FailureAction.Retry)
+        {
+            AddInt("Retries", p.FailureRetryCount, 0, 100, v => p.FailureRetryCount = v);
+            AddInt("Retry delay (ms)", p.FailureRetryDelayMs, 0, 60000, v => p.FailureRetryDelayMs = v);
         }
     }
 
@@ -477,6 +600,15 @@ public sealed class CommandDefaultsWindow : Window
     private void AddImageDefaults(CommandDefaultProfile p)
     {
         AddInt("Image tolerance (0-255)", p.ImageTolerance, 0, 255, v => p.ImageTolerance = v);
+        var includeSubfolders = new CheckBox
+        {
+            Content = "Include images inside subfolders by default",
+            IsChecked = p.ImageIncludeSubfolders,
+            Margin = new Thickness(0, 0, 0, 10)
+        };
+        includeSubfolders.Checked += (_, _) => p.ImageIncludeSubfolders = true;
+        includeSubfolders.Unchecked += (_, _) => p.ImageIncludeSubfolders = false;
+        _propertiesPanel.Children.Add(includeSubfolders);
         AddSearchAreaDefaults(p);
     }
 
@@ -488,6 +620,7 @@ public sealed class CommandDefaultsWindow : Window
             ("Y", p.SearchY, -100000, 100000, v => p.SearchY = v),
             ("W", p.SearchWidth, 0, 100000, v => p.SearchWidth = v),
             ("H", p.SearchHeight, 0, 100000, v => p.SearchHeight = v));
+        AddCoordinateMode(p);
     }
 
     private void AddPolling(CommandDefaultProfile p, bool timeout)
@@ -514,6 +647,7 @@ public sealed class CommandDefaultsWindow : Window
         Grid.SetColumn(xl, 0); Grid.SetColumn(xb, 1); Grid.SetColumn(yl, 2); Grid.SetColumn(yb, 3);
         grid.Children.Add(xl); grid.Children.Add(xb); grid.Children.Add(yl); grid.Children.Add(yb);
         _propertiesPanel.Children.Add(grid);
+        AddCoordinateMode(p);
     }
 
     private void AddEndLocation(CommandDefaultProfile p)

@@ -26,6 +26,9 @@ public enum CommandType
     HoldKey,
     RepeatKey,
     WaitUntilKeyPressed,
+    WaitUntilKeyReleased,
+    IfKeyPressed,
+    LoopWhileKeyPressed,
 
     Wait,
     RandomWait,
@@ -37,6 +40,8 @@ public enum CommandType
     LoopWhileColor,
     LoopUntilColor,
     ClickColor,
+    FindColorToVariables,
+    SampleColorToVariable,
 
     IfImage,
     WaitUntilImage,
@@ -45,12 +50,35 @@ public enum CommandType
     DoubleClickImage,
     MoveToImage,
     LoopUntilImage,
+    LoopWhileImage,
+    FindImageToVariables,
 
+    IfWindow,
     FocusWindow,
     WaitForWindow,
     WaitForWindowGone,
+    MinimizeWindow,
+    MaximizeWindow,
+    RestoreWindow,
+    CloseWindow,
     RunProgram,
 
+    SetVariable,
+    AddVariable,
+    RandomNumber,
+    IfVariable,
+    WaitUntilVariable,
+    LoopWhileVariable,
+    LoopUntilVariable,
+
+    SetClipboard,
+    ClipboardToVariable,
+    ReadTextFile,
+    WriteTextFile,
+    PromptText,
+    PromptYesNo,
+
+    Group,
     RunSequence,
     LoopTimes,
     LoopForever,
@@ -65,11 +93,47 @@ public enum CompareMode
     NotEquals
 }
 
+public enum VariableCompareMode
+{
+    Equals,
+    NotEquals,
+    GreaterThan,
+    GreaterThanOrEqual,
+    LessThan,
+    LessThanOrEqual,
+    Contains,
+    StartsWith,
+    EndsWith
+}
+
 public enum MouseMoveMode
 {
     Legacy,
     Teleport,
     Smooth
+}
+
+public enum CoordinateMode
+{
+    Screen,
+    ActiveWindow,
+    RelativeToMouse
+}
+
+public enum FailureAction
+{
+    Continue,
+    StopMacro,
+    Retry,
+    RunSequence
+}
+
+public enum HudCorner
+{
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight
 }
 
 public sealed class RecorderSettings
@@ -79,11 +143,41 @@ public sealed class RecorderSettings
     public int MouseSampleMs { get; set; } = 45;
 }
 
+public sealed class ProjectVariable
+{
+    public string Name { get; set; } = "Variable";
+    public string Value { get; set; } = "0";
+    public string Description { get; set; } = string.Empty;
+    public bool UserEditable { get; set; } = true;
+
+    public ProjectVariable DeepClone() => new()
+    {
+        Name = Name,
+        Value = Value,
+        Description = Description,
+        UserEditable = UserEditable
+    };
+}
+
+public sealed class MacroRuntimeSettings
+{
+    public bool UseProjectRuntimeSettings { get; set; }
+    public string StartupSequence { get; set; } = "Starting Sequence";
+    public bool LockMouseMovementWhileRunning { get; set; }
+    public bool ShowRunStatusHud { get; set; } = true;
+    public int PlaybackSpeedPercent { get; set; } = 100;
+    public HudCorner HudCorner { get; set; } = HudCorner.TopLeft;
+    public int HudOpacityPercent { get; set; } = 92;
+    public bool PromptForVariablesOnRun { get; set; }
+}
+
 public sealed class MacroProject
 {
     public string Name { get; set; } = "Untitled Macro";
     public List<MacroSequence> Sequences { get; set; } = new();
     public RecorderSettings RecorderSettings { get; set; } = new();
+    public List<ProjectVariable> Variables { get; set; } = new();
+    public MacroRuntimeSettings RuntimeSettings { get; set; } = new();
 }
 
 public sealed class MacroSequence
@@ -105,6 +199,8 @@ public sealed class MacroCommand
 {
     public Guid Id { get; set; } = Guid.NewGuid();
     public CommandType Type { get; set; }
+    public bool Enabled { get; set; } = true;
+    public string CustomName { get; set; } = string.Empty;
 
     public string Text { get; set; } = string.Empty;
     public string Key { get; set; } = "E";
@@ -114,6 +210,11 @@ public sealed class MacroCommand
     public int Y { get; set; } = 300;
     public int EndX { get; set; } = 1100;
     public int EndY { get; set; } = 500;
+    public string XExpression { get; set; } = string.Empty;
+    public string YExpression { get; set; } = string.Empty;
+    public string EndXExpression { get; set; } = string.Empty;
+    public string EndYExpression { get; set; } = string.Empty;
+    public CoordinateMode CoordinateMode { get; set; } = CoordinateMode.Screen;
     public MouseMoveMode MouseMoveMode { get; set; } = MouseMoveMode.Legacy;
     public int MoveDurationMs { get; set; }
     public int ClickDelayMs { get; set; } = 100;
@@ -122,6 +223,7 @@ public sealed class MacroCommand
     public int HoldMs { get; set; } = 500;
 
     public int WaitMs { get; set; } = 500;
+    public string WaitExpression { get; set; } = string.Empty;
     public int MinWaitMs { get; set; } = 250;
     public int MaxWaitMs { get; set; } = 750;
 
@@ -138,8 +240,13 @@ public sealed class MacroCommand
     public CompareMode CompareMode { get; set; } = CompareMode.Equals;
 
     public string ImagePath { get; set; } = string.Empty;
+    public string ImageFolder { get; set; } = string.Empty;
+    public List<string> ImagePriority { get; set; } = new();
+    public bool ImageIncludeSubfolders { get; set; } = true;
     public string WindowTitle { get; set; } = string.Empty;
     public string ProgramPath { get; set; } = string.Empty;
+    public string ProgramArguments { get; set; } = string.Empty;
+    public string WorkingDirectory { get; set; } = string.Empty;
     public int ImageTolerance { get; set; } = 25;
     public int SearchX { get; set; }
     public int SearchY { get; set; }
@@ -149,22 +256,55 @@ public sealed class MacroCommand
     public int ImageOffsetY { get; set; }
 
     public int RepeatCount { get; set; } = 3;
+    public string RepeatExpression { get; set; } = string.Empty;
+
+    // Variables / data.
+    public string VariableName { get; set; } = "value";
+    public string VariableValue { get; set; } = "0";
+    public string VariableValue2 { get; set; } = "100";
+    public VariableCompareMode VariableCompareMode { get; set; } = VariableCompareMode.Equals;
+    public string StoreXVariable { get; set; } = "FoundX";
+    public string StoreYVariable { get; set; } = "FoundY";
+    public string StoreTextVariable { get; set; } = "Result";
+
+    // File / prompt behavior.
+    public string FilePath { get; set; } = string.Empty;
+    public bool AppendFile { get; set; }
+    public string PromptText { get; set; } = "Enter a value:";
+
+    // Failure / retry behavior for commands that can fail or time out.
+    public FailureAction FailureAction { get; set; } = FailureAction.Continue;
+    public int FailureRetryCount { get; set; } = 2;
+    public int FailureRetryDelayMs { get; set; } = 250;
+    public string FailureSequence { get; set; } = "Starting Sequence";
 
     public List<MacroCommand> Children { get; set; } = new();
     public List<MacroCommand> ElseChildren { get; set; } = new();
 
     [JsonIgnore]
     public bool HasBody => Type is CommandType.RecordedActions
+        or CommandType.IfKeyPressed
+        or CommandType.LoopWhileKeyPressed
         or CommandType.IfColor
         or CommandType.LoopWhileColor
         or CommandType.LoopUntilColor
         or CommandType.IfImage
         or CommandType.LoopUntilImage
+        or CommandType.LoopWhileImage
+        or CommandType.IfWindow
+        or CommandType.IfVariable
+        or CommandType.LoopWhileVariable
+        or CommandType.LoopUntilVariable
+        or CommandType.Group
         or CommandType.LoopTimes
         or CommandType.LoopForever;
 
     [JsonIgnore]
-    public bool HasElse => Type is CommandType.IfColor or CommandType.IfImage;
+    public bool HasElse => Type is CommandType.IfKeyPressed
+        or CommandType.IfColor
+        or CommandType.IfImage
+        or CommandType.IfWindow
+        or CommandType.IfVariable;
 
     public MacroCommand DeepClone()
     {
@@ -172,6 +312,8 @@ public sealed class MacroCommand
         {
             Id = Guid.NewGuid(),
             Type = Type,
+            Enabled = Enabled,
+            CustomName = CustomName,
             Text = Text,
             Key = Key,
             TargetSequence = TargetSequence,
@@ -179,6 +321,11 @@ public sealed class MacroCommand
             Y = Y,
             EndX = EndX,
             EndY = EndY,
+            XExpression = XExpression,
+            YExpression = YExpression,
+            EndXExpression = EndXExpression,
+            EndYExpression = EndYExpression,
+            CoordinateMode = CoordinateMode,
             MouseMoveMode = MouseMoveMode,
             MoveDurationMs = MoveDurationMs,
             ClickDelayMs = ClickDelayMs,
@@ -186,6 +333,7 @@ public sealed class MacroCommand
             DragDurationMs = DragDurationMs,
             HoldMs = HoldMs,
             WaitMs = WaitMs,
+            WaitExpression = WaitExpression,
             MinWaitMs = MinWaitMs,
             MaxWaitMs = MaxWaitMs,
             RecordingStopHotkey = RecordingStopHotkey,
@@ -197,8 +345,13 @@ public sealed class MacroCommand
             ColorTolerance = ColorTolerance,
             CompareMode = CompareMode,
             ImagePath = ImagePath,
+            ImageFolder = ImageFolder,
+            ImagePriority = ImagePriority.ToList(),
+            ImageIncludeSubfolders = ImageIncludeSubfolders,
             WindowTitle = WindowTitle,
             ProgramPath = ProgramPath,
+            ProgramArguments = ProgramArguments,
+            WorkingDirectory = WorkingDirectory,
             ImageTolerance = ImageTolerance,
             SearchX = SearchX,
             SearchY = SearchY,
@@ -207,6 +360,21 @@ public sealed class MacroCommand
             ImageOffsetX = ImageOffsetX,
             ImageOffsetY = ImageOffsetY,
             RepeatCount = RepeatCount,
+            RepeatExpression = RepeatExpression,
+            VariableName = VariableName,
+            VariableValue = VariableValue,
+            VariableValue2 = VariableValue2,
+            VariableCompareMode = VariableCompareMode,
+            StoreXVariable = StoreXVariable,
+            StoreYVariable = StoreYVariable,
+            StoreTextVariable = StoreTextVariable,
+            FilePath = FilePath,
+            AppendFile = AppendFile,
+            PromptText = PromptText,
+            FailureAction = FailureAction,
+            FailureRetryCount = FailureRetryCount,
+            FailureRetryDelayMs = FailureRetryDelayMs,
+            FailureSequence = FailureSequence,
             Children = Children.Select(c => c.DeepClone()).ToList(),
             ElseChildren = ElseChildren.Select(c => c.DeepClone()).ToList()
         };
@@ -214,17 +382,32 @@ public sealed class MacroCommand
 
     public string DisplayText()
     {
+        var body = BaseDisplayText();
+        if (!string.IsNullOrWhiteSpace(CustomName))
+            body = $"{CustomName}  —  {body}";
+        if (!Enabled)
+            body = $"[OFF] {body}";
+        return body;
+    }
+
+    private string BaseDisplayText()
+    {
+        var x = CoordinateDisplay(XExpression, X);
+        var y = CoordinateDisplay(YExpression, Y);
+        var ex = CoordinateDisplay(EndXExpression, EndX);
+        var ey = CoordinateDisplay(EndYExpression, EndY);
+
         return Type switch
         {
             CommandType.Comment => $"// {Text}",
             CommandType.MoveMouse => EffectiveMoveMode() == MouseMoveMode.Teleport
-                ? $"Move mouse to {X}, {Y} (teleport)"
-                : $"Move mouse to {X}, {Y} smoothly over {MoveDurationMs} ms",
-            CommandType.Click => $"Click {X}, {Y}" + MoveSuffix(),
-            CommandType.DoubleClick => $"Double click {X}, {Y}" + MoveSuffix(),
-            CommandType.RightClick => $"Right click {X}, {Y}" + MoveSuffix(),
-            CommandType.Scroll => $"Scroll {ScrollAmount} at {X}, {Y}" + MoveSuffix(),
-            CommandType.DragMouse => $"Drag {X}, {Y} → {EndX}, {EndY} over {DragDurationMs} ms",
+                ? $"Move mouse to {x}, {y} (teleport){CoordinateSuffix()}"
+                : $"Move mouse to {x}, {y} smoothly over {MoveDurationMs} ms{CoordinateSuffix()}",
+            CommandType.Click => $"Click {x}, {y}" + MoveSuffix() + CoordinateSuffix(),
+            CommandType.DoubleClick => $"Double click {x}, {y}" + MoveSuffix() + CoordinateSuffix(),
+            CommandType.RightClick => $"Right click {x}, {y}" + MoveSuffix() + CoordinateSuffix(),
+            CommandType.Scroll => $"Scroll {ScrollAmount} at {x}, {y}" + MoveSuffix() + CoordinateSuffix(),
+            CommandType.DragMouse => $"Drag {x}, {y} → {ex}, {ey} over {DragDurationMs} ms{CoordinateSuffix()}",
             CommandType.LeftMouseDown => "Left mouse down",
             CommandType.LeftMouseUp => "Left mouse up",
             CommandType.RightMouseDown => "Right mouse down",
@@ -234,16 +417,21 @@ public sealed class MacroCommand
             CommandType.KeyUp => $"Key up {Key}",
             CommandType.TypeText => $"Type \"{TrimForDisplay(Text, 48)}\"",
             CommandType.HoldKey => $"Hold {Key} for {HoldMs} ms",
-            CommandType.RepeatKey => $"Press {Key} × {RepeatCount} ({WaitMs} ms apart)",
+            CommandType.RepeatKey => $"Press {Key} × {RepeatDisplay()} ({WaitMs} ms apart)",
             CommandType.WaitUntilKeyPressed => $"Wait until {Key} is pressed",
-            CommandType.Wait => $"Wait {WaitMs} ms",
+            CommandType.WaitUntilKeyReleased => $"Wait until {Key} is released",
+            CommandType.IfKeyPressed => $"IF key {Key} is pressed",
+            CommandType.LoopWhileKeyPressed => $"Loop WHILE key {Key} is pressed",
+            CommandType.Wait => $"Wait {WaitDisplay()} ms",
             CommandType.RandomWait => $"Wait random {MinWaitMs}-{MaxWaitMs} ms",
-            CommandType.RecordedActions => $"Record / recorded actions ({Children.Count} commands, stop {RecordingStopHotkey})",
-            CommandType.IfColor => $"IF color at {X}, {Y} {CompareSymbol()} {ColorHex} ±{ColorTolerance}",
-            CommandType.WaitUntilColor => $"Wait until color at {X}, {Y} {CompareSymbol()} {ColorHex} ±{ColorTolerance}",
-            CommandType.LoopWhileColor => $"Loop WHILE color at {X}, {Y} {CompareSymbol()} {ColorHex} ±{ColorTolerance}",
-            CommandType.LoopUntilColor => $"Loop UNTIL color at {X}, {Y} {CompareSymbol()} {ColorHex} ±{ColorTolerance}",
+            CommandType.RecordedActions => $"Recorded actions ({Children.Count} commands, stop {RecordingStopHotkey})",
+            CommandType.IfColor => $"IF color at {x}, {y} {CompareSymbol()} {ColorHex} ±{ColorTolerance}{CoordinateSuffix()}",
+            CommandType.WaitUntilColor => $"Wait until color at {x}, {y} {CompareSymbol()} {ColorHex} ±{ColorTolerance}{CoordinateSuffix()}",
+            CommandType.LoopWhileColor => $"Loop WHILE color at {x}, {y} {CompareSymbol()} {ColorHex} ±{ColorTolerance}{CoordinateSuffix()}",
+            CommandType.LoopUntilColor => $"Loop UNTIL color at {x}, {y} {CompareSymbol()} {ColorHex} ±{ColorTolerance}{CoordinateSuffix()}",
             CommandType.ClickColor => $"Find + click color {ColorHex} ±{ColorTolerance}",
+            CommandType.FindColorToVariables => $"Find color {ColorHex} → {{{StoreXVariable}}}, {{{StoreYVariable}}}",
+            CommandType.SampleColorToVariable => $"Read color at {x}, {y} → {{{StoreTextVariable}}}{CoordinateSuffix()}",
             CommandType.IfImage => $"IF image found: {ImageName()}",
             CommandType.WaitUntilImage => $"Wait until image appears: {ImageName()}",
             CommandType.WaitUntilImageGone => $"Wait until image disappears: {ImageName()}",
@@ -251,12 +439,33 @@ public sealed class MacroCommand
             CommandType.DoubleClickImage => $"Find + double click image: {ImageName()}" + MoveSuffix(),
             CommandType.MoveToImage => $"Move to image: {ImageName()}" + MoveSuffix(),
             CommandType.LoopUntilImage => $"Loop UNTIL image found: {ImageName()}",
+            CommandType.LoopWhileImage => $"Loop WHILE image exists: {ImageName()}",
+            CommandType.FindImageToVariables => $"Find image {ImageName()} → {{{StoreXVariable}}}, {{{StoreYVariable}}}",
+            CommandType.IfWindow => $"IF window exists \"{TrimForDisplay(WindowTitle, 36)}\"",
             CommandType.FocusWindow => $"Focus window containing \"{TrimForDisplay(WindowTitle, 36)}\"",
             CommandType.WaitForWindow => $"Wait for window \"{TrimForDisplay(WindowTitle, 36)}\"",
             CommandType.WaitForWindowGone => $"Wait for window to close \"{TrimForDisplay(WindowTitle, 36)}\"",
+            CommandType.MinimizeWindow => $"Minimize window \"{TrimForDisplay(WindowTitle, 36)}\"",
+            CommandType.MaximizeWindow => $"Maximize window \"{TrimForDisplay(WindowTitle, 36)}\"",
+            CommandType.RestoreWindow => $"Restore window \"{TrimForDisplay(WindowTitle, 36)}\"",
+            CommandType.CloseWindow => $"Close window \"{TrimForDisplay(WindowTitle, 36)}\"",
             CommandType.RunProgram => $"Open \"{TrimForDisplay(ProgramPath, 42)}\"",
+            CommandType.SetVariable => $"Set {{{VariableName}}} = {TrimForDisplay(VariableValue, 40)}",
+            CommandType.AddVariable => $"Add {TrimForDisplay(VariableValue, 28)} to {{{VariableName}}}",
+            CommandType.RandomNumber => $"Random {{{VariableName}}} = {TrimForDisplay(VariableValue, 18)}..{TrimForDisplay(VariableValue2, 18)}",
+            CommandType.IfVariable => $"IF {{{VariableName}}} {VariableCompareSymbol()} {TrimForDisplay(VariableValue, 30)}",
+            CommandType.WaitUntilVariable => $"Wait until {{{VariableName}}} {VariableCompareSymbol()} {TrimForDisplay(VariableValue, 30)}",
+            CommandType.LoopWhileVariable => $"Loop WHILE {{{VariableName}}} {VariableCompareSymbol()} {TrimForDisplay(VariableValue, 30)}",
+            CommandType.LoopUntilVariable => $"Loop UNTIL {{{VariableName}}} {VariableCompareSymbol()} {TrimForDisplay(VariableValue, 30)}",
+            CommandType.SetClipboard => $"Set clipboard to \"{TrimForDisplay(Text, 38)}\"",
+            CommandType.ClipboardToVariable => $"Clipboard → {{{VariableName}}}",
+            CommandType.ReadTextFile => $"Read file → {{{VariableName}}}",
+            CommandType.WriteTextFile => $"{(AppendFile ? "Append" : "Write")} text file",
+            CommandType.PromptText => $"Ask user → {{{VariableName}}}",
+            CommandType.PromptYesNo => $"Ask Yes/No → {{{VariableName}}}",
+            CommandType.Group => string.IsNullOrWhiteSpace(CustomName) ? "Command group" : "Group",
             CommandType.RunSequence => $"Run \"{TargetSequence}\"",
-            CommandType.LoopTimes => $"Loop {RepeatCount} times",
+            CommandType.LoopTimes => $"Loop {RepeatDisplay()} times",
             CommandType.LoopForever => "Loop forever",
             CommandType.Break => "Break loop",
             CommandType.Return => "Return from sequence",
@@ -267,6 +476,20 @@ public sealed class MacroCommand
 
     private string CompareSymbol() => CompareMode == CompareMode.Equals ? "==" : "!=";
 
+    private string VariableCompareSymbol() => VariableCompareMode switch
+    {
+        VariableCompareMode.Equals => "==",
+        VariableCompareMode.NotEquals => "!=",
+        VariableCompareMode.GreaterThan => ">",
+        VariableCompareMode.GreaterThanOrEqual => ">=",
+        VariableCompareMode.LessThan => "<",
+        VariableCompareMode.LessThanOrEqual => "<=",
+        VariableCompareMode.Contains => "contains",
+        VariableCompareMode.StartsWith => "starts with",
+        VariableCompareMode.EndsWith => "ends with",
+        _ => "=="
+    };
+
     private MouseMoveMode EffectiveMoveMode() => MouseMoveMode == MouseMoveMode.Legacy
         ? (MoveDurationMs > 0 ? MouseMoveMode.Smooth : MouseMoveMode.Teleport)
         : MouseMoveMode;
@@ -275,8 +498,32 @@ public sealed class MacroCommand
         ? $" (smooth {MoveDurationMs} ms)"
         : " (teleport)";
 
+    private string CoordinateSuffix() => CoordinateMode switch
+    {
+        CoordinateMode.ActiveWindow => " [window]",
+        CoordinateMode.RelativeToMouse => " [relative]",
+        _ => string.Empty
+    };
+
+    private string RepeatDisplay() => string.IsNullOrWhiteSpace(RepeatExpression) ? RepeatCount.ToString() : RepeatExpression;
+    private string WaitDisplay() => string.IsNullOrWhiteSpace(WaitExpression) ? WaitMs.ToString() : WaitExpression;
+    private static string CoordinateDisplay(string expression, int fallback) => string.IsNullOrWhiteSpace(expression) ? fallback.ToString() : expression;
+
     private string ImageName()
     {
+        if (!string.IsNullOrWhiteSpace(ImageFolder))
+        {
+            try
+            {
+                var folderName = Path.GetFileName(ImageFolder.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+                return $"folder: {folderName} ({ImagePriority.Count} priority images)";
+            }
+            catch
+            {
+                return $"folder: {ImageFolder}";
+            }
+        }
+
         if (string.IsNullOrWhiteSpace(ImagePath))
             return "<not selected>";
 
@@ -317,7 +564,15 @@ public sealed class CommandRow
     public bool IsHeader { get; init; }
     public CommandBranch Branch { get; init; }
 
-    public string Display => IsHeader ? Label : Command?.DisplayText() ?? string.Empty;
+    public string Display => IsHeader
+        ? Label switch
+        {
+            "THEN" => "THEN  —  run these when true",
+            "ELSE" => "ELSE  —  otherwise run these",
+            "DO" => "LOOP BODY  —  repeat these commands",
+            _ => Label
+        }
+        : Command?.DisplayText() ?? string.Empty;
     public Thickness Indent => new(Math.Max(0, Depth) * 22, 0, 0, 0);
 }
 
@@ -328,6 +583,35 @@ public readonly record struct ScreenRegion(int X, int Y, int Width, int Height)
 
 public readonly record struct ImageMatch(int X, int Y, int Width, int Height)
 {
+    public string SourcePath { get; init; } = string.Empty;
     public int CenterX => X + Width / 2;
     public int CenterY => Y + Height / 2;
+}
+
+internal static class ProjectPaths
+{
+    public static string? CurrentFolder { get; set; }
+
+    public static string Resolve(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+            return string.Empty;
+        if (Path.IsPathRooted(path) || string.IsNullOrWhiteSpace(CurrentFolder))
+            return path;
+        return Path.GetFullPath(Path.Combine(CurrentFolder, path));
+    }
+
+    public static string MakeRelative(string path)
+    {
+        if (string.IsNullOrWhiteSpace(CurrentFolder))
+            return path;
+        try
+        {
+            return Path.GetRelativePath(CurrentFolder, path);
+        }
+        catch
+        {
+            return path;
+        }
+    }
 }

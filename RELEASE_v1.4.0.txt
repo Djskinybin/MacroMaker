@@ -1,0 +1,9 @@
+MacroMaker v1.4.0 — Polish & Reliability
+
+- Undo / Redo for macro editing (Ctrl+Z / Ctrl+Y)
+- Auto-save for saved project folders
+- Test Selected command without running the whole macro
+- Check Macro validator for missing images, broken sequence links, invalid colors, empty blocks, and hotkey conflicts
+- Simple command picker by default; advanced low-level input commands can be enabled in Settings
+- Run Start, Run Current, and Test Selected all hide MacroMaker while automation runs
+- Existing live HUD, configurable hotkeys, mouse lock, nested image library, priorities, and project folders retained

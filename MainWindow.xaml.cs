@@ -15,6 +15,9 @@ namespace MacroMaker;
 
 public partial class MainWindow : Window
 {
+    private const string ProjectFileName = "macro.json";
+    private static readonly string RecoveryFilePath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "MacroMaker", "Recovery", "unsaved-recovery.json");
     private MacroProject _project = new();
     private MacroSequence? _currentSequence;
     private CommandRow? _selectedRow;
@@ -27,9 +30,23 @@ public partial class MainWindow : Window
 
     private IntPtr _keyboardHook;
     private NativeMethods.LowLevelKeyboardProc? _keyboardProc;
+    private readonly HashSet<uint> _hookKeysDown = new();
+
+    private IntPtr _mouseLockHook;
+    private NativeMethods.LowLevelMouseProc? _mouseLockProc;
+    private RunStatusWindow? _runStatusWindow;
+
     private readonly DispatcherTimer _foregroundTimer = new() { Interval = TimeSpan.FromMilliseconds(150) };
     private IntPtr _mainWindowHandle;
     private IntPtr _lastExternalForeground;
+    private bool _startupUpdateCheckStarted;
+    private bool _skipSavePromptForUpdate;
+
+    private readonly Stack<string> _undoHistory = new();
+    private readonly Stack<string> _redoHistory = new();
+    private string _historySnapshot = string.Empty;
+    private bool _historySuspended;
+    private readonly DispatcherTimer _autoSaveTimer = new() { Interval = TimeSpan.FromMilliseconds(1400) };
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -43,17 +60,35 @@ public partial class MainWindow : Window
         _appSettings = AppSettingsStore.Load();
         ThemeManager.Apply(_appSettings.Theme);
         InitializeComponent();
+        WindowTheme.Attach(this);
         NewProjectCore();
         RefreshQuickAdd();
         Loaded += MainWindow_Loaded;
+        ContentRendered += MainWindow_ContentRendered;
+        PreviewKeyDown += MainWindow_PreviewKeyDown;
+        _autoSaveTimer.Tick += AutoSaveTimer_Tick;
     }
 
     private void MainWindow_Loaded(object sender, RoutedEventArgs e)
     {
+        TryOfferUnsavedRecovery();
         InstallKeyboardHook();
         _mainWindowHandle = new WindowInteropHelper(this).Handle;
         _foregroundTimer.Tick += (_, _) => TrackExternalForegroundWindow();
         _foregroundTimer.Start();
+    }
+
+    private async void MainWindow_ContentRendered(object? sender, EventArgs e)
+    {
+        if (_startupUpdateCheckStarted || !_appSettings.CheckForUpdatesOnStartup)
+            return;
+
+        _startupUpdateCheckStarted = true;
+
+        // Give the main window a moment to finish appearing, then silently check GitHub.
+        // If a newer release exists, UpdateService shows the Update Now / Later prompt.
+        await Task.Delay(800);
+        await UpdateService.CheckAndPromptAsync(this, false);
     }
 
     private void TrackExternalForegroundWindow()
@@ -84,6 +119,7 @@ public partial class MainWindow : Window
         if (!ConfirmDiscardChanges())
             return;
 
+        DeleteUnsavedRecovery();
         NewProjectCore();
     }
 
@@ -99,6 +135,7 @@ public partial class MainWindow : Window
         };
 
         _projectPath = null;
+        ProjectPaths.CurrentFolder = null;
         _dirty = false;
         _sequenceCounter = 1;
         RebuildEngine();
@@ -106,6 +143,7 @@ public partial class MainWindow : Window
         RefreshTabs();
         UpdateProjectTitle();
         StatusText.Text = "Ready";
+        ResetHistory();
     }
 
     private void OpenProject_Click(object sender, RoutedEventArgs e)
@@ -113,10 +151,10 @@ public partial class MainWindow : Window
         if (!ConfirmDiscardChanges())
             return;
 
-        var dialog = new OpenFileDialog
+        var dialog = new OpenFolderDialog
         {
-            Title = "Open Macro Maker Project",
-            Filter = "Macro Maker project (*.macro.json)|*.macro.json|JSON (*.json)|*.json|All files (*.*)|*.*"
+            Title = "Open Macro Maker Project Folder",
+            Multiselect = false
         };
 
         if (dialog.ShowDialog(this) != true)
@@ -124,17 +162,28 @@ public partial class MainWindow : Window
 
         try
         {
-            var json = File.ReadAllText(dialog.FileName);
+            var folder = dialog.FolderName;
+            var projectFile = FindProjectFile(folder);
+            if (projectFile is null)
+                throw new FileNotFoundException(
+                    $"That folder is not a MacroMaker project. Expected '{ProjectFileName}' inside it.\n\n" +
+                    "Tip: for an older .macro.json save, put that file inside its own folder and open the folder.");
+
+            var json = File.ReadAllText(projectFile);
             var project = JsonSerializer.Deserialize<MacroProject>(json, JsonOptions)
                           ?? throw new InvalidOperationException("The project file was empty.");
 
             project.Sequences ??= new List<MacroSequence>();
             project.RecorderSettings ??= new RecorderSettings();
+            project.Variables ??= new List<ProjectVariable>();
+            project.RuntimeSettings ??= new MacroRuntimeSettings();
+            project.RuntimeSettings.PlaybackSpeedPercent = Math.Clamp(project.RuntimeSettings.PlaybackSpeedPercent, 10, 400);
+            project.RuntimeSettings.HudOpacityPercent = Math.Clamp(project.RuntimeSettings.HudOpacityPercent, 35, 100);
             if (project.Sequences.Count == 0)
                 project.Sequences.Add(new MacroSequence("Starting Sequence"));
 
-            var starting = project.Sequences.FirstOrDefault(s =>
-                s.Name.Equals("Starting Sequence", StringComparison.OrdinalIgnoreCase));
+            var starting = project.Sequences.FirstOrDefault(sequence =>
+                sequence.Name.Equals("Starting Sequence", StringComparison.OrdinalIgnoreCase));
             if (starting is null)
                 project.Sequences.Insert(0, new MacroSequence("Starting Sequence"));
 
@@ -145,18 +194,36 @@ public partial class MainWindow : Window
             }
 
             _project = project;
-            _projectPath = dialog.FileName;
+            _projectPath = folder;
+            ProjectPaths.CurrentFolder = folder;
+            Directory.CreateDirectory(Path.Combine(folder, "Images"));
             _dirty = false;
+            DeleteUnsavedRecovery();
             RebuildEngine();
-            SelectSequence(_project.Sequences.First(s => s.Name.Equals("Starting Sequence", StringComparison.OrdinalIgnoreCase)));
+            SelectSequence(_project.Sequences.First(sequence =>
+                sequence.Name.Equals("Starting Sequence", StringComparison.OrdinalIgnoreCase)));
             RefreshTabs();
-                UpdateProjectTitle();
-            StatusText.Text = "Project loaded";
+            UpdateProjectTitle();
+            StatusText.Text = $"Project loaded: {Path.GetFileName(folder)}";
+            ResetHistory();
         }
         catch (Exception ex)
         {
             MessageBox.Show(this, ex.Message, "Could not open project", MessageBoxButton.OK, MessageBoxImage.Error);
         }
+    }
+
+    private static string? FindProjectFile(string folder)
+    {
+        var standard = Path.Combine(folder, ProjectFileName);
+        if (File.Exists(standard))
+            return standard;
+
+        // Backward compatibility: an old standalone .macro.json can be placed
+        // inside a folder and that folder can then be opened as a project.
+        return Directory.EnumerateFiles(folder, "*.macro.json", SearchOption.TopDirectoryOnly)
+            .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+            .FirstOrDefault();
     }
 
     private static void RepairCommandLists(List<MacroCommand> commands)
@@ -167,7 +234,14 @@ public partial class MainWindow : Window
             if (command.MouseMoveMode == MouseMoveMode.Legacy)
                 command.MouseMoveMode = command.MoveDurationMs > 0 ? MouseMoveMode.Smooth : MouseMoveMode.Teleport;
 
+            command.ImagePriority ??= new List<string>();
             command.Children ??= new List<MacroCommand>();
+            command.ElseChildren ??= new List<MacroCommand>();
+            if (string.IsNullOrWhiteSpace(command.StoreXVariable)) command.StoreXVariable = "FoundX";
+            if (string.IsNullOrWhiteSpace(command.StoreYVariable)) command.StoreYVariable = "FoundY";
+            if (string.IsNullOrWhiteSpace(command.VariableName)) command.VariableName = "value";
+            command.FailureRetryCount = Math.Clamp(command.FailureRetryCount, 0, 100);
+            command.FailureRetryDelayMs = Math.Clamp(command.FailureRetryDelayMs, 0, 60000);
             command.ElseChildren ??= new List<MacroCommand>();
             RepairCommandLists(command.Children);
             RepairCommandLists(command.ElseChildren);
@@ -184,39 +258,253 @@ public partial class MainWindow : Window
         SaveProject(true);
     }
 
-    private bool SaveProject(bool forceDialog)
+    private bool SaveProject(bool forceDialog, Window? dialogOwner = null)
     {
+        var owner = dialogOwner ?? this;
+        var previousProjectPath = _projectPath;
+
         if (forceDialog || string.IsNullOrWhiteSpace(_projectPath))
         {
-            var dialog = new SaveFileDialog
-            {
-                Title = "Save Macro Maker Project",
-                Filter = "Macro Maker project (*.macro.json)|*.macro.json|JSON (*.json)|*.json",
-                FileName = string.IsNullOrWhiteSpace(_project.Name) ? "MyMacro.macro.json" : SanitizeFileName(_project.Name) + ".macro.json"
-            };
-
-            if (dialog.ShowDialog(this) != true)
+            var defaultName = _project.Name == "Untitled Macro" ? "My Macro" : _project.Name;
+            var namePrompt = new TextPromptWindow("Save Macro As", "Macro name:", defaultName) { Owner = owner };
+            if (namePrompt.ShowDialog() != true)
                 return false;
 
-            _projectPath = dialog.FileName;
-            if (_project.Name == "Untitled Macro")
-                _project.Name = Path.GetFileName(dialog.FileName).Replace(".macro.json", "", StringComparison.OrdinalIgnoreCase);
+            var displayName = namePrompt.Value.Trim();
+            if (string.IsNullOrWhiteSpace(displayName))
+                displayName = "My Macro";
+            var folderName = SanitizeFileName(displayName);
+
+            var dialog = new OpenFolderDialog
+            {
+                Title = $"Choose where to save '{folderName}'",
+                Multiselect = false
+            };
+
+            if (dialog.ShowDialog(owner) != true)
+                return false;
+
+            var targetFolder = Path.Combine(dialog.FolderName, folderName);
+            var existingProject = Path.Combine(targetFolder, ProjectFileName);
+            if (File.Exists(existingProject) &&
+                MessageBox.Show(owner,
+                    $"A MacroMaker project named '{folderName}' already exists there. Replace its macro.json?\n\nImages already in that project will be kept.",
+                    "Existing Project", MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes)
+                return false;
+
+            _projectPath = targetFolder;
+            _project.Name = displayName;
+            Directory.CreateDirectory(_projectPath);
+            Directory.CreateDirectory(Path.Combine(_projectPath, "Images"));
+
+            // Save As copies the project's image library with it, so all
+            // relative image/folder references continue to work in the new folder.
+            if (!string.IsNullOrWhiteSpace(previousProjectPath) &&
+                !Path.GetFullPath(previousProjectPath).Equals(Path.GetFullPath(_projectPath), StringComparison.OrdinalIgnoreCase))
+            {
+                var previousImages = Path.Combine(previousProjectPath, "Images");
+                if (Directory.Exists(previousImages))
+                    CopyImageFolderRecursive(previousImages, Path.Combine(_projectPath, "Images"));
+            }
+
+            ProjectPaths.CurrentFolder = _projectPath;
         }
 
         try
         {
+            Directory.CreateDirectory(_projectPath!);
+            Directory.CreateDirectory(Path.Combine(_projectPath!, "Images"));
+            ProjectPaths.CurrentFolder = _projectPath;
+
             var json = JsonSerializer.Serialize(_project, JsonOptions);
-            File.WriteAllText(_projectPath!, json);
+            File.WriteAllText(Path.Combine(_projectPath!, ProjectFileName), json);
             _dirty = false;
+            DeleteUnsavedRecovery();
             UpdateProjectTitle();
-            StatusText.Text = "Saved";
+            StatusText.Text = $"Saved: {Path.GetFileName(_projectPath)}";
             return true;
         }
         catch (Exception ex)
         {
-            MessageBox.Show(this, ex.Message, "Could not save project", MessageBoxButton.OK, MessageBoxImage.Error);
+            MessageBox.Show(owner, ex.Message, "Could not save project", MessageBoxButton.OK, MessageBoxImage.Error);
             return false;
         }
+    }
+
+    private bool EnsureProjectFolder()
+    {
+        if (!string.IsNullOrWhiteSpace(_projectPath))
+            return true;
+
+        MessageBox.Show(this,
+            "Save this macro as a project folder first. MacroMaker keeps images inside the project so it can be moved or shared without broken paths.",
+            "Save Project Folder", MessageBoxButton.OK, MessageBoxImage.Information);
+        return SaveProject(true);
+    }
+
+    private string ProjectImagesFolder()
+    {
+        if (string.IsNullOrWhiteSpace(_projectPath))
+            throw new InvalidOperationException("Save the project folder first.");
+        var folder = Path.Combine(_projectPath, "Images");
+        Directory.CreateDirectory(folder);
+        return folder;
+    }
+
+    private static bool IsInsideFolder(string path, string folder)
+    {
+        try
+        {
+            var root = Path.GetFullPath(folder).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+            var full = Path.GetFullPath(path);
+            return full.StartsWith(root, StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private string ImportImageFile(string sourcePath)
+    {
+        var images = ProjectImagesFolder();
+        if (IsInsideFolder(sourcePath, images))
+            return ProjectPaths.MakeRelative(sourcePath);
+
+        var baseName = Path.GetFileNameWithoutExtension(sourcePath);
+        var ext = Path.GetExtension(sourcePath);
+        var destination = Path.Combine(images, baseName + ext);
+        var suffix = 2;
+        while (File.Exists(destination) && !FilesAreSame(sourcePath, destination))
+            destination = Path.Combine(images, $"{baseName}_{suffix++}{ext}");
+
+        if (!File.Exists(destination))
+            File.Copy(sourcePath, destination);
+        return ProjectPaths.MakeRelative(destination);
+    }
+
+    private string ImportImageFolder(string sourceFolder)
+    {
+        var imagesRoot = ProjectImagesFolder();
+        if (IsInsideFolder(sourceFolder, imagesRoot))
+            return ProjectPaths.MakeRelative(sourceFolder);
+
+        var folderName = SanitizeFileName(Path.GetFileName(sourceFolder.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)));
+        var destination = Path.Combine(imagesRoot, folderName);
+        var suffix = 2;
+        while (Directory.Exists(destination))
+            destination = Path.Combine(imagesRoot, $"{folderName}_{suffix++}");
+
+        CopyImageFolderRecursive(sourceFolder, destination);
+        return ProjectPaths.MakeRelative(destination);
+    }
+
+    private static void CopyImageFolderRecursive(string sourceFolder, string destinationFolder)
+    {
+        Directory.CreateDirectory(destinationFolder);
+
+        foreach (var source in Directory.EnumerateFiles(sourceFolder, "*.*", SearchOption.TopDirectoryOnly).Where(IsImageFile))
+            File.Copy(source, Path.Combine(destinationFolder, Path.GetFileName(source)), overwrite: true);
+
+        foreach (var sourceSubfolder in Directory.EnumerateDirectories(sourceFolder, "*", SearchOption.TopDirectoryOnly))
+        {
+            var destinationSubfolder = Path.Combine(destinationFolder, Path.GetFileName(sourceSubfolder));
+            CopyImageFolderRecursive(sourceSubfolder, destinationSubfolder);
+
+            // Do not leave empty directories behind if a source subfolder had no supported images.
+            if (Directory.Exists(destinationSubfolder) && !Directory.EnumerateFileSystemEntries(destinationSubfolder).Any())
+                Directory.Delete(destinationSubfolder);
+        }
+    }
+
+    private static bool IsImageFile(string path)
+        => new[] { ".png", ".jpg", ".jpeg", ".bmp" }.Contains(Path.GetExtension(path), StringComparer.OrdinalIgnoreCase);
+
+    private static bool FilesAreSame(string first, string second)
+    {
+        try
+        {
+            return Path.GetFullPath(first).Equals(Path.GetFullPath(second), StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static void SyncImagePriority(MacroCommand command)
+    {
+        command.ImagePriority ??= new List<string>();
+        if (string.IsNullOrWhiteSpace(command.ImageFolder))
+            return;
+
+        var folder = ProjectPaths.Resolve(command.ImageFolder);
+        if (!Directory.Exists(folder))
+            return;
+
+        // Priorities are stored relative to the selected image folder so nested
+        // folders remain portable and duplicate file names are safe.
+        var searchOption = command.ImageIncludeSubfolders
+            ? SearchOption.AllDirectories
+            : SearchOption.TopDirectoryOnly;
+
+        var names = Directory.EnumerateFiles(folder, "*.*", searchOption)
+            .Where(IsImageFile)
+            .Select(path => Path.GetRelativePath(folder, path))
+            .OrderBy(name => name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        command.ImagePriority.RemoveAll(saved => !names.Contains(saved, StringComparer.OrdinalIgnoreCase));
+        foreach (var name in names)
+        {
+            if (!command.ImagePriority.Contains(name, StringComparer.OrdinalIgnoreCase))
+                command.ImagePriority.Add(name);
+        }
+    }
+
+    private sealed record ProjectImageAsset(string Label, string RelativePath, bool IsFolder)
+    {
+        public override string ToString() => Label;
+    }
+
+    private List<ProjectImageAsset> GetProjectImageAssets()
+    {
+        var result = new List<ProjectImageAsset>();
+        if (string.IsNullOrWhiteSpace(_projectPath))
+            return result;
+
+        var imagesRoot = ProjectImagesFolder();
+        if (!Directory.Exists(imagesRoot))
+            return result;
+
+        // Every imported image can be reused by any image command.
+        foreach (var file in Directory.EnumerateFiles(imagesRoot, "*.*", SearchOption.AllDirectories)
+                     .Where(IsImageFile)
+                     .OrderBy(path => Path.GetRelativePath(imagesRoot, path), StringComparer.OrdinalIgnoreCase))
+        {
+            var relativeToImages = Path.GetRelativePath(imagesRoot, file);
+            result.Add(new ProjectImageAsset($"Image  •  {relativeToImages}", ProjectPaths.MakeRelative(file), false));
+        }
+
+        // Any folder containing images is also reusable as a priority source.
+        foreach (var folder in Directory.EnumerateDirectories(imagesRoot, "*", SearchOption.AllDirectories)
+                     .Prepend(imagesRoot)
+                     .Where(folder => Directory.EnumerateFiles(folder, "*.*", SearchOption.AllDirectories).Any(IsImageFile))
+                     .OrderBy(folder => folder, StringComparer.OrdinalIgnoreCase))
+        {
+            // The Images root itself is useful only when it has images directly in it.
+            if (Path.GetFullPath(folder).Equals(Path.GetFullPath(imagesRoot), StringComparison.OrdinalIgnoreCase) &&
+                !Directory.EnumerateFiles(imagesRoot, "*.*", SearchOption.TopDirectoryOnly).Any(IsImageFile))
+                continue;
+
+            var display = Path.GetFullPath(folder).Equals(Path.GetFullPath(imagesRoot), StringComparison.OrdinalIgnoreCase)
+                ? "Images"
+                : Path.GetRelativePath(imagesRoot, folder);
+            var imageCount = Directory.EnumerateFiles(folder, "*.*", SearchOption.AllDirectories).Count(IsImageFile);
+            result.Add(new ProjectImageAsset($"Folder • {display} ({imageCount})", ProjectPaths.MakeRelative(folder), true));
+        }
+
+        return result;
     }
 
     private static string SanitizeFileName(string name)
@@ -237,21 +525,274 @@ public partial class MainWindow : Window
             MessageBoxButton.YesNoCancel,
             MessageBoxImage.Question);
 
-        return result switch
+        if (result == MessageBoxResult.Yes)
+            return SaveProject(false);
+        if (result == MessageBoxResult.No)
         {
-            MessageBoxResult.Yes => SaveProject(false),
-            MessageBoxResult.No => true,
-            _ => false
-        };
+            DeleteUnsavedRecovery();
+            return true;
+        }
+        return false;
+    }
+
+    internal bool TryPrepareForUpdate(Window promptOwner, out bool discardUnsavedChanges)
+    {
+        discardUnsavedChanges = false;
+        if (!_dirty)
+            return true;
+
+        var message = string.IsNullOrWhiteSpace(_projectPath)
+            ? "This macro has not been saved yet. Save it before updating MacroMaker?\n\nChoosing No will update MacroMaker and discard this unsaved macro."
+            : "This macro has unsaved changes. Save them before updating MacroMaker?\n\nChoosing No will update MacroMaker and discard the unsaved changes.";
+
+        var result = MessageBox.Show(promptOwner, message, "Save Before Update",
+            MessageBoxButton.YesNoCancel, MessageBoxImage.Question);
+
+        if (result == MessageBoxResult.Cancel)
+            return false;
+
+        if (result == MessageBoxResult.Yes)
+            return SaveProject(false, promptOwner);
+
+        discardUnsavedChanges = true;
+        DeleteUnsavedRecovery();
+        return true;
+    }
+
+    internal void AllowUpdateShutdownWithoutSavePrompt()
+    {
+        _skipSavePromptForUpdate = true;
     }
 
     private void MarkDirty()
     {
-        if (_dirty)
+        TrackHistoryChange();
+
+        if (!_dirty)
+        {
+            _dirty = true;
+            UpdateProjectTitle();
+        }
+
+        if (_appSettings.AutoSaveProjectChanges)
+        {
+            _autoSaveTimer.Stop();
+            _autoSaveTimer.Start();
+        }
+    }
+
+    private string SerializeProjectSnapshot() => JsonSerializer.Serialize(_project, JsonOptions);
+
+    private void ResetHistory()
+    {
+        _undoHistory.Clear();
+        _redoHistory.Clear();
+        _historySnapshot = SerializeProjectSnapshot();
+        UpdateUndoButtons();
+    }
+
+    private void TrackHistoryChange()
+    {
+        if (_historySuspended)
             return;
 
-        _dirty = true;
-        UpdateProjectTitle();
+        var current = SerializeProjectSnapshot();
+        if (string.Equals(current, _historySnapshot, StringComparison.Ordinal))
+            return;
+
+        if (!string.IsNullOrEmpty(_historySnapshot))
+            _undoHistory.Push(_historySnapshot);
+
+        _redoHistory.Clear();
+        _historySnapshot = current;
+        UpdateUndoButtons();
+    }
+
+    private void UndoButton_Click(object sender, RoutedEventArgs e) => UndoProjectChange();
+    private void RedoButton_Click(object sender, RoutedEventArgs e) => RedoProjectChange();
+
+    private void UndoProjectChange()
+    {
+        if (_undoHistory.Count == 0 || _engine?.IsRunning == true || _isRecording)
+            return;
+
+        var current = SerializeProjectSnapshot();
+        var previous = _undoHistory.Pop();
+        _redoHistory.Push(current);
+        ApplyHistorySnapshot(previous);
+        StatusText.Text = "Undo";
+    }
+
+    private void RedoProjectChange()
+    {
+        if (_redoHistory.Count == 0 || _engine?.IsRunning == true || _isRecording)
+            return;
+
+        var current = SerializeProjectSnapshot();
+        var next = _redoHistory.Pop();
+        _undoHistory.Push(current);
+        ApplyHistorySnapshot(next);
+        StatusText.Text = "Redo";
+    }
+
+    private void ApplyHistorySnapshot(string json)
+    {
+        var selectedSequenceName = _currentSequence?.Name ?? "Starting Sequence";
+        _historySuspended = true;
+        try
+        {
+            var restored = JsonSerializer.Deserialize<MacroProject>(json, JsonOptions);
+            if (restored is null)
+                return;
+            restored.Sequences ??= new List<MacroSequence>();
+            foreach (var sequence in restored.Sequences)
+            {
+                sequence.Commands ??= new List<MacroCommand>();
+                RepairCommandLists(sequence.Commands);
+            }
+            _project = restored;
+            _historySnapshot = json;
+            _dirty = true;
+            RebuildEngine();
+            var sequenceToSelect = _project.Sequences.FirstOrDefault(x => x.Name.Equals(selectedSequenceName, StringComparison.OrdinalIgnoreCase))
+                                   ?? _project.Sequences.FirstOrDefault()
+                                   ?? new MacroSequence("Starting Sequence");
+            if (_project.Sequences.Count == 0)
+                _project.Sequences.Add(sequenceToSelect);
+            SelectSequence(sequenceToSelect);
+            RefreshTabs();
+            UpdateProjectTitle();
+            UpdateUndoButtons();
+            if (_appSettings.AutoSaveProjectChanges)
+            {
+                _autoSaveTimer.Stop();
+                _autoSaveTimer.Start();
+            }
+        }
+        finally
+        {
+            _historySuspended = false;
+        }
+    }
+
+    private void UpdateUndoButtons()
+    {
+        if (UndoButton is not null) UndoButton.IsEnabled = _undoHistory.Count > 0 && _engine?.IsRunning != true;
+        if (RedoButton is not null) RedoButton.IsEnabled = _redoHistory.Count > 0 && _engine?.IsRunning != true;
+    }
+
+    private async void AutoSaveTimer_Tick(object? sender, EventArgs e)
+    {
+        _autoSaveTimer.Stop();
+        if (!_appSettings.AutoSaveProjectChanges || !_dirty || _engine?.IsRunning == true || _isRecording)
+            return;
+
+        try
+        {
+            var json = SerializeProjectSnapshot();
+            if (string.IsNullOrWhiteSpace(_projectPath))
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(RecoveryFilePath)!);
+                await File.WriteAllTextAsync(RecoveryFilePath, json);
+                StatusText.Text = "Unsaved work backed up";
+                return;
+            }
+
+            await File.WriteAllTextAsync(Path.Combine(_projectPath!, ProjectFileName), json);
+            _dirty = false;
+            UpdateProjectTitle();
+            StatusText.Text = "Auto-saved";
+        }
+        catch
+        {
+            // Auto-save/recovery should never interrupt editing. Manual Save still reports errors.
+        }
+    }
+
+    private void MainWindow_PreviewKeyDown(object sender, KeyEventArgs e)
+    {
+        if (Keyboard.FocusedElement is TextBox)
+            return;
+
+        if ((Keyboard.Modifiers & ModifierKeys.Control) != 0 && e.Key == Key.Z)
+        {
+            UndoProjectChange();
+            e.Handled = true;
+        }
+        else if ((Keyboard.Modifiers & ModifierKeys.Control) != 0 && (e.Key == Key.Y || ((Keyboard.Modifiers & ModifierKeys.Shift) != 0 && e.Key == Key.Z)))
+        {
+            RedoProjectChange();
+            e.Handled = true;
+        }
+        else if ((Keyboard.Modifiers & ModifierKeys.Control) != 0 && e.Key == Key.C)
+        {
+            CopyCommandButton_Click(this, new RoutedEventArgs());
+            e.Handled = true;
+        }
+        else if ((Keyboard.Modifiers & ModifierKeys.Control) != 0 && e.Key == Key.V)
+        {
+            PasteCommandButton_Click(this, new RoutedEventArgs());
+            e.Handled = true;
+        }
+    }
+
+    private void TryOfferUnsavedRecovery()
+    {
+        try
+        {
+            if (!File.Exists(RecoveryFilePath))
+                return;
+            var json = File.ReadAllText(RecoveryFilePath);
+            var recovered = JsonSerializer.Deserialize<MacroProject>(json, JsonOptions);
+            if (recovered?.Sequences is null || recovered.Sequences.Count == 0)
+            {
+                DeleteUnsavedRecovery();
+                return;
+            }
+
+            var answer = MessageBox.Show(this,
+                "MacroMaker found an unsaved macro from a previous session. Recover it?",
+                "Recover Unsaved Macro", MessageBoxButton.YesNo, MessageBoxImage.Question);
+            if (answer != MessageBoxResult.Yes)
+            {
+                DeleteUnsavedRecovery();
+                return;
+            }
+
+            recovered.RecorderSettings ??= new RecorderSettings();
+            recovered.Variables ??= new List<ProjectVariable>();
+            recovered.RuntimeSettings ??= new MacroRuntimeSettings();
+            foreach (var sequence in recovered.Sequences)
+            {
+                sequence.Commands ??= new List<MacroCommand>();
+                RepairCommandLists(sequence.Commands);
+            }
+            _project = recovered;
+            _projectPath = null;
+            ProjectPaths.CurrentFolder = null;
+            _dirty = true;
+            RebuildEngine();
+            var startupSequence = _project.Sequences.FirstOrDefault(x => x.Name.Equals("Starting Sequence", StringComparison.OrdinalIgnoreCase))
+                                  ?? _project.Sequences[0];
+            SelectSequence(startupSequence);
+            RefreshTabs();
+            UpdateProjectTitle();
+            ResetHistory();
+            StatusText.Text = "Recovered unsaved macro";
+        }
+        catch
+        {
+            DeleteUnsavedRecovery();
+        }
+    }
+
+    private static void DeleteUnsavedRecovery()
+    {
+        try
+        {
+            if (File.Exists(RecoveryFilePath)) File.Delete(RecoveryFilePath);
+        }
+        catch { }
     }
 
     private void UpdateProjectTitle()
@@ -546,7 +1087,16 @@ public partial class MainWindow : Window
 
         _appSettings = dialog.Settings;
         AppSettingsStore.Save(_appSettings);
+        if (!_appSettings.AutoSaveProjectChanges)
+            _autoSaveTimer.Stop();
+        else if (_dirty)
+        {
+            _autoSaveTimer.Stop();
+            _autoSaveTimer.Start();
+        }
         ThemeManager.Apply(_appSettings.Theme);
+        if (_engine is not null)
+            _engine.PlaybackSpeedPercent = EffectivePlaybackSpeed;
         RefreshQuickAdd();
         RefreshTabs();
         RefreshCommandList(_selectedRow?.Command?.Id);
@@ -633,7 +1183,7 @@ public partial class MainWindow : Window
         m = Regex.Match(text, @"^move(?: mouse)?(?: to)?\s+(-?\d+)\s*[, ]\s*(-?\d+)(?:\s+over\s+(\d+)\s*ms)?$", RegexOptions.IgnoreCase);
         if (m.Success && TryPoint(m, 1, 2, out var mx, out var my))
         {
-            var duration = 250;
+            var duration = 50;
             var smooth = m.Groups[3].Success && int.TryParse(m.Groups[3].Value, out duration);
             return new MacroCommand
             {
@@ -779,7 +1329,7 @@ public partial class MainWindow : Window
     {
         if (!TryResolveBlockTarget(out var parent, out var target, out _))
         {
-            StatusText.Text = "Select an IF, Loop, THEN/ELSE row, or a command already inside one";
+            StatusText.Text = "Select an IF, loop, group, THEN/ELSE row, or a command already inside one";
             return;
         }
 
@@ -789,7 +1339,7 @@ public partial class MainWindow : Window
             target.Add(command);
             MarkDirty();
             RefreshCommandList(command.Id);
-            StatusText.Text = target == parent.ElseChildren ? "Added to ELSE" : parent.HasElse ? "Added to THEN" : "Added to loop";
+            StatusText.Text = target == parent.ElseChildren ? "Added to ELSE" : parent.HasElse ? "Added to THEN" : parent.Type == CommandType.Group ? "Added to group" : "Added to loop";
         });
     }
 
@@ -798,7 +1348,7 @@ public partial class MainWindow : Window
         var parent = ResolveIfParent();
         if (parent is null)
         {
-            StatusText.Text = "ELSE is available on IF Color and IF Image";
+            StatusText.Text = "ELSE is available on IF commands";
             return;
         }
 
@@ -833,7 +1383,7 @@ public partial class MainWindow : Window
             else
             {
                 target = parent.Children;
-                label = parent.HasElse ? "THEN" : "Loop";
+                label = parent.HasElse ? "THEN" : parent.Type == CommandType.Group ? "Group" : "Loop";
             }
             return true;
         }
@@ -842,7 +1392,7 @@ public partial class MainWindow : Window
         {
             parent = selected;
             target = selected.Children;
-            label = selected.HasElse ? "THEN" : "Loop";
+            label = selected.HasElse ? "THEN" : selected.Type == CommandType.Group ? "Group" : "Loop";
             return true;
         }
 
@@ -857,7 +1407,7 @@ public partial class MainWindow : Window
             else
             {
                 target = parent.Children;
-                label = parent.HasElse ? "THEN" : "Loop";
+                label = parent.HasElse ? "THEN" : parent.Type == CommandType.Group ? "Group" : "Loop";
             }
             return true;
         }
@@ -881,26 +1431,30 @@ public partial class MainWindow : Window
 
         if (TryResolveBlockTarget(out _, out _, out var label))
         {
+            AddBlockButton.Visibility = Visibility.Visible;
             AddBlockButton.IsEnabled = true;
             AddBlockButton.Content = label switch
             {
                 "THEN" => "+ Add to THEN",
                 "ELSE" => "+ Add to ELSE",
+                "Group" => "+ Add to Group",
                 _ => "+ Add to Loop"
             };
         }
         else
         {
+            AddBlockButton.Visibility = Visibility.Collapsed;
             AddBlockButton.IsEnabled = false;
-            AddBlockButton.Content = "+ Add to Block";
         }
 
-        AddElseButton.IsEnabled = ResolveIfParent() is not null;
+        var ifParent = ResolveIfParent();
+        AddElseButton.Visibility = ifParent is null ? Visibility.Collapsed : Visibility.Visible;
+        AddElseButton.IsEnabled = ifParent is not null;
     }
 
     private void OpenCommandMenu(FrameworkElement? target, Action<CommandType> onSelected)
     {
-        var picker = new CommandPickerWindow
+        var picker = new CommandPickerWindow()
         {
             Owner = this
         };
@@ -919,6 +1473,7 @@ public partial class MainWindow : Window
             Y = defaults.Y,
             EndX = defaults.EndX,
             EndY = defaults.EndY,
+            CoordinateMode = defaults.CoordinateMode,
             MouseMoveMode = defaults.MouseMoveMode == MouseMoveMode.Legacy ? MouseMoveMode.Smooth : defaults.MouseMoveMode,
             MoveDurationMs = defaults.MoveDurationMs,
             ClickDelayMs = defaults.ClickDelayMs,
@@ -939,14 +1494,30 @@ public partial class MainWindow : Window
             ColorTolerance = defaults.ColorTolerance,
             CompareMode = defaults.CompareMode,
             ImageTolerance = defaults.ImageTolerance,
+            ImageIncludeSubfolders = defaults.ImageIncludeSubfolders,
             WindowTitle = defaults.WindowTitle,
             ProgramPath = defaults.ProgramPath,
+            ProgramArguments = defaults.ProgramArguments,
+            WorkingDirectory = defaults.WorkingDirectory,
             SearchX = defaults.SearchX,
             SearchY = defaults.SearchY,
             SearchWidth = defaults.SearchWidth,
             SearchHeight = defaults.SearchHeight,
             ImageOffsetX = defaults.ImageOffsetX,
             ImageOffsetY = defaults.ImageOffsetY,
+            VariableName = defaults.VariableName,
+            VariableValue = defaults.VariableValue,
+            VariableValue2 = defaults.VariableValue2,
+            VariableCompareMode = defaults.VariableCompareMode,
+            StoreXVariable = defaults.StoreXVariable,
+            StoreYVariable = defaults.StoreYVariable,
+            StoreTextVariable = defaults.StoreTextVariable,
+            FilePath = defaults.FilePath,
+            AppendFile = defaults.AppendFile,
+            PromptText = defaults.PromptText,
+            FailureAction = defaults.FailureAction,
+            FailureRetryCount = defaults.FailureRetryCount,
+            FailureRetryDelayMs = defaults.FailureRetryDelayMs,
             RepeatCount = defaults.RepeatCount
         };
 
@@ -1116,12 +1687,14 @@ public partial class MainWindow : Window
         {
             _selectedRow = null;
             UpdateBlockButtonState();
+            UpdateRunButtons();
             ClearProperties("Select a command to edit it.");
             return;
         }
 
         _selectedRow = row;
         UpdateBlockButtonState();
+        UpdateRunButtons();
 
         if (row.IsHeader)
         {
@@ -1195,7 +1768,7 @@ public partial class MainWindow : Window
             if (!command.HasBody || command.Type == CommandType.RecordedActions)
                 continue;
 
-            var bodyLabel = command.HasElse ? "THEN" : "DO";
+            var bodyLabel = command.HasElse ? "THEN" : command.Type == CommandType.Group ? "GROUP" : "DO";
             rows.Add(new CommandRow
             {
                 IsHeader = true,
@@ -1230,6 +1803,7 @@ public partial class MainWindow : Window
         PropertiesPanel.Children.Clear();
         PropertiesHintText.Text = FriendlyName(command.Type);
         AddReadOnlyField("Command", FriendlyName(command.Type));
+        AddCommonCommandProperties(command);
 
         switch (command.Type)
         {
@@ -1297,16 +1871,30 @@ public partial class MainWindow : Window
             case CommandType.RepeatKey:
                 AddTextField("Key or combo", command.Key, value => command.Key = value);
                 AddNumberField("Repeat count", command.RepeatCount, 1, 1_000_000, value => command.RepeatCount = value);
+                AddTextField("Repeat count variable / math (optional)", command.RepeatExpression, value => command.RepeatExpression = value);
                 AddNumberField("Delay between presses (ms)", command.WaitMs, 0, 86_400_000, value => command.WaitMs = value);
                 break;
 
             case CommandType.WaitUntilKeyPressed:
+            case CommandType.WaitUntilKeyReleased:
                 AddTextField("Key", command.Key, value => command.Key = value);
                 AddPollingFields(command);
                 break;
 
+            case CommandType.IfKeyPressed:
+                AddTextField("Key", command.Key, value => command.Key = value);
+                AddBlockInfo(command);
+                break;
+
+            case CommandType.LoopWhileKeyPressed:
+                AddTextField("Key", command.Key, value => command.Key = value);
+                AddNumberField("Idle poll ms (empty loop)", command.PollMs, 10, 5000, value => command.PollMs = value);
+                AddBlockInfo(command);
+                break;
+
             case CommandType.Wait:
                 AddNumberField("Milliseconds", command.WaitMs, 0, 86_400_000, value => command.WaitMs = value);
+                AddTextField("Variable / math override (optional)", command.WaitExpression, value => command.WaitExpression = value);
                 break;
 
             case CommandType.RandomWait:
@@ -1332,11 +1920,20 @@ public partial class MainWindow : Window
                 break;
 
             case CommandType.ClickColor:
+            case CommandType.FindColorToVariables:
                 AddColorField(command);
                 AddNumberField("Color tolerance (0-255 per channel)", command.ColorTolerance, 0, 255, value => command.ColorTolerance = value);
                 AddSearchAreaFields(command);
-                AddMouseMovementFields(command);
+                if (command.Type == CommandType.ClickColor)
+                    AddMouseMovementFields(command);
+                else
+                    AddStorePointVariableFields(command);
                 AddColorSearchTest(command);
+                break;
+
+            case CommandType.SampleColorToVariable:
+                AddLocationFields(command);
+                AddTextField("Save color into variable", command.StoreTextVariable, value => command.StoreTextVariable = RuntimeValues.NormalizeName(value));
                 break;
 
             case CommandType.IfImage:
@@ -1346,6 +1943,8 @@ public partial class MainWindow : Window
             case CommandType.DoubleClickImage:
             case CommandType.MoveToImage:
             case CommandType.LoopUntilImage:
+            case CommandType.LoopWhileImage:
+            case CommandType.FindImageToVariables:
                 AddImageFields(command);
                 if (command.Type is CommandType.WaitUntilImage or CommandType.WaitUntilImageGone)
                     AddPollingFields(command);
@@ -1357,13 +1956,24 @@ public partial class MainWindow : Window
                     if (command.Type == CommandType.DoubleClickImage)
                         AddNumberField("Delay between clicks (ms)", command.ClickDelayMs, 20, 1000, value => command.ClickDelayMs = value);
                 }
-                if (command.Type == CommandType.LoopUntilImage)
+                if (command.Type is CommandType.LoopUntilImage or CommandType.LoopWhileImage)
                     AddNumberField("Idle poll ms (used if body is empty)", command.PollMs, 10, 5000, value => command.PollMs = value);
+                if (command.Type == CommandType.FindImageToVariables)
+                    AddStorePointVariableFields(command);
                 if (command.HasBody)
                     AddBlockInfo(command);
                 break;
 
+            case CommandType.IfWindow:
+                AddTextField("Window title contains", command.WindowTitle, value => command.WindowTitle = value);
+                AddBlockInfo(command);
+                break;
+
             case CommandType.FocusWindow:
+            case CommandType.MinimizeWindow:
+            case CommandType.MaximizeWindow:
+            case CommandType.RestoreWindow:
+            case CommandType.CloseWindow:
                 AddTextField("Window title contains", command.WindowTitle, value => command.WindowTitle = value);
                 break;
 
@@ -1377,18 +1987,77 @@ public partial class MainWindow : Window
                 AddProgramField(command);
                 break;
 
+            case CommandType.SetVariable:
+                AddTextField("Variable name", command.VariableName, value => command.VariableName = RuntimeValues.NormalizeName(value));
+                AddTextField("Value", command.VariableValue, value => command.VariableValue = value);
+                break;
+
+            case CommandType.AddVariable:
+                AddTextField("Variable name", command.VariableName, value => command.VariableName = RuntimeValues.NormalizeName(value));
+                AddTextField("Amount / text to add", command.VariableValue, value => command.VariableValue = value);
+                break;
+
+            case CommandType.RandomNumber:
+                AddTextField("Variable name", command.VariableName, value => command.VariableName = RuntimeValues.NormalizeName(value));
+                AddTextField("Minimum", command.VariableValue, value => command.VariableValue = value);
+                AddTextField("Maximum", command.VariableValue2, value => command.VariableValue2 = value);
+                break;
+
+            case CommandType.IfVariable:
+            case CommandType.WaitUntilVariable:
+            case CommandType.LoopWhileVariable:
+            case CommandType.LoopUntilVariable:
+                AddVariableConditionFields(command);
+                if (command.Type == CommandType.WaitUntilVariable) AddPollingFields(command);
+                else if (command.Type is CommandType.LoopWhileVariable or CommandType.LoopUntilVariable)
+                    AddNumberField("Idle poll ms (empty loop)", command.PollMs, 10, 5000, value => command.PollMs = value);
+                if (command.HasBody) AddBlockInfo(command);
+                break;
+
+            case CommandType.SetClipboard:
+                AddTextField("Clipboard text", command.Text, value => command.Text = value, true);
+                break;
+
+            case CommandType.ClipboardToVariable:
+                AddTextField("Save into variable", command.VariableName, value => command.VariableName = RuntimeValues.NormalizeName(value));
+                break;
+
+            case CommandType.ReadTextFile:
+                AddFileDataFields(command, false, true, false);
+                break;
+
+            case CommandType.WriteTextFile:
+                AddFileDataFields(command, true, false, true);
+                break;
+
+            case CommandType.PromptText:
+                AddTextField("Question", command.PromptText, value => command.PromptText = value, true);
+                AddTextField("Save answer into variable", command.VariableName, value => command.VariableName = RuntimeValues.NormalizeName(value));
+                AddTextField("Default answer", command.VariableValue, value => command.VariableValue = value);
+                break;
+
+            case CommandType.PromptYesNo:
+                AddTextField("Question", command.PromptText, value => command.PromptText = value, true);
+                AddTextField("Save true/false into variable", command.VariableName, value => command.VariableName = RuntimeValues.NormalizeName(value));
+                break;
+
+            case CommandType.Group:
+                AddBlockInfo(command);
+                break;
+
             case CommandType.RunSequence:
                 AddSequencePicker(command);
                 break;
 
             case CommandType.LoopTimes:
                 AddNumberField("Repeat count", command.RepeatCount, 0, 1_000_000, value => command.RepeatCount = value);
+                AddTextField("Repeat count variable / math (optional)", command.RepeatExpression, value => command.RepeatExpression = value);
                 AddBlockInfo(command);
                 break;
 
             case CommandType.LoopForever:
                 AddBlockInfo(command);
-                AddInfo("Use Break Loop inside this block, or F8 at any time, to stop it.");
+                AddInfo($"Use Break Loop inside this block, or {_appSettings.StopMacroHotkey} at any time, to stop it.");
                 break;
 
             case CommandType.Break:
@@ -1400,9 +2069,11 @@ public partial class MainWindow : Window
                 break;
 
             case CommandType.StopMacro:
-                AddInfo("Stops the entire macro immediately, the same as pressing F8.");
+                AddInfo($"Stops the entire macro immediately, the same as pressing {_appSettings.StopMacroHotkey}.");
                 break;
         }
+
+        AddFailureBehaviorFields(command);
     }
 
     private void AddMouseMovementFields(MacroCommand command)
@@ -1424,7 +2095,7 @@ public partial class MainWindow : Window
 
             command.MouseMoveMode = selected;
             if (selected == MouseMoveMode.Smooth && command.MoveDurationMs <= 0)
-                command.MoveDurationMs = 250;
+                command.MoveDurationMs = 50;
             MarkDirtyAndRefresh(command.Id);
             BuildProperties(command);
         };
@@ -1731,6 +2402,8 @@ public partial class MainWindow : Window
             RefreshCommandList(command.Id);
         };
         PropertiesPanel.Children.Add(set);
+        AddCoordinateModeFields(command);
+        AddCoordinateExpressionFields(command);
     }
 
     private void AddEndLocationFields(MacroCommand command)
@@ -1791,6 +2464,7 @@ public partial class MainWindow : Window
             RefreshCommandList(command.Id);
         };
         PropertiesPanel.Children.Add(set);
+        AddEndCoordinateExpressionFields(command);
     }
 
     private void AddSearchAreaFields(MacroCommand command)
@@ -1846,6 +2520,7 @@ public partial class MainWindow : Window
         Grid.SetColumn(setRegion, 0); Grid.SetColumn(fullRegion, 1);
         buttons.Children.Add(setRegion); buttons.Children.Add(fullRegion);
         PropertiesPanel.Children.Add(buttons);
+        AddCoordinateModeFields(command);
     }
 
     private void AddColorSearchTest(MacroCommand command)
@@ -1904,38 +2579,158 @@ public partial class MainWindow : Window
         Grid.SetColumn(box, 0); Grid.SetColumn(browse, 1);
         grid.Children.Add(box); grid.Children.Add(browse);
         PropertiesPanel.Children.Add(grid);
+        AddTextField("Arguments (optional)", command.ProgramArguments, value => command.ProgramArguments = value);
+        AddTextField("Working directory (optional)", command.WorkingDirectory, value => command.WorkingDirectory = value);
     }
 
     private void AddImageFields(MacroCommand command)
     {
-        AddLabel("Reference image");
-        var pathRow = new Grid { Margin = new Thickness(0, 0, 0, 10) };
-        pathRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        pathRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        pathRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        var pathBox = new TextBox { Text = command.ImagePath, IsReadOnly = true, Margin = new Thickness(0, 0, 7, 0) };
-        var choose = new Button { Content = "Choose...", MinWidth = 80 };
-        var capture = new Button { Content = "Capture", MinWidth = 80, Margin = new Thickness(7, 0, 0, 0) };
-        choose.Click += (_, _) =>
+        AddLabel("Image source");
+        var sourceText = !string.IsNullOrWhiteSpace(command.ImageFolder)
+            ? $"Folder: {command.ImageFolder}"
+            : (!string.IsNullOrWhiteSpace(command.ImagePath) ? $"Image: {command.ImagePath}" : "No image selected");
+
+        PropertiesPanel.Children.Add(new TextBlock
         {
+            Text = sourceText,
+            TextWrapping = TextWrapping.Wrap,
+            Margin = new Thickness(0, 0, 0, 8),
+            Foreground = (Brush)FindResource("TextBrush")
+        });
+
+        if (!string.IsNullOrWhiteSpace(_projectPath))
+        {
+            AddLabel("Project image library");
+            var assets = GetProjectImageAssets();
+            if (assets.Count > 0)
+            {
+                var chooseLibrary = new Button
+                {
+                    Content = "Choose From Project…",
+                    Margin = new Thickness(0, 0, 0, 10),
+                    HorizontalAlignment = HorizontalAlignment.Stretch
+                };
+                chooseLibrary.Click += (_, _) =>
+                {
+                    var currentPath = !string.IsNullOrWhiteSpace(command.ImageFolder)
+                        ? command.ImageFolder
+                        : command.ImagePath;
+                    var picker = new ProjectImageLibraryWindow(
+                        _projectPath!,
+                        currentPath,
+                        !string.IsNullOrWhiteSpace(command.ImageFolder))
+                    {
+                        Owner = this
+                    };
+
+                    if (picker.ShowDialog() != true)
+                        return;
+
+                    if (picker.SelectedIsFolder)
+                    {
+                        command.ImageFolder = picker.SelectedRelativePath;
+                        command.ImagePath = string.Empty;
+                        command.ImagePriority.Clear();
+                        SyncImagePriority(command);
+                    }
+                    else
+                    {
+                        command.ImagePath = picker.SelectedRelativePath;
+                        command.ImageFolder = string.Empty;
+                        command.ImagePriority.Clear();
+                    }
+
+                    MarkDirty();
+                    BuildProperties(command);
+                    RefreshCommandList(command.Id);
+                };
+                PropertiesPanel.Children.Add(chooseLibrary);
+            }
+            else
+            {
+                PropertiesPanel.Children.Add(new TextBlock
+                {
+                    Text = "No project images yet. Import one below and it becomes reusable in every image command.",
+                    TextWrapping = TextWrapping.Wrap,
+                    Margin = new Thickness(0, 0, 0, 10),
+                    Foreground = (Brush)FindResource("MutedTextBrush")
+                });
+            }
+        }
+
+        var sourceButtons = new Grid { Margin = new Thickness(0, 0, 0, 12) };
+        sourceButtons.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        sourceButtons.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        sourceButtons.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+
+        var chooseImage = new Button { Content = "Import Image", Margin = new Thickness(0, 0, 4, 0) };
+        var chooseFolder = new Button { Content = "Import Folder", Margin = new Thickness(4, 0, 4, 0) };
+        var capture = new Button { Content = "Capture", Margin = new Thickness(4, 0, 0, 0) };
+
+        chooseImage.Click += (_, _) =>
+        {
+            if (!EnsureProjectFolder())
+                return;
+
             var dialog = new OpenFileDialog
             {
                 Title = "Choose image to detect",
                 Filter = "Images (*.png;*.jpg;*.jpeg;*.bmp)|*.png;*.jpg;*.jpeg;*.bmp|All files (*.*)|*.*"
             };
-            if (dialog.ShowDialog(this) == true)
+            if (dialog.ShowDialog(this) != true)
+                return;
+
+            try
             {
-                command.ImagePath = dialog.FileName;
+                command.ImagePath = ImportImageFile(dialog.FileName);
+                command.ImageFolder = string.Empty;
+                command.ImagePriority.Clear();
                 MarkDirty();
                 BuildProperties(command);
                 RefreshCommandList(command.Id);
             }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, ex.Message, "Could not import image", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
         };
+
+        chooseFolder.Click += (_, _) =>
+        {
+            if (!EnsureProjectFolder())
+                return;
+
+            var dialog = new OpenFolderDialog
+            {
+                Title = "Choose a folder of priority images",
+                Multiselect = false
+            };
+            if (dialog.ShowDialog(this) != true)
+                return;
+
+            try
+            {
+                command.ImageFolder = ImportImageFolder(dialog.FolderName);
+                command.ImagePath = string.Empty;
+                command.ImagePriority.Clear();
+                SyncImagePriority(command);
+                MarkDirty();
+                BuildProperties(command);
+                RefreshCommandList(command.Id);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, ex.Message, "Could not import image folder", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        };
+
         capture.Click += async (_, _) =>
         {
+            if (!EnsureProjectFolder())
+                return;
+
             var picker = new RegionPickerWindow();
             System.Windows.Media.Imaging.BitmapSource? image = null;
-
             Hide();
             try
             {
@@ -1952,33 +2747,43 @@ public partial class MainWindow : Window
             finally
             {
                 Show();
-                WindowState = System.Windows.WindowState.Normal;
                 Activate();
             }
 
-            if (image is not null)
-            {
-                var save = new SaveFileDialog
-                {
-                    Title = "Save reference image",
-                    Filter = "PNG image (*.png)|*.png",
-                    FileName = "reference.png"
-                };
-                if (save.ShowDialog(this) == true)
-                {
-                    ScreenTools.SavePng(image, save.FileName);
-                    command.ImagePath = save.FileName;
-                    MarkDirty();
-                }
-            }
+            if (image is null)
+                return;
 
+            var prompt = new TextPromptWindow("Save Reference Image", "Image name:", "reference") { Owner = this };
+            if (prompt.ShowDialog() != true)
+                return;
+
+            var baseName = SanitizeFileName(Path.GetFileNameWithoutExtension(prompt.Value.Trim()));
+            if (string.IsNullOrWhiteSpace(baseName))
+                baseName = "reference";
+            var destination = Path.Combine(ProjectImagesFolder(), baseName + ".png");
+            var suffix = 2;
+            while (File.Exists(destination))
+                destination = Path.Combine(ProjectImagesFolder(), $"{baseName}_{suffix++}.png");
+
+            ScreenTools.SavePng(image, destination);
+            command.ImagePath = ProjectPaths.MakeRelative(destination);
+            command.ImageFolder = string.Empty;
+            command.ImagePriority.Clear();
+            MarkDirty();
             BuildProperties(command);
             RefreshCommandList(command.Id);
         };
 
-        Grid.SetColumn(pathBox, 0); Grid.SetColumn(choose, 1); Grid.SetColumn(capture, 2);
-        pathRow.Children.Add(pathBox); pathRow.Children.Add(choose); pathRow.Children.Add(capture);
-        PropertiesPanel.Children.Add(pathRow);
+        Grid.SetColumn(chooseImage, 0);
+        Grid.SetColumn(chooseFolder, 1);
+        Grid.SetColumn(capture, 2);
+        sourceButtons.Children.Add(chooseImage);
+        sourceButtons.Children.Add(chooseFolder);
+        sourceButtons.Children.Add(capture);
+        PropertiesPanel.Children.Add(sourceButtons);
+
+        if (!string.IsNullOrWhiteSpace(command.ImageFolder))
+            AddImagePriorityEditor(command);
 
         AddNumberField("Image tolerance (0 exact → 255 loose)", command.ImageTolerance, 0, 255, value => command.ImageTolerance = value);
 
@@ -2017,7 +2822,6 @@ public partial class MainWindow : Window
             finally
             {
                 Show();
-                WindowState = System.Windows.WindowState.Normal;
                 Activate();
             }
             BuildProperties(command);
@@ -2030,21 +2834,22 @@ public partial class MainWindow : Window
             BuildProperties(command);
             RefreshCommandList(command.Id);
         };
-        Grid.SetColumn(setRegion, 0); Grid.SetColumn(fullRegion, 1);
-        regionButtons.Children.Add(setRegion); regionButtons.Children.Add(fullRegion);
+        Grid.SetColumn(setRegion, 0);
+        Grid.SetColumn(fullRegion, 1);
+        regionButtons.Children.Add(setRegion);
+        regionButtons.Children.Add(fullRegion);
         PropertiesPanel.Children.Add(regionButtons);
 
         var test = new Button { Content = "Test Image Detection", Margin = new Thickness(0, 0, 0, 12) };
         test.Click += async (_, _) =>
         {
-            if (string.IsNullOrWhiteSpace(command.ImagePath) || !File.Exists(command.ImagePath))
+            if (ImageMatcher.GetCandidatePaths(command).Count == 0)
             {
-                MessageBox.Show(this, "Choose an image first.", "Image Detection", MessageBoxButton.OK, MessageBoxImage.Information);
+                MessageBox.Show(this, "Choose an image or an image folder first.", "Image Detection", MessageBoxButton.OK, MessageBoxImage.Information);
                 return;
             }
 
-            var previous = WindowState;
-            WindowState = System.Windows.WindowState.Minimized;
+            Hide();
             await Task.Delay(180);
             ImageMatch? match = null;
             Exception? error = null;
@@ -2056,8 +2861,11 @@ public partial class MainWindow : Window
             {
                 error = ex;
             }
-            WindowState = previous == System.Windows.WindowState.Minimized ? System.Windows.WindowState.Normal : previous;
-            Activate();
+            finally
+            {
+                Show();
+                Activate();
+            }
 
             if (error is not null)
             {
@@ -2065,19 +2873,135 @@ public partial class MainWindow : Window
             }
             else if (match.HasValue)
             {
+                var matchedName = string.IsNullOrWhiteSpace(match.Value.SourcePath)
+                    ? "image"
+                    : Path.GetFileName(match.Value.SourcePath);
                 MessageBox.Show(this,
-                    $"FOUND\nTop-left: {match.Value.X}, {match.Value.Y}\nCenter: {match.Value.CenterX}, {match.Value.CenterY}\nSize: {match.Value.Width} × {match.Value.Height}",
+                    $"FOUND: {matchedName}\nTop-left: {match.Value.X}, {match.Value.Y}\nCenter: {match.Value.CenterX}, {match.Value.CenterY}\nSize: {match.Value.Width} × {match.Value.Height}",
                     "Image Detection", MessageBoxButton.OK, MessageBoxImage.Information);
             }
             else
             {
                 MessageBox.Show(this,
-                    "Image was not found. Try a tighter search area or increase tolerance a little.",
+                    "No image was found. With a folder source, images are checked from top to bottom in Priorities.",
                     "Image Detection", MessageBoxButton.OK, MessageBoxImage.Information);
             }
         };
         PropertiesPanel.Children.Add(test);
-        AddInfo("Tip: crop the reference image tightly. Smaller search areas make detection much faster.");
+    }
+
+    private void AddImagePriorityEditor(MacroCommand command)
+    {
+        SyncImagePriority(command);
+
+        AddLabel("Priorities");
+        PropertiesPanel.Children.Add(new TextBlock
+        {
+            Text = "Top = highest priority. The first matching image wins.",
+            TextWrapping = TextWrapping.Wrap,
+            Margin = new Thickness(0, 0, 0, 7),
+            Foreground = (Brush)FindResource("MutedTextBrush")
+        });
+
+        var includeSubfolders = new CheckBox
+        {
+            Content = "Include images inside subfolders",
+            IsChecked = command.ImageIncludeSubfolders,
+            Margin = new Thickness(0, 0, 0, 9)
+        };
+        includeSubfolders.Checked += (_, _) =>
+        {
+            command.ImageIncludeSubfolders = true;
+            command.ImagePriority.Clear();
+            SyncImagePriority(command);
+            MarkDirty();
+            BuildProperties(command);
+            RefreshCommandList(command.Id);
+        };
+        includeSubfolders.Unchecked += (_, _) =>
+        {
+            command.ImageIncludeSubfolders = false;
+            command.ImagePriority.Clear();
+            SyncImagePriority(command);
+            MarkDirty();
+            BuildProperties(command);
+            RefreshCommandList(command.Id);
+        };
+        PropertiesPanel.Children.Add(includeSubfolders);
+
+        var list = new ListBox
+        {
+            Height = 210,
+            Margin = new Thickness(0, 0, 0, 7),
+            Background = (Brush)FindResource("InputBrush"),
+            Foreground = (Brush)FindResource("TextBrush"),
+            BorderBrush = (Brush)FindResource("BorderBrushDark"),
+            BorderThickness = new Thickness(1),
+            Padding = new Thickness(6)
+        };
+
+        void RefreshPriorityList(int selectedIndex = -1)
+        {
+            list.ItemsSource = command.ImagePriority
+                .Select((name, index) => $"{index + 1}.  {name}")
+                .ToList();
+            if (selectedIndex >= 0 && selectedIndex < command.ImagePriority.Count)
+                list.SelectedIndex = selectedIndex;
+        }
+
+        RefreshPriorityList();
+        PropertiesPanel.Children.Add(list);
+
+        var buttons = new Grid { Margin = new Thickness(0, 0, 0, 12) };
+        buttons.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        buttons.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        buttons.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        var up = new Button { Content = "↑ Higher", Margin = new Thickness(0, 0, 4, 0) };
+        var down = new Button { Content = "↓ Lower", Margin = new Thickness(4, 0, 4, 0) };
+        var refresh = new Button { Content = "↻ Refresh", Margin = new Thickness(4, 0, 0, 0) };
+
+        up.Click += (_, _) =>
+        {
+            var index = list.SelectedIndex;
+            if (index <= 0 || index >= command.ImagePriority.Count)
+                return;
+
+            (command.ImagePriority[index - 1], command.ImagePriority[index]) =
+                (command.ImagePriority[index], command.ImagePriority[index - 1]);
+            MarkDirty();
+            RefreshPriorityList(index - 1);
+            RefreshCommandList(command.Id);
+        };
+
+        down.Click += (_, _) =>
+        {
+            var index = list.SelectedIndex;
+            if (index < 0 || index >= command.ImagePriority.Count - 1)
+                return;
+
+            (command.ImagePriority[index + 1], command.ImagePriority[index]) =
+                (command.ImagePriority[index], command.ImagePriority[index + 1]);
+            MarkDirty();
+            RefreshPriorityList(index + 1);
+            RefreshCommandList(command.Id);
+        };
+
+        refresh.Click += (_, _) =>
+        {
+            var selected = list.SelectedIndex;
+            SyncImagePriority(command);
+            MarkDirty();
+            RefreshPriorityList(Math.Min(selected, command.ImagePriority.Count - 1));
+            RefreshCommandList(command.Id);
+        };
+
+        Grid.SetColumn(up, 0);
+        Grid.SetColumn(down, 1);
+        Grid.SetColumn(refresh, 2);
+        buttons.Children.Add(up);
+        buttons.Children.Add(down);
+        buttons.Children.Add(refresh);
+        PropertiesPanel.Children.Add(buttons);
     }
 
     private void AddPollingFields(MacroCommand command)
@@ -2224,6 +3148,9 @@ public partial class MainWindow : Window
         CommandType.HoldKey => "Hold Key",
         CommandType.RepeatKey => "Repeat Key",
         CommandType.WaitUntilKeyPressed => "Wait Until Key Pressed",
+        CommandType.WaitUntilKeyReleased => "Wait Until Key Released",
+        CommandType.IfKeyPressed => "IF Key Pressed",
+        CommandType.LoopWhileKeyPressed => "Loop While Key Pressed",
         CommandType.Wait => "Wait",
         CommandType.RandomWait => "Random Wait",
         CommandType.RecordedActions => "Record Actions",
@@ -2232,6 +3159,8 @@ public partial class MainWindow : Window
         CommandType.LoopWhileColor => "Loop While Color",
         CommandType.LoopUntilColor => "Loop Until Color",
         CommandType.ClickColor => "Find + Click Color",
+        CommandType.FindColorToVariables => "Find Color → Variables",
+        CommandType.SampleColorToVariable => "Read Pixel Color → Variable",
         CommandType.IfImage => "IF Image Found",
         CommandType.WaitUntilImage => "Wait Until Image",
         CommandType.WaitUntilImageGone => "Wait Until Image Gone",
@@ -2239,10 +3168,31 @@ public partial class MainWindow : Window
         CommandType.DoubleClickImage => "Find + Double Click Image",
         CommandType.MoveToImage => "Move To Image",
         CommandType.LoopUntilImage => "Loop Until Image",
+        CommandType.LoopWhileImage => "Loop While Image Exists",
+        CommandType.FindImageToVariables => "Find Image → Variables",
+        CommandType.IfWindow => "IF Window Exists",
         CommandType.FocusWindow => "Focus Window",
         CommandType.WaitForWindow => "Wait For Window",
         CommandType.WaitForWindowGone => "Wait For Window Gone",
+        CommandType.MinimizeWindow => "Minimize Window",
+        CommandType.MaximizeWindow => "Maximize Window",
+        CommandType.RestoreWindow => "Restore Window",
+        CommandType.CloseWindow => "Close Window",
         CommandType.RunProgram => "Open Program / File / URL",
+        CommandType.SetVariable => "Set Variable",
+        CommandType.AddVariable => "Add / Subtract Variable",
+        CommandType.RandomNumber => "Random Number",
+        CommandType.IfVariable => "IF Variable",
+        CommandType.WaitUntilVariable => "Wait Until Variable",
+        CommandType.LoopWhileVariable => "Loop While Variable",
+        CommandType.LoopUntilVariable => "Loop Until Variable",
+        CommandType.SetClipboard => "Set Clipboard",
+        CommandType.ClipboardToVariable => "Clipboard → Variable",
+        CommandType.ReadTextFile => "Read Text File → Variable",
+        CommandType.WriteTextFile => "Write / Append Text File",
+        CommandType.PromptText => "Ask User For Text",
+        CommandType.PromptYesNo => "Ask User Yes / No",
+        CommandType.Group => "Command Group",
         CommandType.RunSequence => "Run Sequence",
         CommandType.LoopTimes => "Loop X Times",
         CommandType.LoopForever => "Loop Forever",
@@ -2257,20 +3207,30 @@ public partial class MainWindow : Window
     private void RebuildEngine()
     {
         _engine?.Stop();
-        _engine = new MacroEngine(_project);
-        _engine.StatusChanged += text => Dispatcher.InvokeAsync(() => StatusText.Text = text);
-        _engine.StateChanged += () => Dispatcher.InvokeAsync(UpdateRunButtons);
+        _engine = new MacroEngine(_project) { PlaybackSpeedPercent = EffectivePlaybackSpeed };
+        _engine.StatusChanged += text => Dispatcher.InvokeAsync(() =>
+        {
+            StatusText.Text = text;
+            _runStatusWindow?.UpdateStatus(text);
+        });
+        _engine.StateChanged += () => Dispatcher.InvokeAsync(() =>
+        {
+            UpdateRunButtons();
+            UpdateMouseLockForEngineState();
+        });
         _engine.CommandStarted += (sequence, id) => Dispatcher.InvokeAsync(() =>
         {
             var command = EnumerateAllCommands().FirstOrDefault(c => c.Id == id);
-            StatusText.Text = command is null ? $"Running: {sequence}" : $"{sequence}: {command.DisplayText()}";
+            var text = command is null ? $"Running: {sequence}" : $"{sequence}: {command.DisplayText()}";
+            StatusText.Text = text;
+            _runStatusWindow?.UpdateStatus(text);
         });
         UpdateRunButtons();
     }
 
     private async void RunStartButton_Click(object sender, RoutedEventArgs e)
     {
-        await RunSequenceFromUi("Starting Sequence");
+        await RunSequenceFromUi(EffectiveStartupSequence);
     }
 
     private async void RunCurrentButton_Click(object sender, RoutedEventArgs e)
@@ -2279,13 +3239,191 @@ public partial class MainWindow : Window
             await RunSequenceFromUi(_currentSequence.Name);
     }
 
-    private async Task RunSequenceFromUi(string name)
+    private async void TestSelectedButton_Click(object sender, RoutedEventArgs e)
     {
-        if (_engine is null || _engine.IsRunning)
+        if (_selectedRow?.Command is not { } command || _engine is null || _engine.IsRunning || _isRecording)
+        {
+            StatusText.Text = "Select a command to test";
             return;
+        }
 
         Exception? error = null;
         Hide();
+        FocusLastExternalWindow();
+
+        _engine.PlaybackSpeedPercent = EffectivePlaybackSpeed;
+        if (EffectiveShowHud)
+        {
+            _runStatusWindow = new RunStatusWindow(_appSettings.StopMacroHotkey, _appSettings.PauseMacroHotkey, EffectiveHudCorner, EffectiveHudOpacity);
+            _runStatusWindow.Show();
+            _runStatusWindow.UpdateStatus($"Testing: {command.DisplayText()}");
+        }
+
+        if (EffectiveLockMouse)
+            EnableMouseMovementLock();
+
+        try
+        {
+            await Task.Delay(120);
+            await _engine.StartCommandAsync(command, "Selected Command");
+        }
+        catch (Exception ex)
+        {
+            error = ex;
+        }
+        finally
+        {
+            DisableMouseMovementLock();
+            if (_runStatusWindow is not null)
+            {
+                _runStatusWindow.Close();
+                _runStatusWindow = null;
+            }
+            Show();
+            WindowState = System.Windows.WindowState.Normal;
+            Activate();
+        }
+
+        if (error is not null)
+            MessageBox.Show(this, error.Message, "Command test stopped", MessageBoxButton.OK, MessageBoxImage.Error);
+    }
+
+    private void CheckMacroButton_Click(object sender, RoutedEventArgs e)
+    {
+        var errors = new List<string>();
+        var warnings = new List<string>();
+        var duplicateSequences = _project.Sequences
+            .GroupBy(x => x.Name.Trim(), StringComparer.OrdinalIgnoreCase)
+            .Where(g => !string.IsNullOrWhiteSpace(g.Key) && g.Count() > 1)
+            .Select(g => g.Key)
+            .ToList();
+        foreach (var duplicate in duplicateSequences)
+            errors.Add($"Sequence name '{duplicate}' is used more than once.");
+
+        var sequenceNames = _project.Sequences.Select(x => x.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var variableNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var variable in _project.Variables ?? new List<ProjectVariable>())
+        {
+            var name = RuntimeValues.NormalizeName(variable.Name);
+            if (!Regex.IsMatch(name, "^[A-Za-z_][A-Za-z0-9_]*$"))
+                errors.Add($"Project variable '{variable.Name}' has an invalid name.");
+            else if (!variableNames.Add(name))
+                errors.Add($"Project variable '{name}' is defined more than once.");
+        }
+
+        if (_project.RuntimeSettings?.UseProjectRuntimeSettings == true
+            && !sequenceNames.Contains(_project.RuntimeSettings.StartupSequence))
+            errors.Add($"Macro startup sequence '{_project.RuntimeSettings.StartupSequence}' does not exist.");
+
+        foreach (var sequence in _project.Sequences)
+            ValidateCommands(sequence.Name, sequence.Commands, sequenceNames, errors, warnings);
+
+        var hotkeys = new[]
+        {
+            ("Stop", _appSettings.StopMacroHotkey),
+            ("Pause", _appSettings.PauseMacroHotkey),
+            ("Run Start", _appSettings.RunStartHotkey),
+            ("Run Current", _appSettings.RunCurrentHotkey)
+        }.Where(x => !string.IsNullOrWhiteSpace(x.Item2)).ToList();
+        foreach (var group in hotkeys.GroupBy(x => x.Item2.Trim(), StringComparer.OrdinalIgnoreCase).Where(g => g.Count() > 1))
+            warnings.Add($"Hotkey {group.Key} is used by: {string.Join(", ", group.Select(x => x.Item1))}.");
+
+        var dialog = new MacroCheckWindow(errors, warnings) { Owner = this };
+        dialog.ShowDialog();
+        StatusText.Text = errors.Count > 0 ? "Macro check found problems" : warnings.Count > 0 ? "Macro check found warnings" : "Macro check passed";
+    }
+
+    private void ValidateCommands(string sequenceName, IEnumerable<MacroCommand> commands, HashSet<string> sequenceNames, List<string> errors, List<string> warnings)
+    {
+        foreach (var command in commands)
+        {
+            if (!command.Enabled)
+                continue;
+
+            if (CommandCatalog.UsesColor(command.Type)
+                && !command.ColorHex.Contains('{')
+                && !ScreenTools.TryParseColor(command.ColorHex, out _, out _, out _))
+                errors.Add($"{sequenceName}: invalid color '{command.ColorHex}' in {FriendlyName(command.Type)}.");
+
+            if (command.Type == CommandType.RunSequence
+                && !command.TargetSequence.Contains('{')
+                && !sequenceNames.Contains(command.TargetSequence))
+                errors.Add($"{sequenceName}: sequence '{command.TargetSequence}' does not exist.");
+
+            if (command.FailureAction == FailureAction.RunSequence
+                && !string.IsNullOrWhiteSpace(command.FailureSequence)
+                && !command.FailureSequence.Contains('{')
+                && !sequenceNames.Contains(command.FailureSequence))
+                errors.Add($"{sequenceName}: failure sequence '{command.FailureSequence}' does not exist.");
+
+            if (command.Type is CommandType.PressKey or CommandType.KeyDown or CommandType.KeyUp or CommandType.HoldKey
+                or CommandType.RepeatKey or CommandType.WaitUntilKeyPressed or CommandType.WaitUntilKeyReleased
+                or CommandType.IfKeyPressed or CommandType.LoopWhileKeyPressed)
+            {
+                if (!string.IsNullOrWhiteSpace(command.Key) && !command.Key.Contains('{')
+                    && !InputController.TryGetVirtualKey(command.Key.Split('+', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries).LastOrDefault() ?? command.Key, out _))
+                    warnings.Add($"{sequenceName}: key '{command.Key}' may not be recognized in {FriendlyName(command.Type)}.");
+            }
+
+            if (command.Type is CommandType.IfImage or CommandType.WaitUntilImage or CommandType.WaitUntilImageGone
+                or CommandType.ClickImage or CommandType.DoubleClickImage or CommandType.MoveToImage
+                or CommandType.LoopUntilImage or CommandType.LoopWhileImage or CommandType.FindImageToVariables)
+            {
+                var hasFolder = !string.IsNullOrWhiteSpace(command.ImageFolder);
+                var hasImage = !string.IsNullOrWhiteSpace(command.ImagePath);
+                if (!hasFolder && !hasImage)
+                    errors.Add($"{sequenceName}: {FriendlyName(command.Type)} has no image or folder selected.");
+                else if (hasFolder && !command.ImageFolder.Contains('{') && !Directory.Exists(ProjectPaths.Resolve(command.ImageFolder)))
+                    errors.Add($"{sequenceName}: image folder is missing: {command.ImageFolder}.");
+                else if (!hasFolder && hasImage && !command.ImagePath.Contains('{') && !File.Exists(ProjectPaths.Resolve(command.ImagePath)))
+                    errors.Add($"{sequenceName}: image is missing: {command.ImagePath}.");
+            }
+
+            if ((command.Type is CommandType.ReadTextFile or CommandType.WriteTextFile) && string.IsNullOrWhiteSpace(command.FilePath))
+                errors.Add($"{sequenceName}: {FriendlyName(command.Type)} has no file path.");
+
+            if (command.Type == CommandType.RunProgram && string.IsNullOrWhiteSpace(command.ProgramPath))
+                errors.Add($"{sequenceName}: Open Program / File / URL is empty.");
+
+            if (command.Type == CommandType.RecordedActions && command.Children.Count == 0)
+                warnings.Add($"{sequenceName}: Record Actions is empty.");
+            else if (command.HasBody && command.Children.Count == 0)
+                warnings.Add($"{sequenceName}: {FriendlyName(command.Type)} has an empty {(command.HasElse ? "THEN" : "body")} block.");
+
+            ValidateCommands(sequenceName, command.Children, sequenceNames, errors, warnings);
+            ValidateCommands(sequenceName, command.ElseChildren, sequenceNames, errors, warnings);
+        }
+    }
+
+    private async Task RunSequenceFromUi(string name)
+    {
+        if (_engine is null || _engine.IsRunning || _isRecording)
+            return;
+
+        if (!TryPrepareRunOverrides(out var runValues))
+            return;
+        _engine.SetRunOverrides(runValues);
+
+        Exception? error = null;
+        Hide();
+        FocusLastExternalWindow();
+
+        _engine.PlaybackSpeedPercent = EffectivePlaybackSpeed;
+        if (EffectiveShowHud)
+        {
+            _runStatusWindow = new RunStatusWindow(
+                _appSettings.StopMacroHotkey,
+                _appSettings.PauseMacroHotkey,
+                EffectiveHudCorner,
+                EffectiveHudOpacity);
+            _runStatusWindow.Show();
+            _runStatusWindow.UpdateStatus($"Starting: {name}");
+        }
+
+        if (EffectiveLockMouse)
+            EnableMouseMovementLock();
+
         try
         {
             await Task.Delay(120);
@@ -2297,6 +3435,14 @@ public partial class MainWindow : Window
         }
         finally
         {
+            DisableMouseMovementLock();
+
+            if (_runStatusWindow is not null)
+            {
+                _runStatusWindow.Close();
+                _runStatusWindow = null;
+            }
+
             Show();
             WindowState = System.Windows.WindowState.Normal;
             Activate();
@@ -2321,12 +3467,16 @@ public partial class MainWindow : Window
         var running = _engine?.IsRunning == true;
         RunStartButton.IsEnabled = !running && !_isRecording;
         RunCurrentButton.IsEnabled = !running && !_isRecording;
+        RunFromHereButton.IsEnabled = !running && !_isRecording && _selectedRow?.Command is not null;
+        TestSelectedButton.IsEnabled = !running && !_isRecording && _selectedRow?.Command is not null;
+        CheckMacroButton.IsEnabled = !running && !_isRecording;
         StopButton.IsEnabled = running;
         PauseButton.IsEnabled = running;
         PauseButton.Content = _engine?.IsPaused == true ? "▶ Resume" : "⏸ Pause";
+        UpdateUndoButtons();
     }
 
-    // ---------------- NON-BLOCKING GLOBAL F8/F9 ----------------
+    // ---------------- GLOBAL HOTKEYS + MOUSE LOCK ----------------
 
     private void InstallKeyboardHook()
     {
@@ -2340,21 +3490,140 @@ public partial class MainWindow : Window
 
     private IntPtr KeyboardHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
     {
-        if (nCode >= 0 && (wParam.ToInt32() == NativeMethods.WM_KEYDOWN || wParam.ToInt32() == NativeMethods.WM_SYSKEYDOWN))
+        if (nCode >= 0)
         {
+            var message = wParam.ToInt32();
             var data = Marshal.PtrToStructure<NativeMethods.KBDLLHOOKSTRUCT>(lParam);
             var injected = (data.flags & 0x10) != 0;
+
             if (!injected)
             {
-                if (data.vkCode == 0x77) // F8
-                    Dispatcher.InvokeAsync(() => _engine?.Stop());
-                else if (data.vkCode == 0x78) // F9
-                    Dispatcher.InvokeAsync(() => _engine?.TogglePause());
+                if (message == NativeMethods.WM_KEYUP || message == NativeMethods.WM_SYSKEYUP)
+                {
+                    _hookKeysDown.Remove(data.vkCode);
+                }
+                else if ((message == NativeMethods.WM_KEYDOWN || message == NativeMethods.WM_SYSKEYDOWN)
+                         && _hookKeysDown.Add(data.vkCode))
+                {
+                    if (HotkeyMatches(_appSettings.StopMacroHotkey, data.vkCode))
+                    {
+                        Dispatcher.InvokeAsync(() => _engine?.Stop());
+                    }
+                    else if (HotkeyMatches(_appSettings.PauseMacroHotkey, data.vkCode))
+                    {
+                        Dispatcher.InvokeAsync(() => _engine?.TogglePause());
+                    }
+                    else if (HotkeyMatches(_appSettings.RunStartHotkey, data.vkCode))
+                    {
+                        Dispatcher.InvokeAsync(() => { _ = RunSequenceFromUi(EffectiveStartupSequence); });
+                    }
+                    else if (HotkeyMatches(_appSettings.RunCurrentHotkey, data.vkCode))
+                    {
+                        Dispatcher.InvokeAsync(() =>
+                        {
+                            if (_currentSequence is not null)
+                                _ = RunSequenceFromUi(_currentSequence.Name);
+                        });
+                    }
+                }
             }
         }
 
-        // Always pass the key through. F8/F9 remain usable in other programs.
+        // Global hotkeys are non-blocking and still pass through to the focused app.
         return NativeMethods.CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
+    }
+
+    private static bool HotkeyMatches(string? expression, uint eventVk)
+    {
+        if (string.IsNullOrWhiteSpace(expression))
+            return false;
+
+        var parts = expression.Split('+', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (parts.Length == 0)
+            return false;
+
+        var needCtrl = false;
+        var needShift = false;
+        var needAlt = false;
+        var needWin = false;
+        string? keyPart = null;
+
+        foreach (var raw in parts)
+        {
+            if (raw.Equals("CTRL", StringComparison.OrdinalIgnoreCase) || raw.Equals("CONTROL", StringComparison.OrdinalIgnoreCase))
+                needCtrl = true;
+            else if (raw.Equals("SHIFT", StringComparison.OrdinalIgnoreCase))
+                needShift = true;
+            else if (raw.Equals("ALT", StringComparison.OrdinalIgnoreCase))
+                needAlt = true;
+            else if (raw.Equals("WIN", StringComparison.OrdinalIgnoreCase) || raw.Equals("LWIN", StringComparison.OrdinalIgnoreCase) || raw.Equals("RWIN", StringComparison.OrdinalIgnoreCase))
+                needWin = true;
+            else if (keyPart is null)
+                keyPart = raw;
+            else
+                return false;
+        }
+
+        if (keyPart is null || !InputController.TryGetVirtualKey(keyPart, out var keyVk) || keyVk != eventVk)
+            return false;
+
+        var ctrl = (NativeMethods.GetAsyncKeyState(0x11) & 0x8000) != 0;
+        var shift = (NativeMethods.GetAsyncKeyState(0x10) & 0x8000) != 0;
+        var alt = (NativeMethods.GetAsyncKeyState(0x12) & 0x8000) != 0;
+        var win = (NativeMethods.GetAsyncKeyState(0x5B) & 0x8000) != 0
+                  || (NativeMethods.GetAsyncKeyState(0x5C) & 0x8000) != 0;
+
+        return (!needCtrl || ctrl)
+               && (!needShift || shift)
+               && (!needAlt || alt)
+               && (!needWin || win);
+    }
+
+    private void UpdateMouseLockForEngineState()
+    {
+        if (EffectiveLockMouse
+            && _engine?.IsRunning == true
+            && _engine.IsPaused == false)
+        {
+            EnableMouseMovementLock();
+        }
+        else
+        {
+            DisableMouseMovementLock();
+        }
+    }
+
+    private void EnableMouseMovementLock()
+    {
+        if (_mouseLockHook != IntPtr.Zero)
+            return;
+
+        _mouseLockProc = MouseLockHookCallback;
+        var module = NativeMethods.GetModuleHandle(null);
+        _mouseLockHook = NativeMethods.SetWindowsHookEx(NativeMethods.WH_MOUSE_LL, _mouseLockProc, module, 0);
+    }
+
+    private void DisableMouseMovementLock()
+    {
+        if (_mouseLockHook != IntPtr.Zero)
+        {
+            NativeMethods.UnhookWindowsHookEx(_mouseLockHook);
+            _mouseLockHook = IntPtr.Zero;
+        }
+        _mouseLockProc = null;
+    }
+
+    private IntPtr MouseLockHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+    {
+        if (nCode >= 0 && wParam.ToInt32() == NativeMethods.WM_MOUSEMOVE)
+        {
+            var data = Marshal.PtrToStructure<NativeMethods.MSLLHOOKSTRUCT>(lParam);
+            var injected = (data.flags & 0x01) != 0 || data.dwExtraInfo == InputController.MacroMouseInputTag;
+            if (!injected)
+                return (IntPtr)1;
+        }
+
+        return NativeMethods.CallNextHookEx(_mouseLockHook, nCode, wParam, lParam);
     }
 
     private IEnumerable<MacroCommand> EnumerateAllCommands()
@@ -2382,13 +3651,19 @@ public partial class MainWindow : Window
     {
         _engine?.Stop();
 
-        if (!ConfirmDiscardChanges())
+        if (!_skipSavePromptForUpdate && !ConfirmDiscardChanges())
         {
             e.Cancel = true;
             return;
         }
 
         _foregroundTimer.Stop();
+        DisableMouseMovementLock();
+        if (_runStatusWindow is not null)
+        {
+            _runStatusWindow.Close();
+            _runStatusWindow = null;
+        }
 
         if (_keyboardHook != IntPtr.Zero)
         {

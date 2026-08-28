@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Windows.Input;
 
@@ -20,15 +21,19 @@ internal static class NativeMethods
     public const int WM_RBUTTONUP = 0x0205;
     public const int WM_MOUSEWHEEL = 0x020A;
 
+    public const uint MOUSEEVENTF_MOVE = 0x0001;
     public const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
     public const uint MOUSEEVENTF_LEFTUP = 0x0004;
     public const uint MOUSEEVENTF_RIGHTDOWN = 0x0008;
     public const uint MOUSEEVENTF_RIGHTUP = 0x0010;
     public const uint MOUSEEVENTF_WHEEL = 0x0800;
+    public const uint MOUSEEVENTF_VIRTUALDESK = 0x4000;
+    public const uint MOUSEEVENTF_ABSOLUTE = 0x8000;
 
     public const uint KEYEVENTF_KEYUP = 0x0002;
     public const uint KEYEVENTF_UNICODE = 0x0004;
 
+    public const uint INPUT_MOUSE = 0;
     public const uint INPUT_KEYBOARD = 1;
     public const uint SRCCOPY = 0x00CC0020;
 
@@ -54,6 +59,15 @@ internal static class NativeMethods
     public static extern bool IsWindow(IntPtr hWnd);
 
     [DllImport("user32.dll")]
+    public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("dwmapi.dll")]
+    public static extern int DwmSetWindowAttribute(IntPtr hwnd, int dwAttribute, ref int pvAttribute, int cbAttribute);
+
+    [DllImport("user32.dll")]
     public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
 
     [DllImport("user32.dll")]
@@ -70,6 +84,12 @@ internal static class NativeMethods
 
     [DllImport("user32.dll")]
     public static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+
+    [DllImport("winmm.dll")]
+    public static extern uint timeBeginPeriod(uint uPeriod);
+
+    [DllImport("winmm.dll")]
+    public static extern uint timeEndPeriod(uint uPeriod);
 
     [DllImport("user32.dll")]
     public static extern IntPtr GetDC(IntPtr hWnd);
@@ -122,6 +142,15 @@ internal static class NativeMethods
     {
         public int X;
         public int Y;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT
+    {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -241,28 +270,106 @@ internal static class InputController
         ["SCROLLLOCK"] = 0x91
     };
 
+    public static readonly UIntPtr MacroMouseInputTag = new(0x4D4D4B52u);
+
     public static async Task MoveMouseAsync(int x, int y, int durationMs, CancellationToken token)
     {
-        if (durationMs <= 0 || !NativeMethods.GetCursorPos(out var start))
+        if (!NativeMethods.GetCursorPos(out var start))
         {
-            NativeMethods.SetCursorPos(x, y);
+            SendAbsoluteMouseMove(x, y);
             return;
         }
 
-        var steps = Math.Clamp(durationMs / 10, 2, 120);
-        var delay = Math.Max(1, durationMs / steps);
-
-        for (var i = 1; i <= steps; i++)
+        if (durationMs <= 0)
         {
-            token.ThrowIfCancellationRequested();
-            var t = (double)i / steps;
-            var nx = (int)Math.Round(start.X + (x - start.X) * t);
-            var ny = (int)Math.Round(start.Y + (y - start.Y) * t);
-            NativeMethods.SetCursorPos(nx, ny);
-            await Task.Delay(delay, token);
+            SendAbsoluteMouseMove(x, y);
+            return;
         }
 
-        NativeMethods.SetCursorPos(x, y);
+        var dx = x - start.X;
+        var dy = y - start.Y;
+        var distance = Math.Sqrt((double)dx * dx + (double)dy * dy);
+        if (distance < 1)
+            return;
+
+        // Respect the duration the user selected. A 50 ms smooth move should take
+        // about 50 ms even across a long distance. We still submit intermediate
+        // absolute mouse input at high frequency so Windows sees a continuous glide.
+        var smoothDurationMs = Math.Clamp(durationMs, 1, 60_000);
+
+        await Task.Run(() =>
+        {
+            NativeMethods.timeBeginPeriod(1);
+            try
+            {
+                var sw = Stopwatch.StartNew();
+                var lastX = start.X;
+                var lastY = start.Y;
+
+                while (sw.ElapsedMilliseconds < smoothDurationMs)
+                {
+                    token.ThrowIfCancellationRequested();
+                    var t = Math.Clamp(sw.Elapsed.TotalMilliseconds / smoothDurationMs, 0.0, 1.0);
+                    // Smoothstep removes the harsh start/stop of a linear cursor path.
+                    var eased = t * t * (3.0 - 2.0 * t);
+                    var nx = (int)Math.Round(start.X + dx * eased);
+                    var ny = (int)Math.Round(start.Y + dy * eased);
+
+                    if (nx != lastX || ny != lastY)
+                    {
+                        SendAbsoluteMouseMove(nx, ny);
+                        lastX = nx;
+                        lastY = ny;
+                    }
+
+                    Thread.Sleep(1);
+                }
+
+                SendAbsoluteMouseMove(x, y);
+            }
+            finally
+            {
+                NativeMethods.timeEndPeriod(1);
+            }
+        }, token);
+    }
+
+    private static void SendAbsoluteMouseMove(int x, int y)
+    {
+        const int SM_XVIRTUALSCREEN = 76;
+        const int SM_YVIRTUALSCREEN = 77;
+        const int SM_CXVIRTUALSCREEN = 78;
+        const int SM_CYVIRTUALSCREEN = 79;
+
+        var left = NativeMethods.GetSystemMetrics(SM_XVIRTUALSCREEN);
+        var top = NativeMethods.GetSystemMetrics(SM_YVIRTUALSCREEN);
+        var width = Math.Max(2, NativeMethods.GetSystemMetrics(SM_CXVIRTUALSCREEN));
+        var height = Math.Max(2, NativeMethods.GetSystemMetrics(SM_CYVIRTUALSCREEN));
+
+        var normalizedX = (int)Math.Round((x - left) * 65535.0 / (width - 1));
+        var normalizedY = (int)Math.Round((y - top) * 65535.0 / (height - 1));
+        normalizedX = Math.Clamp(normalizedX, 0, 65535);
+        normalizedY = Math.Clamp(normalizedY, 0, 65535);
+
+        var input = new NativeMethods.INPUT
+        {
+            type = NativeMethods.INPUT_MOUSE,
+            U = new NativeMethods.InputUnion
+            {
+                mi = new NativeMethods.MOUSEINPUT
+                {
+                    dx = normalizedX,
+                    dy = normalizedY,
+                    dwFlags = NativeMethods.MOUSEEVENTF_MOVE
+                              | NativeMethods.MOUSEEVENTF_ABSOLUTE
+                              | NativeMethods.MOUSEEVENTF_VIRTUALDESK,
+                    dwExtraInfo = MacroMouseInputTag
+                }
+            }
+        };
+
+        if (NativeMethods.SendInput(1, new[] { input }, Marshal.SizeOf<NativeMethods.INPUT>()) == 0)
+            NativeMethods.SetCursorPos(x, y);
     }
 
     public static void LeftDown() => NativeMethods.mouse_event(NativeMethods.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, UIntPtr.Zero);

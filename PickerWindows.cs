@@ -407,6 +407,7 @@ public sealed class TextPromptWindow : Window
 
     public TextPromptWindow(string title, string prompt, string startingValue)
     {
+        WindowTheme.Attach(this);
         Title = title;
         Width = 430;
         Height = 190;
@@ -459,17 +460,22 @@ public sealed class CommandPickerWindow : Window
     private readonly StackPanel _categoryPanel;
     private readonly StackPanel _commandPanel;
     private readonly TextBlock _categoryTitle;
+    private readonly TextBox _searchBox;
     private Button? _activeCategoryButton;
 
-    private readonly (string Name, (string Label, CommandType Type)[] Commands)[] _categories =
-        CommandCatalog.Categories
-            .Select(category => (
-                category.Name,
-                category.Commands.Select(command => (command.Label, command.Type)).ToArray()))
-            .ToArray();
+    private readonly (string Name, (string Label, CommandType Type)[] Commands)[] _categories;
 
     public CommandPickerWindow()
     {
+        _categories = CommandCatalog.Categories
+            .Select(category => (
+                category.Name,
+                category.Commands
+                    .Select(command => (command.Label, command.Type))
+                    .ToArray()))
+            .Where(category => category.Item2.Length > 0)
+            .ToArray();
+        WindowTheme.Attach(this);
         Title = "Add Command";
         Width = 650;
         Height = 500;
@@ -494,11 +500,28 @@ public sealed class CommandPickerWindow : Window
         });
         heading.Children.Add(new TextBlock
         {
-            Text = "Choose a category, then choose the action to add.",
+            Text = "Choose a category, or search for any command.",
             Margin = new Thickness(0, 4, 0, 0),
             FontSize = 13,
             Foreground = PickerBrushes.Get("MutedTextBrush")
         });
+        _searchBox = new TextBox
+        {
+            Margin = new Thickness(0, 10, 0, 0),
+            Padding = new Thickness(10, 7, 10, 7),
+            ToolTip = "Search commands, e.g. image, wait, variable, window"
+        };
+        _searchBox.TextChanged += (_, _) =>
+        {
+            var query = _searchBox.Text.Trim();
+            if (query.Length == 0)
+            {
+                var activeIndex = _activeCategoryButton is null ? 0 : _categoryPanel.Children.IndexOf(_activeCategoryButton);
+                ShowCategory(Math.Max(0, activeIndex));
+            }
+            else ShowSearchResults(query);
+        };
+        heading.Children.Add(_searchBox);
         Grid.SetRow(heading, 0);
         root.Children.Add(heading);
 
@@ -628,6 +651,39 @@ public sealed class CommandPickerWindow : Window
                 Close();
             };
             _commandPanel.Children.Add(button);
+        }
+    }
+
+    private void ShowSearchResults(string query)
+    {
+        _categoryTitle.Text = "Search results";
+        _commandPanel.Children.Clear();
+        foreach (var item in CommandCatalog.AllOptions
+                     .Where(x => x.Label.Contains(query, StringComparison.OrdinalIgnoreCase)
+                                 || x.Category.Contains(query, StringComparison.OrdinalIgnoreCase)
+                                 || x.Type.ToString().Contains(query, StringComparison.OrdinalIgnoreCase)))
+        {
+            var button = CreatePickerButton($"{item.Label}   ·   {item.Category}", true);
+            button.HorizontalContentAlignment = HorizontalAlignment.Left;
+            button.Margin = new Thickness(0, 0, 0, 7);
+            var type = item.Type;
+            button.Click += (_, _) =>
+            {
+                SelectedType = type;
+                DialogResult = true;
+                Close();
+            };
+            _commandPanel.Children.Add(button);
+        }
+
+        if (_commandPanel.Children.Count == 0)
+        {
+            _commandPanel.Children.Add(new TextBlock
+            {
+                Text = "No commands found.",
+                Foreground = PickerBrushes.Get("MutedTextBrush"),
+                Margin = new Thickness(4, 8, 0, 0)
+            });
         }
     }
 

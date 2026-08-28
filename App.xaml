@@ -333,6 +333,13 @@
             <Setter Property="Padding" Value="9,6"/>
         </Style>
 
+        <Style TargetType="ListBox">
+            <Setter Property="Foreground" Value="{DynamicResource TextBrush}"/>
+            <Setter Property="Background" Value="{DynamicResource InputBrush}"/>
+            <Setter Property="BorderBrush" Value="{DynamicResource BorderBrushDark}"/>
+            <Setter Property="BorderThickness" Value="1"/>
+        </Style>
+
         <Style TargetType="ListBoxItem">
             <Setter Property="Foreground" Value="{DynamicResource TextBrush}"/>
             <Setter Property="Background" Value="{DynamicResource ItemBrush}"/>

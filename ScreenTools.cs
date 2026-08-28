@@ -172,14 +172,17 @@ internal static class ImageMatcher
     private static readonly object TemplateCacheLock = new();
     private static readonly Dictionary<string, (DateTime Stamp, PixelBuffer Buffer)> TemplateCache = new(StringComparer.OrdinalIgnoreCase);
 
-    public static Task<ImageMatch?> FindAsync(MacroCommand command, CancellationToken token)
+    private static readonly string[] SupportedImageExtensions = [".png", ".jpg", ".jpeg", ".bmp"];
+
+    public static Task<ImageMatch?> FindAsync(MacroCommand command, CancellationToken token, Action<string>? progress = null)
     {
-        return Task.Run(() => Find(command, token), token);
+        return Task.Run(() => Find(command, token, progress), token);
     }
 
-    public static ImageMatch? Find(MacroCommand command, CancellationToken token)
+    public static ImageMatch? Find(MacroCommand command, CancellationToken token, Action<string>? progress = null)
     {
-        if (string.IsNullOrWhiteSpace(command.ImagePath) || !File.Exists(command.ImagePath))
+        var candidates = GetCandidatePaths(command);
+        if (candidates.Count == 0)
             return null;
 
         var region = GetSearchRegion(command);
@@ -188,9 +191,77 @@ internal static class ImageMatcher
         if (region.IsEmpty)
             return null;
 
+        // Capture once, then test every priority image against the same frame.
+        // This keeps folder-based priority checks much faster than recapturing
+        // the screen for every image.
         var screen = ScreenTools.ToBgra32(ScreenTools.CaptureRegion(region));
-        var template = LoadTemplateCached(command.ImagePath);
+        var tolerance = Math.Clamp(command.ImageTolerance, 0, 255);
 
+        for (var i = 0; i < candidates.Count; i++)
+        {
+            token.ThrowIfCancellationRequested();
+            var imagePath = candidates[i];
+            if (!File.Exists(imagePath))
+                continue;
+
+            progress?.Invoke($"Searching image {i + 1}/{candidates.Count}: {Path.GetFileName(imagePath)}");
+
+            var template = LoadTemplateCached(imagePath);
+            var match = FindTemplate(screen, template, region, tolerance, token);
+            if (match.HasValue)
+            {
+                progress?.Invoke($"Found image: {Path.GetFileName(imagePath)}");
+                return match.Value with { SourcePath = imagePath };
+            }
+        }
+
+        return null;
+    }
+
+    public static List<string> GetCandidatePaths(MacroCommand command)
+    {
+        if (!string.IsNullOrWhiteSpace(command.ImageFolder))
+        {
+            var folder = ProjectPaths.Resolve(command.ImageFolder);
+            if (!Directory.Exists(folder))
+                return new List<string>();
+
+            var searchOption = command.ImageIncludeSubfolders
+                ? SearchOption.AllDirectories
+                : SearchOption.TopDirectoryOnly;
+
+            var all = Directory.EnumerateFiles(folder, "*.*", searchOption)
+                .Where(IsSupportedImage)
+                .ToDictionary(path => Path.GetRelativePath(folder, path), path => path, StringComparer.OrdinalIgnoreCase);
+
+            var ordered = new List<string>();
+            foreach (var item in command.ImagePriority ?? new List<string>())
+            {
+                var relative = item.Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar);
+                if (all.TryGetValue(relative, out var path) && !ordered.Contains(path, StringComparer.OrdinalIgnoreCase))
+                    ordered.Add(path);
+            }
+
+            // Any new images appear after the saved priority list until the user
+            // moves them and saves the project.
+            ordered.AddRange(all
+                .Where(pair => !ordered.Contains(pair.Value, StringComparer.OrdinalIgnoreCase))
+                .OrderBy(pair => pair.Key, StringComparer.OrdinalIgnoreCase)
+                .Select(pair => pair.Value));
+            return ordered;
+        }
+
+        var single = ProjectPaths.Resolve(command.ImagePath);
+        return !string.IsNullOrWhiteSpace(single) && File.Exists(single)
+            ? new List<string> { single }
+            : new List<string>();
+    }
+
+    private static bool IsSupportedImage(string path)
+        => SupportedImageExtensions.Contains(Path.GetExtension(path), StringComparer.OrdinalIgnoreCase);
+
+    private static ImageMatch? FindTemplate(PixelBuffer screen, PixelBuffer template, ScreenRegion region, int tolerance, CancellationToken token)
+    {
         if (template.Width <= 0 || template.Height <= 0 ||
             template.Width > screen.Width || template.Height > screen.Height)
             return null;
@@ -199,10 +270,8 @@ internal static class ImageMatcher
         if (anchors.Count == 0)
             return null;
 
-        var tolerance = Math.Clamp(command.ImageTolerance, 0, 255);
         var maxX = screen.Width - template.Width;
         var maxY = screen.Height - template.Height;
-
         for (var y = 0; y <= maxY; y++)
         {
             if ((y & 15) == 0)
@@ -212,12 +281,10 @@ internal static class ImageMatcher
             {
                 if (!AnchorsMatch(screen, template, anchors, x, y, tolerance))
                     continue;
-
                 if (VerifyMatch(screen, template, x, y, tolerance))
                     return new ImageMatch(region.X + x, region.Y + y, template.Width, template.Height);
             }
         }
-
         return null;
     }
 

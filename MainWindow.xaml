@@ -40,10 +40,12 @@
 
                 <StackPanel Orientation="Horizontal">
                     <Button Content="New" Width="68" Click="NewProject_Click"/>
-                    <Button Content="Open" Width="68" Margin="7,0,0,0" Click="OpenProject_Click"/>
+                    <Button Content="Open" Width="72" Margin="7,0,0,0" Click="OpenProject_Click"/>
                     <Button Content="Save" Width="68" Margin="7,0,0,0" Click="SaveProject_Click"/>
                     <Button Content="Save As" Width="82" Margin="7,0,0,0" Click="SaveProjectAs_Click"/>
-                    <Button Content="Settings" Width="86" Margin="7,0,0,0" Click="SettingsButton_Click"/>
+                    <Button Content="Macro Setup" Width="100" Margin="14,0,0,0" Click="MacroSettingsButton_Click"/>
+                    <Button Content="Export ZIP" Width="88" Margin="7,0,0,0" Click="ExportProjectButton_Click"/>
+                    <Button Content="⚙ Settings" Width="96" Margin="14,0,0,0" Click="SettingsButton_Click"/>
                 </StackPanel>
             </DockPanel>
         </Border>
@@ -131,9 +133,13 @@
                             <Button x:Name="AddBlockButton" Content="+ Add to Block" Width="122" Margin="7,0,0,0" Click="AddInsideButton_Click"/>
                             <Button x:Name="AddElseButton" Content="+ Add Else" Width="100" Margin="7,0,0,0" Click="AddElseButton_Click"/>
                             <Button Content="Duplicate" Width="92" Margin="7,0,0,0" Click="DuplicateCommandButton_Click"/>
+                            <Button Content="Copy" Width="64" Margin="7,0,0,0" Click="CopyCommandButton_Click"/>
+                            <Button Content="Paste" Width="64" Margin="7,0,0,0" Click="PasteCommandButton_Click"/>
                             <Button Content="↑" Width="42" Margin="7,0,0,0" Click="MoveUpButton_Click"/>
                             <Button Content="↓" Width="42" Margin="7,0,0,0" Click="MoveDownButton_Click"/>
                             <Button Content="Delete" Width="78" Margin="7,0,0,0" Click="DeleteCommandButton_Click"/>
+                            <Button x:Name="UndoButton" Content="↶ Undo" Width="78" Margin="16,0,0,0" Click="UndoButton_Click"/>
+                            <Button x:Name="RedoButton" Content="↷ Redo" Width="78" Margin="7,0,0,0" Click="RedoButton_Click"/>
                         </WrapPanel>
                     </Border>
                 </Grid>
@@ -172,7 +178,10 @@
                 <StackPanel Orientation="Horizontal">
                     <Button x:Name="RunStartButton" Style="{StaticResource AccentButtonStyle}" Content="▶ Run Start" Width="110" Click="RunStartButton_Click"/>
                     <Button x:Name="RunCurrentButton" Content="▶ Run Current" Width="118" Margin="7,0,0,0" Click="RunCurrentButton_Click"/>
-                    <Button x:Name="PauseButton" Content="⏸ Pause" Width="96" Margin="7,0,0,0" Click="PauseButton_Click"/>
+                    <Button x:Name="RunFromHereButton" Content="▶ Run From Here" Width="128" Margin="7,0,0,0" Click="RunFromHereButton_Click"/>
+                    <Button x:Name="TestSelectedButton" Content="Test Selected" Width="112" Margin="14,0,0,0" Click="TestSelectedButton_Click"/>
+                    <Button x:Name="CheckMacroButton" Content="✓ Check Macro" Width="112" Margin="7,0,0,0" Click="CheckMacroButton_Click"/>
+                    <Button x:Name="PauseButton" Content="⏸ Pause" Width="96" Margin="14,0,0,0" Click="PauseButton_Click"/>
                     <Button x:Name="StopButton" Content="■ Stop" Width="90" Margin="7,0,0,0" Click="StopButton_Click"/>
                 </StackPanel>
             </DockPanel>
