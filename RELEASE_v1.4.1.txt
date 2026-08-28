@@ -1,8 +1,0 @@
-MacroMaker v1.4.1
-
-- All commands are always available in Add Command; removed the Simple/Advanced command toggle
-- Update flow now asks to save an unsaved macro before downloading/installing an update
-- Choosing Don't Save can still update cleanly without the shutdown save prompt blocking the installer
-- Pause / Resume default hotkey changed to F7
-- Default smooth mouse movement changed from 250 ms to 50 ms
-- Existing untouched F9/250 ms settings migrate to the new defaults
