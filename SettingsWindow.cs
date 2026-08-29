@@ -93,7 +93,7 @@ public sealed class SettingsWindow : Window
         };
         controlsPanel.Children.Add(_pauseHotkeyBox);
 
-        AddLabel(controlsPanel, "Run Starting Sequence hotkey (optional)");
+        AddLabel(controlsPanel, "Run Macro hotkey (optional)");
         _runStartHotkeyBox = new TextBox
         {
             Text = current.RunStartHotkey,
@@ -101,7 +101,7 @@ public sealed class SettingsWindow : Window
         };
         controlsPanel.Children.Add(_runStartHotkeyBox);
 
-        AddLabel(controlsPanel, "Run Current Sequence hotkey (optional)");
+        AddLabel(controlsPanel, "Run Current Tab hotkey (optional)");
         _runCurrentHotkeyBox = new TextBox
         {
             Text = current.RunCurrentHotkey,

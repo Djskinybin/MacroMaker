@@ -210,9 +210,11 @@ public sealed class QuickAddSettingsWindow : Window
         {
             Text = option.Label,
             Foreground = Brush("TextBrush"),
-            VerticalAlignment = VerticalAlignment.Center,
             FontWeight = FontWeights.Medium
         };
+        var labelStack = new StackPanel();
+        labelStack.Children.Add(label);
+
         var state = new TextBlock
         {
             Text = enabled ? "✓ Shown" : "Hidden",
@@ -223,7 +225,7 @@ public sealed class QuickAddSettingsWindow : Window
         var dock = new DockPanel();
         DockPanel.SetDock(state, Dock.Right);
         dock.Children.Add(state);
-        dock.Children.Add(label);
+        dock.Children.Add(labelStack);
 
         var button = new Button
         {
@@ -232,7 +234,7 @@ public sealed class QuickAddSettingsWindow : Window
             BorderBrush = enabled ? Brush("AccentBrush") : Brush("BorderBrushDark"),
             BorderThickness = new Thickness(1),
             Padding = new Thickness(12, 10, 12, 10),
-            MinHeight = 42,
+            MinHeight = 50,
             HorizontalContentAlignment = HorizontalAlignment.Stretch,
             Margin = new Thickness(0, 0, 0, 7),
             Cursor = Cursors.Hand

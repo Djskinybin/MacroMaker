@@ -43,9 +43,8 @@
                     <Button Content="Open" Width="72" Margin="7,0,0,0" Click="OpenProject_Click"/>
                     <Button Content="Save" Width="68" Margin="7,0,0,0" Click="SaveProject_Click"/>
                     <Button Content="Save As" Width="82" Margin="7,0,0,0" Click="SaveProjectAs_Click"/>
-                    <Button Content="Macro Setup" Width="100" Margin="14,0,0,0" Click="MacroSettingsButton_Click"/>
-                    <Button Content="Export ZIP" Width="88" Margin="7,0,0,0" Click="ExportProjectButton_Click"/>
-                    <Button Content="⚙ Settings" Width="96" Margin="14,0,0,0" Click="SettingsButton_Click"/>
+                    <Button Content="Variables" Width="86" Margin="14,0,0,0" Click="VariablesButton_Click" ToolTip="View and edit saved values used by this macro"/>
+                    <Button Content="⚙ Settings" Width="96" Margin="7,0,0,0" Click="SettingsButton_Click"/>
                 </StackPanel>
             </DockPanel>
         </Border>
@@ -97,26 +96,68 @@
                         <TextBlock x:Name="SequenceTitleText" Text="Starting Sequence" FontSize="22" FontWeight="SemiBold" VerticalAlignment="Center"/>
                     </DockPanel>
 
-                    <!-- QUICK ADD replaces typed-command box -->
                     <Border Grid.Row="1" Background="{DynamicResource TopBarBrush}" BorderBrush="{DynamicResource BorderBrushSoft}" BorderThickness="1" CornerRadius="10" Padding="10" Margin="0,0,0,12">
-                        <DockPanel LastChildFill="True">
-                            <TextBlock DockPanel.Dock="Left" Text="Quick add" Foreground="{DynamicResource MutedTextBrush}" FontWeight="SemiBold" VerticalAlignment="Center" Margin="2,0,12,0"/>
-                            <WrapPanel x:Name="QuickAddPanel"/>
-                        </DockPanel>
+                        <StackPanel>
+                            <DockPanel LastChildFill="True">
+                                <TextBlock DockPanel.Dock="Left" Text="Quick Add" Foreground="{DynamicResource MutedTextBrush}" FontWeight="SemiBold" VerticalAlignment="Center" Margin="2,0,12,0"/>
+                                <WrapPanel x:Name="QuickAddPanel"/>
+                            </DockPanel>
+                        </StackPanel>
                     </Border>
 
                     <ListBox x:Name="CommandList"
                              Grid.Row="2"
                              Background="Transparent"
                              BorderThickness="0"
+                             SelectionMode="Extended"
+                             AllowDrop="True"
                              SelectionChanged="CommandList_SelectionChanged"
-                             MouseDoubleClick="CommandList_MouseDoubleClick">
+                             MouseDoubleClick="CommandList_MouseDoubleClick"
+                             PreviewMouseLeftButtonDown="CommandList_PreviewMouseLeftButtonDown"
+                             PreviewMouseMove="CommandList_PreviewMouseMove"
+                             PreviewMouseRightButtonDown="CommandList_PreviewMouseRightButtonDown"
+                             DragOver="CommandList_DragOver"
+                             Drop="CommandList_Drop"
+                             ContextMenuOpening="CommandList_ContextMenuOpening">
+                        <ListBox.ContextMenu>
+                            <ContextMenu/>
+                        </ListBox.ContextMenu>
                         <ListBox.ItemTemplate>
                             <DataTemplate>
-                                <TextBlock x:Name="RowText"
-                                           Text="{Binding Display}"
-                                           Margin="{Binding Indent}"
-                                           TextWrapping="Wrap"/>
+                                <Grid>
+                                    <Border Width="2"
+                                            HorizontalAlignment="Left"
+                                            Margin="{Binding NestingGuideMargin}"
+                                            Background="{DynamicResource AccentBrush}"
+                                            Opacity="0.30"
+                                            CornerRadius="1"
+                                            Visibility="{Binding NestingGuideVisibility}"/>
+                                    <Grid Margin="{Binding Indent}">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="Auto"/>
+                                            <ColumnDefinition Width="*"/>
+                                        </Grid.ColumnDefinitions>
+                                        <Button x:Name="CollapseButton"
+                                                Grid.Column="0"
+                                                Content="{Binding CollapseGlyph}"
+                                                Visibility="{Binding CollapseVisibility}"
+                                                Width="26"
+                                                Height="26"
+                                                MinHeight="0"
+                                                Padding="0"
+                                                Margin="0,0,6,0"
+                                                Background="Transparent"
+                                                BorderBrush="Transparent"
+                                                FontSize="10"
+                                                ToolTip="Collapse or expand this block"
+                                                Click="CollapseRowButton_Click"/>
+                                        <TextBlock x:Name="RowText"
+                                                   Grid.Column="1"
+                                                   Text="{Binding Display}"
+                                                   VerticalAlignment="Center"
+                                                   TextWrapping="Wrap"/>
+                                    </Grid>
+                                </Grid>
                                 <DataTemplate.Triggers>
                                     <DataTrigger Binding="{Binding IsHeader}" Value="True">
                                         <Setter TargetName="RowText" Property="Foreground" Value="{DynamicResource AccentBrush}"/>
@@ -176,13 +217,14 @@
                 </Border>
 
                 <StackPanel Orientation="Horizontal">
-                    <Button x:Name="RunStartButton" Style="{StaticResource AccentButtonStyle}" Content="▶ Run Start" Width="110" Click="RunStartButton_Click"/>
-                    <Button x:Name="RunCurrentButton" Content="▶ Run Current" Width="118" Margin="7,0,0,0" Click="RunCurrentButton_Click"/>
-                    <Button x:Name="RunFromHereButton" Content="▶ Run From Here" Width="128" Margin="7,0,0,0" Click="RunFromHereButton_Click"/>
-                    <Button x:Name="TestSelectedButton" Content="Test Selected" Width="112" Margin="14,0,0,0" Click="TestSelectedButton_Click"/>
-                    <Button x:Name="CheckMacroButton" Content="✓ Check Macro" Width="112" Margin="7,0,0,0" Click="CheckMacroButton_Click"/>
+                    <Button x:Name="RunStartButton" Style="{StaticResource AccentButtonStyle}" Content="▶ Run Macro" Width="138" Click="RunStartButton_Click" ToolTip="Runs the macro from its starting tab"/>
+                    <Button x:Name="TestMenuButton" Content="Test ▾" Width="92" Margin="8,0,0,0" Click="TestMenuButton_Click" ToolTip="Testing tools"/>
                     <Button x:Name="PauseButton" Content="⏸ Pause" Width="96" Margin="14,0,0,0" Click="PauseButton_Click"/>
                     <Button x:Name="StopButton" Content="■ Stop" Width="90" Margin="7,0,0,0" Click="StopButton_Click"/>
+                    <Button x:Name="RunCurrentButton" Visibility="Collapsed" Click="RunCurrentButton_Click"/>
+                    <Button x:Name="RunFromHereButton" Visibility="Collapsed" Click="RunFromHereButton_Click"/>
+                    <Button x:Name="TestSelectedButton" Visibility="Collapsed" Click="TestSelectedButton_Click"/>
+                    <Button x:Name="CheckMacroButton" Visibility="Collapsed" Click="CheckMacroButton_Click"/>
                 </StackPanel>
             </DockPanel>
         </Border>

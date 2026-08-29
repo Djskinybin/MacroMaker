@@ -5,7 +5,7 @@ namespace MacroMaker;
 
 internal sealed class RuntimeValues
 {
-    private static readonly Regex TokenRegex = new(@"\{([A-Za-z_][A-Za-z0-9_]*)\}", RegexOptions.Compiled);
+    private static readonly Regex BareIdentifierRegex = new(@"\b([A-Za-z_][A-Za-z0-9_]*)\b", RegexOptions.Compiled);
     private readonly Dictionary<string, string> _values = new(StringComparer.OrdinalIgnoreCase);
 
     public RuntimeValues(MacroProject project)
@@ -25,6 +25,32 @@ internal sealed class RuntimeValues
     }
 
     public IReadOnlyDictionary<string, string> Snapshot() => new Dictionary<string, string>(_values, StringComparer.OrdinalIgnoreCase);
+
+    public MacroCommand ResolveNumericExpressions(MacroCommand source)
+    {
+        if (source.ValueExpressions is null || source.ValueExpressions.Count == 0)
+            return source;
+
+        // Keep the original child lists so blocks still execute the real commands.
+        // The clone is only used for this execution pass so variable-backed numbers
+        // can be resolved again the next time the command runs.
+        var resolved = source.ShallowCloneForExecution();
+
+        foreach (var pair in source.ValueExpressions)
+        {
+            if (string.IsNullOrWhiteSpace(pair.Key) || string.IsNullOrWhiteSpace(pair.Value))
+                continue;
+
+            var property = typeof(MacroCommand).GetProperty(pair.Key);
+            if (property is null || !property.CanRead || !property.CanWrite || property.PropertyType != typeof(int))
+                continue;
+
+            var fallback = property.GetValue(source) is int value ? value : 0;
+            property.SetValue(resolved, ResolveInt(pair.Value, fallback));
+        }
+
+        return resolved;
+    }
 
     public string Get(string name)
     {
@@ -55,7 +81,16 @@ internal sealed class RuntimeValues
     public string ResolveText(string? text)
     {
         var source = text ?? string.Empty;
-        return TokenRegex.Replace(source, match => Get(match.Groups[1].Value));
+        var trimmed = source.Trim();
+
+        // Plain variable names are the only variable syntax. If the entire field
+        // is a variable or built-in name, use its value. Otherwise keep the text literal.
+        if (TryGetBuiltIn(trimmed, out var builtIn))
+            return builtIn;
+        if (_values.TryGetValue(trimmed, out var value))
+            return value;
+
+        return source;
     }
 
     public int ResolveInt(string? expression, int fallback)
@@ -64,6 +99,17 @@ internal sealed class RuntimeValues
             return fallback;
 
         var expanded = ResolveText(expression).Trim();
+
+        // Numeric fields accept plain variable names and formulas. Examples:
+        // FoundX, FoundX+20, MouseX.
+        expanded = BareIdentifierRegex.Replace(expanded, match =>
+        {
+            var name = NormalizeName(match.Groups[1].Value);
+            if (TryGetBuiltIn(name, out var builtIn))
+                return builtIn;
+            return _values.TryGetValue(name, out var value) ? value : match.Value;
+        });
+
         if (int.TryParse(expanded, NumberStyles.Integer, CultureInfo.InvariantCulture, out var direct))
             return direct;
 
@@ -76,7 +122,7 @@ internal sealed class RuntimeValues
         }
         catch
         {
-            throw new InvalidOperationException($"Could not evaluate number expression '{expression}'.");
+            throw new InvalidOperationException($"Could not evaluate number or variable '{expression}'. Try a number, a variable like FoundX, or a formula like FoundX+20.");
         }
     }
 
@@ -117,13 +163,7 @@ internal sealed class RuntimeValues
         };
     }
 
-    public static string NormalizeName(string? value)
-    {
-        var name = (value ?? string.Empty).Trim();
-        if (name.StartsWith('{') && name.EndsWith('}') && name.Length > 2)
-            name = name[1..^1].Trim();
-        return name;
-    }
+    public static string NormalizeName(string? value) => (value ?? string.Empty).Trim();
 
     private static bool TryNumber(string value, out double number) =>
         double.TryParse(value.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out number);

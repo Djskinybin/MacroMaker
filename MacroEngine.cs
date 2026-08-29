@@ -154,13 +154,14 @@ public sealed class MacroEngine
         CancellationToken token,
         int depth)
     {
-        foreach (var command in commands)
+        foreach (var sourceCommand in commands)
         {
             token.ThrowIfCancellationRequested();
             await WaitWhilePausedAsync(token);
-            if (!command.Enabled)
+            if (!sourceCommand.Enabled)
                 continue;
 
+            var command = _values.ResolveNumericExpressions(sourceCommand);
             CommandStarted?.Invoke(sequenceName, command.Id);
 
             switch (command.Type)

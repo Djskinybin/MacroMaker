@@ -156,7 +156,7 @@ public sealed class PointPickerWindow : Window
 
     public int PickedX { get; private set; }
     public int PickedY { get; private set; }
-    public string PickedColor { get; private set; } = "0xFFFFFF";
+    public string PickedColor { get; private set; } = "0x000000";
 
     private void UpdateMouseInfo()
     {
@@ -516,7 +516,9 @@ public sealed class CommandPickerWindow : Window
             var query = _searchBox.Text.Trim();
             if (query.Length == 0)
             {
-                var activeIndex = _activeCategoryButton is null ? 0 : _categoryPanel.Children.IndexOf(_activeCategoryButton);
+                var activeIndex = 0;
+                if (_activeCategoryButton is not null && _categoryPanel is not null)
+                    activeIndex = _categoryPanel.Children.IndexOf(_activeCategoryButton);
                 ShowCategory(Math.Max(0, activeIndex));
             }
             else ShowSearchResults(query);
@@ -641,8 +643,7 @@ public sealed class CommandPickerWindow : Window
 
         foreach (var (label, type) in category.Commands)
         {
-            var button = CreatePickerButton(label, true);
-            button.HorizontalContentAlignment = HorizontalAlignment.Left;
+            var button = CreateCommandButton(label, type);
             button.Margin = new Thickness(0, 0, 0, 7);
             button.Click += (_, _) =>
             {
@@ -663,8 +664,7 @@ public sealed class CommandPickerWindow : Window
                                  || x.Category.Contains(query, StringComparison.OrdinalIgnoreCase)
                                  || x.Type.ToString().Contains(query, StringComparison.OrdinalIgnoreCase)))
         {
-            var button = CreatePickerButton($"{item.Label}   ·   {item.Category}", true);
-            button.HorizontalContentAlignment = HorizontalAlignment.Left;
+            var button = CreateCommandButton($"{item.Label}   ·   {item.Category}", item.Type);
             button.Margin = new Thickness(0, 0, 0, 7);
             var type = item.Type;
             button.Click += (_, _) =>
@@ -685,6 +685,30 @@ public sealed class CommandPickerWindow : Window
                 Margin = new Thickness(4, 8, 0, 0)
             });
         }
+    }
+
+    private static Button CreateCommandButton(string label, CommandType type)
+    {
+        var content = new StackPanel();
+        content.Children.Add(new TextBlock
+        {
+            Text = label,
+            Foreground = PickerBrushes.Get("TextBrush"),
+            FontWeight = FontWeights.SemiBold
+        });
+
+        return new Button
+        {
+            Content = content,
+            Foreground = PickerBrushes.Get("TextBrush"),
+            Background = PickerBrushes.Get("InputBrush"),
+            BorderBrush = PickerBrushes.Get("BorderBrushDark"),
+            BorderThickness = new Thickness(1),
+            Padding = new Thickness(12, 9, 12, 9),
+            MinHeight = 44,
+            Cursor = Cursors.Hand,
+            HorizontalContentAlignment = HorizontalAlignment.Left
+        };
     }
 
     private static Button CreatePickerButton(string text, bool command)

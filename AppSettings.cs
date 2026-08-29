@@ -17,10 +17,10 @@ public sealed class CommandDefaultProfile
 {
     public CommandType Type { get; set; }
 
-    public int X { get; set; } = 960;
-    public int Y { get; set; } = 300;
-    public int EndX { get; set; } = 1100;
-    public int EndY { get; set; } = 500;
+    public int X { get; set; }
+    public int Y { get; set; }
+    public int EndX { get; set; }
+    public int EndY { get; set; }
     public CoordinateMode CoordinateMode { get; set; } = CoordinateMode.Screen;
     public MouseMoveMode MouseMoveMode { get; set; } = MouseMoveMode.Smooth;
     public int MoveDurationMs { get; set; } = 50;
@@ -43,8 +43,8 @@ public sealed class CommandDefaultProfile
     public int PollMs { get; set; } = 50;
     public int TimeoutMs { get; set; }
 
-    public string ColorHex { get; set; } = "0xFFFFFF";
-    public int ColorTolerance { get; set; } = 8;
+    public string ColorHex { get; set; } = "0x000000";
+    public int ColorTolerance { get; set; }
     public CompareMode CompareMode { get; set; } = CompareMode.Equals;
 
     public int ImageTolerance { get; set; } = 25;
@@ -60,13 +60,18 @@ public sealed class CommandDefaultProfile
     public int ImageOffsetX { get; set; }
     public int ImageOffsetY { get; set; }
 
-    public string VariableName { get; set; } = "value";
+    public string VariableName { get; set; } = string.Empty;
     public string VariableValue { get; set; } = "0";
     public string VariableValue2 { get; set; } = "100";
     public VariableCompareMode VariableCompareMode { get; set; } = VariableCompareMode.Equals;
-    public string StoreXVariable { get; set; } = "FoundX";
-    public string StoreYVariable { get; set; } = "FoundY";
-    public string StoreTextVariable { get; set; } = "Result";
+    public string StoreXVariable { get; set; } = string.Empty;
+    public string StoreYVariable { get; set; } = string.Empty;
+    public string StoreTextVariable { get; set; } = string.Empty;
+
+    // Variable/formula overrides for normal command values.
+    // Keys match MacroCommand property names, such as "X", "WaitMs", or "FilePath".
+    public Dictionary<string, string> ValueExpressions { get; set; } = new();
+
     public string FilePath { get; set; } = string.Empty;
     public bool AppendFile { get; set; }
     public string PromptText { get; set; } = "Enter a value:";
@@ -122,6 +127,9 @@ public sealed class CommandDefaultProfile
         StoreXVariable = StoreXVariable,
         StoreYVariable = StoreYVariable,
         StoreTextVariable = StoreTextVariable,
+        ValueExpressions = ValueExpressions is null
+            ? new Dictionary<string, string>()
+            : new Dictionary<string, string>(ValueExpressions, StringComparer.OrdinalIgnoreCase),
         FilePath = FilePath,
         AppendFile = AppendFile,
         PromptText = PromptText,
@@ -135,7 +143,7 @@ public sealed class CommandDefaultProfile
 public sealed class AppSettings
 {
     public AppTheme Theme { get; set; } = AppTheme.Dark;
-    public int DefaultsRevision { get; set; } = 2;
+    public int DefaultsRevision { get; set; } = 3;
     public bool CheckForUpdatesOnStartup { get; set; } = true;
     public DateTime LastSuccessfulUpdateCheckUtc { get; set; } = DateTime.MinValue;
 
@@ -150,6 +158,7 @@ public sealed class AppSettings
     public int RunHudOpacityPercent { get; set; } = 92;
     public bool ShowAdvancedCommands { get; set; } = true; // Legacy setting; all commands are always shown now.
     public bool AutoSaveProjectChanges { get; set; } = true;
+    public List<string> RecentProjects { get; set; } = new();
     public List<CommandType> QuickAddCommands { get; set; } = new()
     {
         CommandType.MoveMouse,
@@ -163,7 +172,7 @@ public sealed class AppSettings
     // Kept only so V1.7 settings migrate cleanly.
     public MouseMoveMode DefaultMouseMoveMode { get; set; } = MouseMoveMode.Smooth;
     public int DefaultSmoothMoveMs { get; set; } = 50;
-    public int DefaultColorTolerance { get; set; } = 8;
+    public int DefaultColorTolerance { get; set; }
     public int DefaultPollMs { get; set; } = 50;
 
     public CommandDefaultProfile DefaultsFor(CommandType type)
@@ -218,7 +227,9 @@ internal static class AppSettingsStore
             var needsV141DefaultsMigration = !json.Contains("\"DefaultsRevision\"", StringComparison.OrdinalIgnoreCase);
             var settings = JsonSerializer.Deserialize<AppSettings>(json, JsonOptions)
                            ?? new AppSettings();
-            Repair(settings, !hadProfilesInFile, needsV141DefaultsMigration);
+            var needsZeroDefaultsMigration = !json.Contains("\"DefaultsRevision\"", StringComparison.OrdinalIgnoreCase)
+                                            || settings.DefaultsRevision < 3;
+            Repair(settings, !hadProfilesInFile, needsV141DefaultsMigration, needsZeroDefaultsMigration);
             return settings;
         }
         catch
@@ -229,17 +240,24 @@ internal static class AppSettingsStore
 
     public static void Save(AppSettings settings)
     {
-        Repair(settings, false, false);
+        Repair(settings, false, false, false);
         Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath)!);
         File.WriteAllText(SettingsPath, JsonSerializer.Serialize(settings, JsonOptions));
     }
 
-    private static void Repair(AppSettings settings, bool migrateLegacy, bool migrateV141Defaults)
+    private static void Repair(AppSettings settings, bool migrateLegacy, bool migrateV141Defaults, bool migrateZeroDefaults)
     {
         settings.QuickAddCommands ??= new List<CommandType>();
         settings.QuickAddCommands = settings.QuickAddCommands
             .Where(CommandCatalog.CanQuickAdd)
             .Distinct()
+            .ToList();
+
+        settings.RecentProjects ??= new List<string>();
+        settings.RecentProjects = settings.RecentProjects
+            .Where(path => !string.IsNullOrWhiteSpace(path) && Directory.Exists(path))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Take(8)
             .ToList();
 
         settings.StopMacroHotkey = NormalizeHotkey(settings.StopMacroHotkey, "F8");
@@ -282,7 +300,7 @@ internal static class AppSettingsStore
             }
         }
 
-        // V1.4.1 changed the untouched defaults from F9/250ms to F7/50ms.
+        // Migrate older test-build defaults from F9/250ms to the current F7/50ms defaults.
         // Only migrate old settings files that do not yet carry a defaults revision,
         // and only values that still match the old shipped defaults.
         if (migrateV141Defaults)
@@ -299,7 +317,26 @@ internal static class AppSettingsStore
             }
         }
 
-        settings.DefaultsRevision = 2;
+        if (migrateZeroDefaults)
+        {
+            if (settings.DefaultColorTolerance == 8)
+                settings.DefaultColorTolerance = 0;
+
+            foreach (var p in settings.CommandDefaults)
+            {
+                if (p.X == 960) p.X = 0;
+                if (p.Y == 300) p.Y = 0;
+                if (p.EndX == 1100) p.EndX = 0;
+                if (p.EndY == 500) p.EndY = 0;
+                if (string.Equals(p.ColorHex, "0xFFFFFF", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(p.ColorHex, "#FFFFFF", StringComparison.OrdinalIgnoreCase))
+                    p.ColorHex = "0x000000";
+                if (p.ColorTolerance == 8)
+                    p.ColorTolerance = 0;
+            }
+        }
+
+        settings.DefaultsRevision = 3;
 
         foreach (var p in settings.CommandDefaults)
             RepairProfile(p);
@@ -355,10 +392,7 @@ internal static class AppSettingsStore
         p.RepeatCount = Math.Clamp(p.RepeatCount, 0, 1_000_000);
         p.FailureRetryCount = Math.Clamp(p.FailureRetryCount, 0, 100);
         p.FailureRetryDelayMs = Math.Clamp(p.FailureRetryDelayMs, 0, 60_000);
-        if (string.IsNullOrWhiteSpace(p.VariableName)) p.VariableName = "value";
-        if (string.IsNullOrWhiteSpace(p.StoreXVariable)) p.StoreXVariable = "FoundX";
-        if (string.IsNullOrWhiteSpace(p.StoreYVariable)) p.StoreYVariable = "FoundY";
-        if (string.IsNullOrWhiteSpace(p.ColorHex)) p.ColorHex = "0xFFFFFF";
+        if (string.IsNullOrWhiteSpace(p.ColorHex)) p.ColorHex = "0x000000";
         if (string.IsNullOrWhiteSpace(p.Key)) p.Key = "E";
         if (string.IsNullOrWhiteSpace(p.RecordingStopHotkey)) p.RecordingStopHotkey = "F7";
     }
@@ -385,91 +419,91 @@ internal static class CommandCatalog
             new Option("Keyboard", "Type Text", CommandType.TypeText),
             new Option("Keyboard", "Hold Key", CommandType.HoldKey),
             new Option("Keyboard", "Repeat Key", CommandType.RepeatKey),
-            new Option("Keyboard", "Wait Until Key Pressed", CommandType.WaitUntilKeyPressed),
-            new Option("Keyboard", "Wait Until Key Released", CommandType.WaitUntilKeyReleased),
-            new Option("Keyboard", "IF Key Pressed", CommandType.IfKeyPressed),
-            new Option("Keyboard", "Loop While Key Pressed", CommandType.LoopWhileKeyPressed)
+            new Option("Keyboard", "Wait for Key Press", CommandType.WaitUntilKeyPressed),
+            new Option("Keyboard", "Wait for Key Release", CommandType.WaitUntilKeyReleased),
+            new Option("Keyboard", "If Key Is Pressed", CommandType.IfKeyPressed),
+            new Option("Keyboard", "Repeat While Key Is Held", CommandType.LoopWhileKeyPressed)
         }),
-        ("Advanced Input", new[]
+        ("Wait / Timing", new[]
         {
-            new Option("Advanced Input", "Left Mouse Down", CommandType.LeftMouseDown),
-            new Option("Advanced Input", "Left Mouse Up", CommandType.LeftMouseUp),
-            new Option("Advanced Input", "Right Mouse Down", CommandType.RightMouseDown),
-            new Option("Advanced Input", "Right Mouse Up", CommandType.RightMouseUp),
-            new Option("Advanced Input", "Key Down", CommandType.KeyDown),
-            new Option("Advanced Input", "Key Up", CommandType.KeyUp)
-        }),
-        ("Timing", new[]
-        {
-            new Option("Timing", "Wait", CommandType.Wait),
-            new Option("Timing", "Random Wait", CommandType.RandomWait)
+            new Option("Wait / Timing", "Wait", CommandType.Wait),
+            new Option("Wait / Timing", "Random Wait", CommandType.RandomWait)
         }),
         ("Recording", new[]
         {
             new Option("Recording", "Record Actions", CommandType.RecordedActions)
         }),
-        ("Color / Pixel", new[]
+        ("Screen Color", new[]
         {
-            new Option("Color / Pixel", "IF Color", CommandType.IfColor),
-            new Option("Color / Pixel", "Wait Until Color at Location", CommandType.WaitUntilColor),
-            new Option("Color / Pixel", "Loop While Color", CommandType.LoopWhileColor),
-            new Option("Color / Pixel", "Loop Until Color", CommandType.LoopUntilColor),
-            new Option("Color / Pixel", "Find + Click Color", CommandType.ClickColor),
-            new Option("Color / Pixel", "Find Color → Variables", CommandType.FindColorToVariables),
-            new Option("Color / Pixel", "Read Pixel Color → Variable", CommandType.SampleColorToVariable)
+            new Option("Screen Color", "If Color Matches", CommandType.IfColor),
+            new Option("Screen Color", "Wait for Color", CommandType.WaitUntilColor),
+            new Option("Screen Color", "Repeat While Color Matches", CommandType.LoopWhileColor),
+            new Option("Screen Color", "Repeat Until Color Matches", CommandType.LoopUntilColor),
+            new Option("Screen Color", "Find + Click Color", CommandType.ClickColor),
+            new Option("Screen Color", "Find Color + Save Location", CommandType.FindColorToVariables),
+            new Option("Screen Color", "Read Color + Save It", CommandType.SampleColorToVariable)
         }),
-        ("Image Detection", new[]
+        ("Images", new[]
         {
-            new Option("Image Detection", "IF Image Found", CommandType.IfImage),
-            new Option("Image Detection", "Wait Until Image", CommandType.WaitUntilImage),
-            new Option("Image Detection", "Wait Until Image Gone", CommandType.WaitUntilImageGone),
-            new Option("Image Detection", "Find + Click Image", CommandType.ClickImage),
-            new Option("Image Detection", "Find + Double Click Image", CommandType.DoubleClickImage),
-            new Option("Image Detection", "Move To Image", CommandType.MoveToImage),
-            new Option("Image Detection", "Loop Until Image", CommandType.LoopUntilImage),
-            new Option("Image Detection", "Loop While Image Exists", CommandType.LoopWhileImage),
-            new Option("Image Detection", "Find Image → Variables", CommandType.FindImageToVariables)
+            new Option("Images", "If Image Is Found", CommandType.IfImage),
+            new Option("Images", "Wait for Image", CommandType.WaitUntilImage),
+            new Option("Images", "Wait for Image to Disappear", CommandType.WaitUntilImageGone),
+            new Option("Images", "Find + Click Image", CommandType.ClickImage),
+            new Option("Images", "Find + Double Click Image", CommandType.DoubleClickImage),
+            new Option("Images", "Move Mouse to Image", CommandType.MoveToImage),
+            new Option("Images", "Repeat Until Image Is Found", CommandType.LoopUntilImage),
+            new Option("Images", "Repeat While Image Is Visible", CommandType.LoopWhileImage),
+            new Option("Images", "Find Image + Save Location", CommandType.FindImageToVariables)
         }),
-        ("Window / App", new[]
+        ("Windows & Apps", new[]
         {
-            new Option("Window / App", "IF Window Exists", CommandType.IfWindow),
-            new Option("Window / App", "Focus Window", CommandType.FocusWindow),
-            new Option("Window / App", "Wait For Window", CommandType.WaitForWindow),
-            new Option("Window / App", "Wait For Window Gone", CommandType.WaitForWindowGone),
-            new Option("Window / App", "Minimize Window", CommandType.MinimizeWindow),
-            new Option("Window / App", "Maximize Window", CommandType.MaximizeWindow),
-            new Option("Window / App", "Restore Window", CommandType.RestoreWindow),
-            new Option("Window / App", "Close Window", CommandType.CloseWindow),
-            new Option("Window / App", "Open Program / File / URL", CommandType.RunProgram)
+            new Option("Windows & Apps", "If Window Is Open", CommandType.IfWindow),
+            new Option("Windows & Apps", "Focus Window", CommandType.FocusWindow),
+            new Option("Windows & Apps", "Wait for Window", CommandType.WaitForWindow),
+            new Option("Windows & Apps", "Wait for Window to Close", CommandType.WaitForWindowGone),
+            new Option("Windows & Apps", "Minimize Window", CommandType.MinimizeWindow),
+            new Option("Windows & Apps", "Maximize Window", CommandType.MaximizeWindow),
+            new Option("Windows & Apps", "Restore Window", CommandType.RestoreWindow),
+            new Option("Windows & Apps", "Close Window", CommandType.CloseWindow),
+            new Option("Windows & Apps", "Open Program / File / URL", CommandType.RunProgram)
         }),
         ("Variables", new[]
         {
-            new Option("Variables", "Set Variable", CommandType.SetVariable),
-            new Option("Variables", "Add / Subtract Variable", CommandType.AddVariable),
-            new Option("Variables", "Random Number", CommandType.RandomNumber),
-            new Option("Variables", "IF Variable", CommandType.IfVariable),
-            new Option("Variables", "Wait Until Variable", CommandType.WaitUntilVariable),
-            new Option("Variables", "Loop While Variable", CommandType.LoopWhileVariable),
-            new Option("Variables", "Loop Until Variable", CommandType.LoopUntilVariable)
+            new Option("Variables", "Save Value", CommandType.SetVariable),
+            new Option("Variables", "Change Saved Value", CommandType.AddVariable),
+            new Option("Variables", "Save Random Number", CommandType.RandomNumber),
+            new Option("Variables", "If Saved Value Matches", CommandType.IfVariable),
+            new Option("Variables", "Wait for Saved Value", CommandType.WaitUntilVariable),
+            new Option("Variables", "Repeat While Saved Value Matches", CommandType.LoopWhileVariable),
+            new Option("Variables", "Repeat Until Saved Value Matches", CommandType.LoopUntilVariable)
         }),
-        ("Data / User", new[]
+        ("Clipboard / Files / Questions", new[]
         {
-            new Option("Data / User", "Set Clipboard", CommandType.SetClipboard),
-            new Option("Data / User", "Clipboard → Variable", CommandType.ClipboardToVariable),
-            new Option("Data / User", "Read Text File → Variable", CommandType.ReadTextFile),
-            new Option("Data / User", "Write / Append Text File", CommandType.WriteTextFile),
-            new Option("Data / User", "Ask User For Text", CommandType.PromptText),
-            new Option("Data / User", "Ask User Yes / No", CommandType.PromptYesNo)
+            new Option("Clipboard / Files / Questions", "Set Clipboard", CommandType.SetClipboard),
+            new Option("Clipboard / Files / Questions", "Save Clipboard as Variable", CommandType.ClipboardToVariable),
+            new Option("Clipboard / Files / Questions", "Read Text File + Save It", CommandType.ReadTextFile),
+            new Option("Clipboard / Files / Questions", "Write Text File", CommandType.WriteTextFile),
+            new Option("Clipboard / Files / Questions", "Ask User for Text", CommandType.PromptText),
+            new Option("Clipboard / Files / Questions", "Ask User Yes / No", CommandType.PromptYesNo)
         }),
-        ("Flow", new[]
+        ("Logic / Loops", new[]
         {
-            new Option("Flow", "Command Group", CommandType.Group),
-            new Option("Flow", "Run Sequence", CommandType.RunSequence),
-            new Option("Flow", "Loop X Times", CommandType.LoopTimes),
-            new Option("Flow", "Loop Forever", CommandType.LoopForever),
-            new Option("Flow", "Break Loop", CommandType.Break),
-            new Option("Flow", "Return", CommandType.Return),
-            new Option("Flow", "Stop Macro", CommandType.StopMacro)
+            new Option("Logic / Loops", "Group Commands", CommandType.Group),
+            new Option("Logic / Loops", "Run Another Tab", CommandType.RunSequence),
+            new Option("Logic / Loops", "Repeat X Times", CommandType.LoopTimes),
+            new Option("Logic / Loops", "Repeat Forever", CommandType.LoopForever),
+            new Option("Logic / Loops", "Exit Current Repeat", CommandType.Break),
+            new Option("Logic / Loops", "Return to Previous Tab", CommandType.Return),
+            new Option("Logic / Loops", "Stop Macro", CommandType.StopMacro)
+        }),
+        ("Advanced Input", new[]
+        {
+            new Option("Advanced Input", "Hold Left Mouse Down", CommandType.LeftMouseDown),
+            new Option("Advanced Input", "Release Left Mouse", CommandType.LeftMouseUp),
+            new Option("Advanced Input", "Hold Right Mouse Down", CommandType.RightMouseDown),
+            new Option("Advanced Input", "Release Right Mouse", CommandType.RightMouseUp),
+            new Option("Advanced Input", "Hold Key Down", CommandType.KeyDown),
+            new Option("Advanced Input", "Release Key", CommandType.KeyUp)
         })
     };
 
@@ -547,6 +581,9 @@ internal static class ThemeManager
             Set("ItemHoverBrush", "#EEF3FA");
             Set("ItemHoverBorderBrush", "#B8C8DF");
             Set("MenuBrush", "#FFFFFF");
+            Set("ScrollThumbBrush", "#A9B8CB");
+            Set("ScrollThumbHoverBrush", "#8195AE");
+            Set("NestedItemBrush", "#F4F7FB");
         }
         else
         {
@@ -579,6 +616,9 @@ internal static class ThemeManager
             Set("ItemHoverBrush", "#152131");
             Set("ItemHoverBorderBrush", "#334A67");
             Set("MenuBrush", "#111A27");
+            Set("ScrollThumbBrush", "#465A73");
+            Set("ScrollThumbHoverBrush", "#607895");
+            Set("NestedItemBrush", "#121D2A");
         }
 
         foreach (Window window in Application.Current.Windows)

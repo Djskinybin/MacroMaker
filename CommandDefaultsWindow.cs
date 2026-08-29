@@ -13,6 +13,7 @@ public sealed class CommandDefaultsWindow : Window
     private readonly StackPanel _commandPanel = new();
     private readonly StackPanel _propertiesPanel = new();
     private readonly TextBlock _commandTitle = new();
+    private readonly TextBlock _commandDescription = new();
     private Button? _activeCategoryButton;
     private Button? _activeCommandButton;
     private int _currentCategory;
@@ -115,8 +116,10 @@ public sealed class CommandDefaultsWindow : Window
         _commandTitle.FontSize = 18;
         _commandTitle.FontWeight = FontWeights.SemiBold;
         _commandTitle.Foreground = Brush("TextBrush");
-        _commandTitle.Margin = new Thickness(2, 3, 0, 12);
-        propertyArea.Children.Add(_commandTitle);
+        _commandTitle.Margin = new Thickness(2, 3, 0, 3);
+        var commandHeader = new StackPanel();
+        commandHeader.Children.Add(_commandTitle);
+        propertyArea.Children.Add(commandHeader);
         var propertiesScroll = new ScrollViewer
         {
             VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
@@ -522,27 +525,50 @@ public sealed class CommandDefaultsWindow : Window
 
     private void AddVariableCompare(CommandDefaultProfile p)
     {
-        AddLabel("Comparison");
-        var combo = new ComboBox { ItemsSource = Enum.GetValues<VariableCompareMode>(), SelectedItem = p.VariableCompareMode, Margin = new Thickness(0,0,0,10) };
-        combo.SelectionChanged += (_, _) => { if (combo.SelectedItem is VariableCompareMode mode) p.VariableCompareMode = mode; };
+        AddLabel("Check");
+        var combo = new ComboBox { Margin = new Thickness(0,0,0,10) };
+        var options = new[]
+        {
+            (Mode: VariableCompareMode.Equals, Label: "Equals"),
+            (Mode: VariableCompareMode.NotEquals, Label: "Does not equal"),
+            (Mode: VariableCompareMode.GreaterThan, Label: "Is greater than"),
+            (Mode: VariableCompareMode.GreaterThanOrEqual, Label: "Is at least"),
+            (Mode: VariableCompareMode.LessThan, Label: "Is less than"),
+            (Mode: VariableCompareMode.LessThanOrEqual, Label: "Is at most"),
+            (Mode: VariableCompareMode.Contains, Label: "Contains text"),
+            (Mode: VariableCompareMode.StartsWith, Label: "Starts with"),
+            (Mode: VariableCompareMode.EndsWith, Label: "Ends with")
+        };
+        foreach (var option in options) combo.Items.Add(new ComboBoxItem { Content = option.Label, Tag = option.Mode });
+        combo.SelectedItem = combo.Items.Cast<ComboBoxItem>().FirstOrDefault(x => x.Tag is VariableCompareMode m && m == p.VariableCompareMode);
+        combo.SelectionChanged += (_, _) => { if (combo.SelectedItem is ComboBoxItem { Tag: VariableCompareMode mode }) p.VariableCompareMode = mode; };
         _propertiesPanel.Children.Add(combo);
     }
 
     private void AddCoordinateMode(CommandDefaultProfile p)
     {
-        AddLabel("Coordinates relative to");
-        var combo = new ComboBox { ItemsSource = Enum.GetValues<CoordinateMode>(), SelectedItem = p.CoordinateMode, Margin = new Thickness(0,0,0,10) };
-        combo.SelectionChanged += (_, _) => { if (combo.SelectedItem is CoordinateMode mode) p.CoordinateMode = mode; };
+        AddLabel("Location is based on");
+        var combo = new ComboBox { Margin = new Thickness(0,0,0,10) };
+        combo.Items.Add(new ComboBoxItem { Content = "Screen", Tag = CoordinateMode.Screen });
+        combo.Items.Add(new ComboBoxItem { Content = "Active window", Tag = CoordinateMode.ActiveWindow });
+        combo.Items.Add(new ComboBoxItem { Content = "Current mouse position", Tag = CoordinateMode.RelativeToMouse });
+        combo.SelectedItem = combo.Items.Cast<ComboBoxItem>().FirstOrDefault(x => x.Tag is CoordinateMode m && m == p.CoordinateMode);
+        combo.SelectionChanged += (_, _) => { if (combo.SelectedItem is ComboBoxItem { Tag: CoordinateMode mode }) p.CoordinateMode = mode; };
         _propertiesPanel.Children.Add(combo);
     }
 
     private void AddFailureDefaults(CommandDefaultProfile p)
     {
-        AddLabel("If command fails / times out");
-        var combo = new ComboBox { ItemsSource = Enum.GetValues<FailureAction>(), SelectedItem = p.FailureAction, Margin = new Thickness(0,0,0,10) };
+        AddLabel("If this cannot finish");
+        var combo = new ComboBox { Margin = new Thickness(0,0,0,10) };
+        combo.Items.Add(new ComboBoxItem { Content = "Keep going", Tag = FailureAction.Continue });
+        combo.Items.Add(new ComboBoxItem { Content = "Stop the macro", Tag = FailureAction.StopMacro });
+        combo.Items.Add(new ComboBoxItem { Content = "Try again", Tag = FailureAction.Retry });
+        combo.Items.Add(new ComboBoxItem { Content = "Run another tab", Tag = FailureAction.RunSequence });
+        combo.SelectedItem = combo.Items.Cast<ComboBoxItem>().FirstOrDefault(x => x.Tag is FailureAction a && a == p.FailureAction);
         combo.SelectionChanged += (_, _) =>
         {
-            if (combo.SelectedItem is FailureAction action && action != p.FailureAction)
+            if (combo.SelectedItem is ComboBoxItem { Tag: FailureAction action } && action != p.FailureAction)
             {
                 p.FailureAction = action;
                 ShowCommand(_currentType);
@@ -551,8 +577,8 @@ public sealed class CommandDefaultsWindow : Window
         _propertiesPanel.Children.Add(combo);
         if (p.FailureAction == FailureAction.Retry)
         {
-            AddInt("Retries", p.FailureRetryCount, 0, 100, v => p.FailureRetryCount = v);
-            AddInt("Retry delay (ms)", p.FailureRetryDelayMs, 0, 60000, v => p.FailureRetryDelayMs = v);
+            AddInt("How many retries", p.FailureRetryCount, 0, 100, v => p.FailureRetryCount = v);
+            AddInt("Wait between retries (ms)", p.FailureRetryDelayMs, 0, 60000, v => p.FailureRetryDelayMs = v);
         }
     }
 
@@ -579,22 +605,16 @@ public sealed class CommandDefaultsWindow : Window
 
     private void AddColorDefaults(CommandDefaultProfile p, bool includePollingLabel)
     {
-        AddLabel("Comparison");
-        var combo = new ComboBox
-        {
-            ItemsSource = Enum.GetValues<CompareMode>(),
-            SelectedItem = p.CompareMode,
-            Margin = new Thickness(0, 0, 0, 10)
-        };
-        combo.SelectionChanged += (_, _) =>
-        {
-            if (combo.SelectedItem is CompareMode mode)
-                p.CompareMode = mode;
-        };
+        AddLabel("Check for");
+        var combo = new ComboBox { Margin = new Thickness(0, 0, 0, 10) };
+        combo.Items.Add(new ComboBoxItem { Content = "Color matches", Tag = CompareMode.Equals });
+        combo.Items.Add(new ComboBoxItem { Content = "Color does not match", Tag = CompareMode.NotEquals });
+        combo.SelectedItem = combo.Items.Cast<ComboBoxItem>().FirstOrDefault(x => x.Tag is CompareMode m && m == p.CompareMode);
+        combo.SelectionChanged += (_, _) => { if (combo.SelectedItem is ComboBoxItem { Tag: CompareMode mode }) p.CompareMode = mode; };
         _propertiesPanel.Children.Add(combo);
         AddText("Target color", p.ColorHex, v => p.ColorHex = NormalizeColor(v));
         AddLocation(p);
-        AddInt("Color tolerance (0-255)", p.ColorTolerance, 0, 255, v => p.ColorTolerance = v);
+        AddInt("Color tolerance", p.ColorTolerance, 0, 255, v => p.ColorTolerance = v);
     }
 
     private void AddImageDefaults(CommandDefaultProfile p)
@@ -625,9 +645,9 @@ public sealed class CommandDefaultsWindow : Window
 
     private void AddPolling(CommandDefaultProfile p, bool timeout)
     {
-        AddInt("Poll every (ms)", p.PollMs, 10, 5000, v => p.PollMs = v);
+        AddInt("Check every (ms)", p.PollMs, 10, 5000, v => p.PollMs = v);
         if (timeout)
-            AddInt("Timeout (ms, 0 = forever)", p.TimeoutMs, 0, 86_400_000, v => p.TimeoutMs = v);
+            AddInt("Give up after (ms, 0 = never)", p.TimeoutMs, 0, 86_400_000, v => p.TimeoutMs = v);
     }
 
     private void AddLocation(CommandDefaultProfile p)
@@ -672,15 +692,14 @@ public sealed class CommandDefaultsWindow : Window
     private void AddMouseMovement(CommandDefaultProfile p)
     {
         AddLabel("Mouse movement");
-        var combo = new ComboBox
-        {
-            ItemsSource = new[] { MouseMoveMode.Teleport, MouseMoveMode.Smooth },
-            SelectedItem = p.MouseMoveMode == MouseMoveMode.Legacy ? MouseMoveMode.Smooth : p.MouseMoveMode,
-            Margin = new Thickness(0, 0, 0, 10)
-        };
+        var combo = new ComboBox { Margin = new Thickness(0, 0, 0, 10) };
+        combo.Items.Add(new ComboBoxItem { Content = "Instant", Tag = MouseMoveMode.Teleport });
+        combo.Items.Add(new ComboBoxItem { Content = "Smooth", Tag = MouseMoveMode.Smooth });
+        var current = p.MouseMoveMode == MouseMoveMode.Legacy ? MouseMoveMode.Smooth : p.MouseMoveMode;
+        combo.SelectedItem = combo.Items.Cast<ComboBoxItem>().FirstOrDefault(x => x.Tag is MouseMoveMode m && m == current);
         combo.SelectionChanged += (_, _) =>
         {
-            if (combo.SelectedItem is MouseMoveMode mode && mode != p.MouseMoveMode)
+            if (combo.SelectedItem is ComboBoxItem { Tag: MouseMoveMode mode } && mode != p.MouseMoveMode)
             {
                 p.MouseMoveMode = mode;
                 ShowCommand(_currentType);
@@ -688,7 +707,7 @@ public sealed class CommandDefaultsWindow : Window
         };
         _propertiesPanel.Children.Add(combo);
         if (p.MouseMoveMode != MouseMoveMode.Teleport)
-            AddInt("Smooth move duration (ms)", p.MoveDurationMs, 1, 60000, v => p.MoveDurationMs = v);
+            AddInt("Slide time (ms)", p.MoveDurationMs, 1, 60000, v => p.MoveDurationMs = v);
     }
 
     private void AddText(string label, string current, Action<string> setter, bool multiline = false)
@@ -759,7 +778,7 @@ public sealed class CommandDefaultsWindow : Window
         var cleaned = raw.Trim().Replace("#", "").Replace("0x", "", StringComparison.OrdinalIgnoreCase);
         if (cleaned.Length == 6 && int.TryParse(cleaned, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out _))
             return "0x" + cleaned.ToUpperInvariant();
-        return "0xFFFFFF";
+        return "0x000000";
     }
 
     private static Button PickerButton(string text, bool command)

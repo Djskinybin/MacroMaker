@@ -1,6 +1,7 @@
 using System.IO;
 using Microsoft.Win32;
 using System.Runtime.InteropServices;
+using System.Runtime.CompilerServices;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
@@ -40,6 +41,7 @@ public partial class MainWindow : Window
     private IntPtr _mainWindowHandle;
     private IntPtr _lastExternalForeground;
     private bool _startupUpdateCheckStarted;
+    private bool _welcomeShown;
     private bool _skipSavePromptForUpdate;
 
     private readonly Stack<string> _undoHistory = new();
@@ -47,6 +49,16 @@ public partial class MainWindow : Window
     private string _historySnapshot = string.Empty;
     private bool _historySuspended;
     private readonly DispatcherTimer _autoSaveTimer = new() { Interval = TimeSpan.FromMilliseconds(1400) };
+    private readonly HashSet<Guid> _collapsedBlocks = new();
+    private readonly HashSet<Guid> _expandedMoreOptions = new();
+    private readonly HashSet<Guid> _expandedLocationOptions = new();
+    private readonly HashSet<Guid> _expandedTimingOptions = new();
+    private bool _rebuildingProperties;
+    private bool _refreshingCommandSelection;
+    private Point _commandDragStartPoint;
+    private CommandRow? _commandDragStartRow;
+    private bool _commandDragInProgress;
+    private const string CommandDragDataFormat = "MacroMaker.CommandRows";
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -76,6 +88,31 @@ public partial class MainWindow : Window
         _mainWindowHandle = new WindowInteropHelper(this).Handle;
         _foregroundTimer.Tick += (_, _) => TrackExternalForegroundWindow();
         _foregroundTimer.Start();
+
+        if (!_welcomeShown && string.IsNullOrWhiteSpace(_projectPath) && !_dirty)
+        {
+            _welcomeShown = true;
+            Dispatcher.BeginInvoke(new Action(ShowWelcomeWindow), DispatcherPriority.ContextIdle);
+        }
+    }
+
+    private void ShowWelcomeWindow()
+    {
+        if (_engine?.IsRunning == true || _isRecording)
+            return;
+
+        var welcome = new WelcomeWindow(_appSettings.RecentProjects) { Owner = this };
+        if (welcome.ShowDialog() != true)
+            return;
+
+        if (welcome.Action == WelcomeAction.OpenFolder)
+        {
+            OpenProject_Click(this, new RoutedEventArgs());
+        }
+        else if (welcome.Action == WelcomeAction.OpenRecent && !string.IsNullOrWhiteSpace(welcome.SelectedProjectPath))
+        {
+            TryOpenProjectFolder(welcome.SelectedProjectPath);
+        }
     }
 
     private async void MainWindow_ContentRendered(object? sender, EventArgs e)
@@ -85,9 +122,10 @@ public partial class MainWindow : Window
 
         _startupUpdateCheckStarted = true;
 
-        // Give the main window a moment to finish appearing, then silently check GitHub.
-        // If a newer release exists, UpdateService shows the Update Now / Later prompt.
-        await Task.Delay(800);
+        // Wait until the welcome screen is closed, then silently check GitHub.
+        while (OwnedWindows.OfType<WelcomeWindow>().Any(window => window.IsVisible))
+            await Task.Delay(200);
+        await Task.Delay(350);
         await UpdateService.CheckAndPromptAsync(this, false);
     }
 
@@ -137,6 +175,7 @@ public partial class MainWindow : Window
         _projectPath = null;
         ProjectPaths.CurrentFolder = null;
         _dirty = false;
+        _collapsedBlocks.Clear();
         _sequenceCounter = 1;
         RebuildEngine();
         SelectSequence(_project.Sequences[0]);
@@ -160,9 +199,16 @@ public partial class MainWindow : Window
         if (dialog.ShowDialog(this) != true)
             return;
 
+        TryOpenProjectFolder(dialog.FolderName, skipDiscardPrompt: true);
+    }
+
+    private bool TryOpenProjectFolder(string folder, bool skipDiscardPrompt = false)
+    {
+        if (!skipDiscardPrompt && !ConfirmDiscardChanges())
+            return false;
+
         try
         {
-            var folder = dialog.FolderName;
             var projectFile = FindProjectFile(folder);
             if (projectFile is null)
                 throw new FileNotFoundException(
@@ -198,6 +244,7 @@ public partial class MainWindow : Window
             ProjectPaths.CurrentFolder = folder;
             Directory.CreateDirectory(Path.Combine(folder, "Images"));
             _dirty = false;
+            _collapsedBlocks.Clear();
             DeleteUnsavedRecovery();
             RebuildEngine();
             SelectSequence(_project.Sequences.First(sequence =>
@@ -206,11 +253,27 @@ public partial class MainWindow : Window
             UpdateProjectTitle();
             StatusText.Text = $"Project loaded: {Path.GetFileName(folder)}";
             ResetHistory();
+            RememberRecentProject(folder);
+            return true;
         }
         catch (Exception ex)
         {
-            MessageBox.Show(this, ex.Message, "Could not open project", MessageBoxButton.OK, MessageBoxImage.Error);
+            MessageBox.Show(this, FriendlyErrorMessage(ex, "opening this project"), "Could not open project", MessageBoxButton.OK, MessageBoxImage.Error);
+            return false;
         }
+    }
+
+    private void RememberRecentProject(string folder)
+    {
+        if (string.IsNullOrWhiteSpace(folder) || !Directory.Exists(folder))
+            return;
+
+        _appSettings.RecentProjects ??= new List<string>();
+        _appSettings.RecentProjects.RemoveAll(path => path.Equals(folder, StringComparison.OrdinalIgnoreCase));
+        _appSettings.RecentProjects.Insert(0, folder);
+        if (_appSettings.RecentProjects.Count > 8)
+            _appSettings.RecentProjects.RemoveRange(8, _appSettings.RecentProjects.Count - 8);
+        AppSettingsStore.Save(_appSettings);
     }
 
     private static string? FindProjectFile(string folder)
@@ -237,9 +300,6 @@ public partial class MainWindow : Window
             command.ImagePriority ??= new List<string>();
             command.Children ??= new List<MacroCommand>();
             command.ElseChildren ??= new List<MacroCommand>();
-            if (string.IsNullOrWhiteSpace(command.StoreXVariable)) command.StoreXVariable = "FoundX";
-            if (string.IsNullOrWhiteSpace(command.StoreYVariable)) command.StoreYVariable = "FoundY";
-            if (string.IsNullOrWhiteSpace(command.VariableName)) command.VariableName = "value";
             command.FailureRetryCount = Math.Clamp(command.FailureRetryCount, 0, 100);
             command.FailureRetryDelayMs = Math.Clamp(command.FailureRetryDelayMs, 0, 60000);
             command.ElseChildren ??= new List<MacroCommand>();
@@ -322,6 +382,7 @@ public partial class MainWindow : Window
             DeleteUnsavedRecovery();
             UpdateProjectTitle();
             StatusText.Text = $"Saved: {Path.GetFileName(_projectPath)}";
+            RememberRecentProject(_projectPath!);
             return true;
         }
         catch (Exception ex)
@@ -711,27 +772,54 @@ public partial class MainWindow : Window
 
     private void MainWindow_PreviewKeyDown(object sender, KeyEventArgs e)
     {
-        if (Keyboard.FocusedElement is TextBox)
+        var modifiers = Keyboard.Modifiers;
+        var control = (modifiers & ModifierKeys.Control) != 0;
+        var shift = (modifiers & ModifierKeys.Shift) != 0;
+
+        // Saving should work even while the user is typing in a property field.
+        if (control && e.Key == Key.S)
+        {
+            SaveProject(shift);
+            e.Handled = true;
+            return;
+        }
+
+        if (Keyboard.FocusedElement is TextBox or ComboBox)
             return;
 
-        if ((Keyboard.Modifiers & ModifierKeys.Control) != 0 && e.Key == Key.Z)
+        if (control && e.Key == Key.Z && !shift)
         {
             UndoProjectChange();
             e.Handled = true;
         }
-        else if ((Keyboard.Modifiers & ModifierKeys.Control) != 0 && (e.Key == Key.Y || ((Keyboard.Modifiers & ModifierKeys.Shift) != 0 && e.Key == Key.Z)))
+        else if (control && (e.Key == Key.Y || (shift && e.Key == Key.Z)))
         {
             RedoProjectChange();
             e.Handled = true;
         }
-        else if ((Keyboard.Modifiers & ModifierKeys.Control) != 0 && e.Key == Key.C)
+        else if (control && e.Key == Key.C)
         {
             CopyCommandButton_Click(this, new RoutedEventArgs());
             e.Handled = true;
         }
-        else if ((Keyboard.Modifiers & ModifierKeys.Control) != 0 && e.Key == Key.V)
+        else if (control && e.Key == Key.V)
         {
             PasteCommandButton_Click(this, new RoutedEventArgs());
+            e.Handled = true;
+        }
+        else if (control && e.Key == Key.D)
+        {
+            DuplicateCommandButton_Click(this, new RoutedEventArgs());
+            e.Handled = true;
+        }
+        else if (control && e.Key == Key.Enter)
+        {
+            TestSelectedButton_Click(this, new RoutedEventArgs());
+            e.Handled = true;
+        }
+        else if (e.Key == Key.Delete)
+        {
+            DeleteCommandButton_Click(this, new RoutedEventArgs());
             e.Handled = true;
         }
     }
@@ -771,6 +859,7 @@ public partial class MainWindow : Window
             _projectPath = null;
             ProjectPaths.CurrentFolder = null;
             _dirty = true;
+            _collapsedBlocks.Clear();
             RebuildEngine();
             var startupSequence = _project.Sequences.FirstOrDefault(x => x.Name.Equals("Starting Sequence", StringComparison.OrdinalIgnoreCase))
                                   ?? _project.Sequences[0];
@@ -1228,9 +1317,9 @@ public partial class MainWindow : Window
             return new MacroCommand
             {
                 Type = CommandType.IfColor,
-                ColorHex = m.Groups[1].Success ? NormalizeColor(m.Groups[1].Value) : "0xFFFFFF",
-                X = m.Groups[2].Success && int.TryParse(m.Groups[2].Value, out var ifx) ? ifx : 960,
-                Y = m.Groups[3].Success && int.TryParse(m.Groups[3].Value, out var ify) ? ify : 300,
+                ColorHex = m.Groups[1].Success ? NormalizeColor(m.Groups[1].Value) : "0x000000",
+                X = m.Groups[2].Success && int.TryParse(m.Groups[2].Value, out var ifx) ? ifx : 0,
+                Y = m.Groups[3].Success && int.TryParse(m.Groups[3].Value, out var ify) ? ify : 0,
                 CompareMode = CompareMode.Equals
             };
 
@@ -1512,6 +1601,9 @@ public partial class MainWindow : Window
             StoreXVariable = defaults.StoreXVariable,
             StoreYVariable = defaults.StoreYVariable,
             StoreTextVariable = defaults.StoreTextVariable,
+            ValueExpressions = defaults.ValueExpressions is null
+                ? new Dictionary<string, string>()
+                : new Dictionary<string, string>(defaults.ValueExpressions, StringComparer.OrdinalIgnoreCase),
             FilePath = defaults.FilePath,
             AppendFile = defaults.AppendFile,
             PromptText = defaults.PromptText,
@@ -1537,15 +1629,353 @@ public partial class MainWindow : Window
 
     private void DuplicateCommandButton_Click(object sender, RoutedEventArgs e)
     {
-        if (_selectedRow?.Command is not { } command || _selectedRow.Owner is null)
+        var rows = GetSelectedCommandRows();
+        if (rows.Count == 0)
             return;
 
-        var owner = _selectedRow.Owner;
-        var index = owner.IndexOf(command);
-        var clone = command.DeepClone();
-        owner.Insert(Math.Clamp(index + 1, 0, owner.Count), clone);
+        var clonedIds = new List<Guid>();
+        foreach (var group in rows.GroupBy(row => row.Owner!))
+        {
+            var owner = group.Key;
+            var commands = group.Select(row => row.Command!).ToList();
+            var insertionIndex = commands.Select(command => owner.IndexOf(command)).DefaultIfEmpty(-1).Max() + 1;
+            var clones = commands.Select(command => command.DeepClone()).ToList();
+            owner.InsertRange(Math.Clamp(insertionIndex, 0, owner.Count), clones);
+            clonedIds.AddRange(clones.Select(command => command.Id));
+        }
+
         MarkDirty();
-        RefreshCommandList(clone.Id);
+        RefreshCommandList(clonedIds.FirstOrDefault(), clonedIds);
+        StatusText.Text = clonedIds.Count == 1 ? "Command duplicated" : $"{clonedIds.Count} commands duplicated";
+    }
+
+    private void CollapseRowButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not Button { DataContext: CommandRow row } || row.Command is not { } command || !row.IsCollapsible)
+            return;
+
+        ToggleCollapsed(command);
+        e.Handled = true;
+    }
+
+    private void ToggleCollapsed(MacroCommand command)
+    {
+        if (!command.HasBody || command.Type == CommandType.RecordedActions)
+            return;
+
+        if (!_collapsedBlocks.Add(command.Id))
+            _collapsedBlocks.Remove(command.Id);
+
+        RefreshCommandList(command.Id);
+    }
+
+    private List<CommandRow> GetSelectedCommandRows(bool rootsOnly = true)
+    {
+        var selectedIds = CommandList.SelectedItems
+            .OfType<CommandRow>()
+            .Where(row => !row.IsHeader && row.Command is not null && row.Owner is not null)
+            .Select(row => row.Command!.Id)
+            .ToHashSet();
+
+        if (selectedIds.Count == 0 && _selectedRow?.Command is { } selectedCommand && _selectedRow.Owner is not null)
+            selectedIds.Add(selectedCommand.Id);
+
+        var ordered = CommandList.Items
+            .OfType<CommandRow>()
+            .Where(row => !row.IsHeader && row.Command is not null && row.Owner is not null && selectedIds.Contains(row.Command.Id))
+            .ToList();
+
+        if (!rootsOnly || ordered.Count < 2)
+            return ordered;
+
+        return ordered
+            .Where(row => !ordered.Any(other =>
+                other.Command!.Id != row.Command!.Id && CommandContains(other.Command, row.Command.Id)))
+            .ToList();
+    }
+
+    private static bool CommandContains(MacroCommand root, Guid commandId)
+    {
+        foreach (var child in root.Children)
+        {
+            if (child.Id == commandId || CommandContains(child, commandId))
+                return true;
+        }
+        foreach (var child in root.ElseChildren)
+        {
+            if (child.Id == commandId || CommandContains(child, commandId))
+                return true;
+        }
+        return false;
+    }
+
+    private void CommandList_PreviewMouseRightButtonDown(object sender, MouseButtonEventArgs e)
+    {
+        var item = FindVisualParent<ListBoxItem>(e.OriginalSource as DependencyObject);
+        if (item?.DataContext is not CommandRow { IsHeader: false, Command: not null } row)
+            return;
+
+        if (!item.IsSelected)
+        {
+            CommandList.UnselectAll();
+            item.IsSelected = true;
+        }
+
+        ApplyCommandSelection(row);
+    }
+
+    private void CommandList_ContextMenuOpening(object sender, ContextMenuEventArgs e)
+    {
+        if (CommandList.ContextMenu is null)
+            return;
+
+        var menu = CommandList.ContextMenu;
+        menu.Items.Clear();
+
+        var selected = GetSelectedCommandRows();
+        if (_selectedRow?.Command is not { } command || selected.Count == 0)
+        {
+            e.Handled = true;
+            return;
+        }
+
+        var running = _engine?.IsRunning == true || _isRecording;
+
+        if (selected.Count == 1 && _selectedRow.IsCollapsible)
+        {
+            var collapse = new MenuItem
+            {
+                Header = _collapsedBlocks.Contains(command.Id) ? "Expand Block" : "Collapse Block"
+            };
+            collapse.Click += (_, _) => ToggleCollapsed(command);
+            menu.Items.Add(collapse);
+            menu.Items.Add(new Separator());
+        }
+
+        var runFromHere = new MenuItem { Header = "Run From Here", IsEnabled = !running };
+        runFromHere.Click += RunFromHereButton_Click;
+        menu.Items.Add(runFromHere);
+
+        var test = new MenuItem { Header = "Test Command", IsEnabled = !running && selected.Count == 1, InputGestureText = "Ctrl+Enter" };
+        test.Click += TestSelectedButton_Click;
+        menu.Items.Add(test);
+        menu.Items.Add(new Separator());
+
+        var copy = new MenuItem { Header = selected.Count == 1 ? "Copy" : $"Copy {selected.Count} Commands", InputGestureText = "Ctrl+C" };
+        copy.Click += CopyCommandButton_Click;
+        menu.Items.Add(copy);
+
+        var paste = new MenuItem { Header = "Paste", IsEnabled = _copiedCommands.Count > 0, InputGestureText = "Ctrl+V" };
+        paste.Click += PasteCommandButton_Click;
+        menu.Items.Add(paste);
+
+        var duplicate = new MenuItem { Header = selected.Count == 1 ? "Duplicate Command" : $"Duplicate {selected.Count} Commands", InputGestureText = "Ctrl+D" };
+        duplicate.Click += DuplicateCommandButton_Click;
+        menu.Items.Add(duplicate);
+        menu.Items.Add(new Separator());
+
+        var allEnabled = selected.All(row => row.Command!.Enabled);
+        var enabled = new MenuItem { Header = allEnabled ? (selected.Count == 1 ? "Disable Command" : "Disable Commands") : (selected.Count == 1 ? "Enable Command" : "Enable Commands") };
+        enabled.Click += (_, _) => SetSelectedCommandsEnabled(!allEnabled);
+        menu.Items.Add(enabled);
+
+        var delete = new MenuItem { Header = selected.Count == 1 ? "Delete Command" : $"Delete {selected.Count} Commands", InputGestureText = "Del" };
+        delete.Click += DeleteCommandButton_Click;
+        menu.Items.Add(delete);
+    }
+
+    private void SetSelectedCommandsEnabled(bool enabled)
+    {
+        var rows = GetSelectedCommandRows();
+        if (rows.Count == 0)
+            return;
+
+        foreach (var row in rows)
+            row.Command!.Enabled = enabled;
+
+        var ids = rows.Select(row => row.Command!.Id).ToList();
+        MarkDirty();
+        RefreshCommandList(_selectedRow?.Command?.Id, ids);
+        StatusText.Text = enabled
+            ? (rows.Count == 1 ? "Command enabled" : $"{rows.Count} commands enabled")
+            : (rows.Count == 1 ? "Command disabled" : $"{rows.Count} commands disabled");
+    }
+
+    private static T? FindVisualParent<T>(DependencyObject? child) where T : DependencyObject
+    {
+        var current = child;
+        while (current is not null)
+        {
+            if (current is T match)
+                return match;
+            current = VisualTreeHelper.GetParent(current);
+        }
+        return null;
+    }
+
+    private void CommandList_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+    {
+        _commandDragStartPoint = e.GetPosition(CommandList);
+        _commandDragStartRow = null;
+
+        if (FindVisualParent<Button>(e.OriginalSource as DependencyObject) is not null)
+            return;
+
+        var item = FindVisualParent<ListBoxItem>(e.OriginalSource as DependencyObject);
+        if (item?.DataContext is CommandRow { IsHeader: true })
+        {
+            e.Handled = true;
+            return;
+        }
+        if (item?.DataContext is CommandRow { IsHeader: false, Command: not null } row)
+            _commandDragStartRow = row;
+    }
+
+    private void CommandList_PreviewMouseMove(object sender, MouseEventArgs e)
+    {
+        if (_commandDragInProgress || _commandDragStartRow?.Command is null || e.LeftButton != MouseButtonState.Pressed)
+            return;
+
+        var point = e.GetPosition(CommandList);
+        if (Math.Abs(point.X - _commandDragStartPoint.X) < SystemParameters.MinimumHorizontalDragDistance &&
+            Math.Abs(point.Y - _commandDragStartPoint.Y) < SystemParameters.MinimumVerticalDragDistance)
+            return;
+
+        if (!CommandList.SelectedItems.OfType<CommandRow>().Any(row => row.Command?.Id == _commandDragStartRow.Command.Id))
+        {
+            CommandList.UnselectAll();
+            var item = CommandList.ItemContainerGenerator.ContainerFromItem(_commandDragStartRow) as ListBoxItem;
+            if (item is not null)
+                item.IsSelected = true;
+            _selectedRow = _commandDragStartRow;
+        }
+
+        var rows = GetSelectedCommandRows();
+        if (rows.Count == 0)
+            return;
+
+        var data = new DataObject(CommandDragDataFormat, string.Join(";", rows.Select(row => row.Command!.Id)));
+        _commandDragInProgress = true;
+        try
+        {
+            DragDrop.DoDragDrop(CommandList, data, DragDropEffects.Move);
+        }
+        finally
+        {
+            _commandDragInProgress = false;
+            _commandDragStartRow = null;
+        }
+    }
+
+    private void CommandList_DragOver(object sender, DragEventArgs e)
+    {
+        if (!TryGetDragIds(e.Data, out var ids) || !CanDropCommands(ids, e))
+        {
+            e.Effects = DragDropEffects.None;
+            e.Handled = true;
+            return;
+        }
+
+        e.Effects = DragDropEffects.Move;
+        e.Handled = true;
+    }
+
+    private void CommandList_Drop(object sender, DragEventArgs e)
+    {
+        if (!TryGetDragIds(e.Data, out var ids) || !CanDropCommands(ids, e) || _currentSequence is null)
+            return;
+
+        var draggedRows = CommandList.Items
+            .OfType<CommandRow>()
+            .Where(row => row.Command is not null && ids.Contains(row.Command.Id))
+            .Where(row => !CommandList.Items.OfType<CommandRow>().Any(other =>
+                other.Command is not null && ids.Contains(other.Command.Id) && other.Command.Id != row.Command!.Id &&
+                CommandContains(other.Command, row.Command.Id)))
+            .ToList();
+
+        if (draggedRows.Count == 0)
+            return;
+
+        var item = FindVisualParent<ListBoxItem>(e.OriginalSource as DependencyObject);
+        var targetRow = item?.DataContext as CommandRow;
+        List<MacroCommand> targetOwner;
+        MacroCommand? targetCommand = null;
+        var insertAfter = false;
+
+        if (targetRow is null)
+        {
+            targetOwner = _currentSequence.Commands;
+        }
+        else if (targetRow.IsHeader)
+        {
+            targetOwner = targetRow.Owner ?? _currentSequence.Commands;
+        }
+        else
+        {
+            targetOwner = targetRow.Owner ?? _currentSequence.Commands;
+            targetCommand = targetRow.Command;
+            if (item is not null)
+                insertAfter = e.GetPosition(item).Y >= item.ActualHeight / 2;
+        }
+
+        var commands = draggedRows.Select(row => row.Command!).ToList();
+        foreach (var row in draggedRows)
+            row.Owner!.Remove(row.Command!);
+
+        var insertIndex = targetOwner.Count;
+        if (targetRow?.IsHeader == true)
+        {
+            insertIndex = 0;
+        }
+        else if (targetCommand is not null)
+        {
+            var targetIndex = targetOwner.IndexOf(targetCommand);
+            insertIndex = targetIndex < 0 ? targetOwner.Count : targetIndex + (insertAfter ? 1 : 0);
+        }
+
+        targetOwner.InsertRange(Math.Clamp(insertIndex, 0, targetOwner.Count), commands);
+
+        var selectedIds = commands.Select(command => command.Id).ToList();
+        MarkDirty();
+        RefreshCommandList(selectedIds.FirstOrDefault(), selectedIds);
+        StatusText.Text = commands.Count == 1 ? "Command moved" : $"{commands.Count} commands moved";
+        e.Handled = true;
+    }
+
+    private bool CanDropCommands(HashSet<Guid> ids, DragEventArgs e)
+    {
+        if (_currentSequence is null || ids.Count == 0)
+            return false;
+
+        var dragged = CommandList.Items
+            .OfType<CommandRow>()
+            .Where(row => row.Command is not null && ids.Contains(row.Command.Id))
+            .Select(row => row.Command!)
+            .ToList();
+        if (dragged.Count == 0)
+            return false;
+
+        var item = FindVisualParent<ListBoxItem>(e.OriginalSource as DependencyObject);
+        var targetRow = item?.DataContext as CommandRow;
+        var anchor = targetRow?.Command ?? targetRow?.ParentCommand;
+        if (anchor is null)
+            return true;
+
+        return !dragged.Any(command => command.Id == anchor.Id || CommandContains(command, anchor.Id));
+    }
+
+    private static bool TryGetDragIds(IDataObject data, out HashSet<Guid> ids)
+    {
+        ids = new HashSet<Guid>();
+        if (!data.GetDataPresent(CommandDragDataFormat) || data.GetData(CommandDragDataFormat) is not string raw)
+            return false;
+
+        foreach (var part in raw.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (Guid.TryParse(part, out var id))
+                ids.Add(id);
+        }
+        return ids.Count > 0;
     }
 
     private void MoveUpButton_Click(object sender, RoutedEventArgs e) => MoveSelected(-1);
@@ -1553,21 +1983,57 @@ public partial class MainWindow : Window
 
     private void MoveSelected(int direction)
     {
-        if (_selectedRow?.Command is not { } command || _selectedRow.Owner is null || direction == 0)
+        var rows = GetSelectedCommandRows();
+        if (rows.Count == 0 || direction == 0)
             return;
 
-        var row = _selectedRow;
-        var owner = row.Owner;
-        var index = owner.IndexOf(command);
+        if (rows.Count > 1)
+        {
+            var owner = rows[0].Owner!;
+            if (rows.Any(row => !ReferenceEquals(row.Owner, owner)))
+            {
+                StatusText.Text = "Selected commands must be in the same block to move together";
+                return;
+            }
+
+            var indices = rows.Select(row => owner.IndexOf(row.Command!)).OrderBy(index => index).ToList();
+            if (indices.Any(index => index < 0) || indices.Zip(indices.Skip(1), (a, b) => b == a + 1).Any(contiguous => !contiguous))
+            {
+                StatusText.Text = "Select neighboring commands to move them together";
+                return;
+            }
+
+            var first = indices[0];
+            var last = indices[^1];
+            if ((direction < 0 && first == 0) || (direction > 0 && last == owner.Count - 1))
+                return;
+
+            var commands = rows.Select(row => row.Command!).ToList();
+            foreach (var selectedCommand in commands)
+                owner.Remove(selectedCommand);
+
+            var insertIndex = direction < 0 ? first - 1 : first + 1;
+            owner.InsertRange(Math.Clamp(insertIndex, 0, owner.Count), commands);
+
+            var ids = commands.Select(command => command.Id).ToList();
+            MarkDirty();
+            RefreshCommandList(_selectedRow?.Command?.Id, ids);
+            return;
+        }
+
+        var row = rows[0];
+        var command = row.Command!;
+        var ownerSingle = row.Owner!;
+        var index = ownerSingle.IndexOf(command);
         if (index < 0)
             return;
 
         // Normal move between commands in the same block.
         var siblingIndex = index + Math.Sign(direction);
-        if (siblingIndex >= 0 && siblingIndex < owner.Count)
+        if (siblingIndex >= 0 && siblingIndex < ownerSingle.Count)
         {
-            owner.RemoveAt(index);
-            owner.Insert(siblingIndex, command);
+            ownerSingle.RemoveAt(index);
+            ownerSingle.Insert(siblingIndex, command);
             MarkDirty();
             RefreshCommandList(command.Id);
             return;
@@ -1581,12 +2047,12 @@ public partial class MainWindow : Window
         {
             if (row.Branch == CommandBranch.Else)
             {
-                owner.Remove(command);
+                ownerSingle.Remove(command);
                 parent.Children.Add(command);
             }
             else if (TryFindCommandLocation(parent, out var parentOwner, out _, out _))
             {
-                owner.Remove(command);
+                ownerSingle.Remove(command);
                 var parentIndex = parentOwner.IndexOf(parent);
                 parentOwner.Insert(Math.Max(0, parentIndex), command);
             }
@@ -1599,12 +2065,12 @@ public partial class MainWindow : Window
         {
             if (row.Branch == CommandBranch.Body && parent.HasElse && parent.ElseChildren.Count > 0)
             {
-                owner.Remove(command);
+                ownerSingle.Remove(command);
                 parent.ElseChildren.Insert(0, command);
             }
             else if (TryFindCommandLocation(parent, out var parentOwner, out _, out _))
             {
-                owner.Remove(command);
+                ownerSingle.Remove(command);
                 var parentIndex = parentOwner.IndexOf(parent);
                 parentOwner.Insert(Math.Clamp(parentIndex + 1, 0, parentOwner.Count), command);
             }
@@ -1671,19 +2137,109 @@ public partial class MainWindow : Window
 
     private void DeleteCommandButton_Click(object sender, RoutedEventArgs e)
     {
-        if (_selectedRow?.Command is not { } command || _selectedRow.Owner is null)
+        var rows = GetSelectedCommandRows();
+        if (rows.Count == 0)
             return;
 
-        _selectedRow.Owner.Remove(command);
+        var nestedCount = rows.Sum(row => CountCommandsInside(row.Command!));
+        if (rows.Count > 1 || nestedCount > 0)
+        {
+            string message;
+            if (rows.Count == 1)
+            {
+                var noun = nestedCount == 1 ? "command" : "commands";
+                message = $"Delete this block and {nestedCount} {noun} inside it?";
+            }
+            else if (nestedCount > 0)
+            {
+                var noun = nestedCount == 1 ? "command" : "commands";
+                message = $"Delete {rows.Count} selected commands and {nestedCount} {noun} inside them?";
+            }
+            else
+            {
+                message = $"Delete {rows.Count} selected commands?";
+            }
+
+            var result = MessageBox.Show(this, message, "Delete Commands", MessageBoxButton.YesNo, MessageBoxImage.Warning);
+            if (result != MessageBoxResult.Yes)
+                return;
+        }
+
+        foreach (var row in rows)
+        {
+            row.Owner!.Remove(row.Command!);
+            RemoveCollapsedIds(row.Command!);
+        }
+
         _selectedRow = null;
         MarkDirty();
-        RefreshCommandList();
+        RefreshCommandList(selectIds: Array.Empty<Guid>());
         ClearProperties("Select a command to edit it.");
+        StatusText.Text = rows.Count == 1 ? "Command deleted" : $"{rows.Count} commands deleted";
+    }
+
+    private static int CountCommandsInside(MacroCommand command)
+    {
+        var total = 0;
+        foreach (var child in command.Children)
+            total += 1 + CountCommandsInside(child);
+        foreach (var child in command.ElseChildren)
+            total += 1 + CountCommandsInside(child);
+        return total;
+    }
+
+    private void RemoveCollapsedIds(MacroCommand command)
+    {
+        _collapsedBlocks.Remove(command.Id);
+        foreach (var child in command.Children)
+            RemoveCollapsedIds(child);
+        foreach (var child in command.ElseChildren)
+            RemoveCollapsedIds(child);
     }
 
     private void CommandList_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
-        if (CommandList.SelectedItem is not CommandRow row)
+        if (_refreshingCommandSelection)
+            return;
+
+        var preferred = e.AddedItems
+            .OfType<CommandRow>()
+            .LastOrDefault(row => !row.IsHeader && row.Command is not null);
+
+        if (preferred is null && _selectedRow?.Command is { } current &&
+            CommandList.SelectedItems.OfType<CommandRow>().Any(row => row.Command?.Id == current.Id))
+        {
+            preferred = _selectedRow;
+        }
+
+        preferred ??= CommandList.SelectedItems
+            .OfType<CommandRow>()
+            .FirstOrDefault(row => !row.IsHeader && row.Command is not null);
+
+        ApplyCommandSelection(preferred);
+    }
+
+    private void ApplyCommandSelection(CommandRow? row)
+    {
+        var selectedCommandCount = CommandList.SelectedItems
+            .OfType<CommandRow>()
+            .Count(item => !item.IsHeader && item.Command is not null);
+
+        if (selectedCommandCount > 1)
+        {
+            _selectedRow = row?.Command is not null && !row.IsHeader
+                ? row
+                : CommandList.SelectedItems
+                    .OfType<CommandRow>()
+                    .FirstOrDefault(item => !item.IsHeader && item.Command is not null);
+
+            UpdateBlockButtonState();
+            UpdateRunButtons();
+            ClearProperties($"{selectedCommandCount} commands selected");
+            return;
+        }
+
+        if (row?.Command is null || row.IsHeader)
         {
             _selectedRow = null;
             UpdateBlockButtonState();
@@ -1695,77 +2251,115 @@ public partial class MainWindow : Window
         _selectedRow = row;
         UpdateBlockButtonState();
         UpdateRunButtons();
-
-        if (row.IsHeader)
-        {
-            ClearProperties(row.Label + " block selected");
-            return;
-        }
-
-        if (row.Command is null)
-        {
-            ClearProperties("Select a command to edit it.");
-            return;
-        }
-
         BuildProperties(row.Command);
     }
 
     private void CommandList_MouseDoubleClick(object sender, MouseButtonEventArgs e)
     {
-        if (_selectedRow?.Command is { } command)
+        var selectedCommandCount = CommandList.SelectedItems
+            .OfType<CommandRow>()
+            .Count(item => !item.IsHeader && item.Command is not null);
+        if (selectedCommandCount > 1)
+            return;
+
+        if (_selectedRow?.Command is not { } command)
+            return;
+
+        if (_selectedRow.IsCollapsible)
+            ToggleCollapsed(command);
+        else
             BuildProperties(command);
     }
 
-    private void RefreshCommandList(Guid? selectId = null)
+    private void RefreshCommandList(Guid? selectId = null, IReadOnlyCollection<Guid>? selectIds = null)
     {
         if (_currentSequence is null)
             return;
 
+        var previousActiveId = _selectedRow?.Command?.Id;
+        var previousSelectedIds = CommandList.SelectedItems
+            .OfType<CommandRow>()
+            .Where(row => row.Command is not null)
+            .Select(row => row.Command!.Id)
+            .ToHashSet();
+
+        HashSet<Guid> idsToSelect;
+        if (selectIds is not null)
+        {
+            idsToSelect = selectIds.ToHashSet();
+        }
+        else if (selectId.HasValue)
+        {
+            // Keep a multi-selection together when a property refreshes the active command.
+            idsToSelect = previousSelectedIds.Count > 1 && previousSelectedIds.Contains(selectId.Value)
+                ? previousSelectedIds
+                : new HashSet<Guid> { selectId.Value };
+        }
+        else
+        {
+            idsToSelect = previousSelectedIds;
+            if (idsToSelect.Count == 0 && previousActiveId.HasValue)
+                idsToSelect.Add(previousActiveId.Value);
+        }
+
         var rows = new List<CommandRow>();
         FlattenCommands(_currentSequence.Commands, rows, 0, CommandBranch.Root);
-        CommandList.ItemsSource = rows;
-
-        if (selectId.HasValue)
+        if (rows.Count == 0)
         {
-            var row = rows.FirstOrDefault(r => r.Command?.Id == selectId.Value);
-            if (row is not null)
+            rows.Add(new CommandRow
             {
-                CommandList.SelectedItem = row;
-                CommandList.ScrollIntoView(row);
-                _selectedRow = row;
-            }
-        }
-        else if (_selectedRow?.Command is { } selected)
-        {
-            var row = rows.FirstOrDefault(r => r.Command?.Id == selected.Id);
-            if (row is not null)
-            {
-                CommandList.SelectedItem = row;
-                _selectedRow = row;
-            }
+                IsHeader = true,
+                Label = "EMPTY",
+                Owner = _currentSequence.Commands,
+                Depth = 0,
+                Branch = CommandBranch.Root
+            });
         }
 
+        _refreshingCommandSelection = true;
+        try
+        {
+            CommandList.ItemsSource = rows;
+            CommandList.UnselectAll();
+            foreach (var row in rows.Where(row => row.Command is not null && idsToSelect.Contains(row.Command.Id)))
+                CommandList.SelectedItems.Add(row);
+        }
+        finally
+        {
+            _refreshingCommandSelection = false;
+        }
+
+        var activeId = selectId ?? (previousActiveId.HasValue && idsToSelect.Contains(previousActiveId.Value) ? previousActiveId : null);
+        var activeRow = activeId.HasValue
+            ? rows.FirstOrDefault(row => row.Command?.Id == activeId.Value)
+            : rows.FirstOrDefault(row => row.Command is not null && idsToSelect.Contains(row.Command.Id));
+
+        if (activeRow is not null)
+            CommandList.ScrollIntoView(activeRow);
+
+        ApplyCommandSelection(activeRow);
         UpdateBlockButtonState();
     }
 
-    private static void FlattenCommands(List<MacroCommand> source, List<CommandRow> rows, int depth, CommandBranch branch, MacroCommand? parentCommand = null)
+    private void FlattenCommands(List<MacroCommand> source, List<CommandRow> rows, int depth, CommandBranch branch, MacroCommand? parentCommand = null)
     {
         foreach (var command in source)
         {
             if (command.Type == CommandType.Comment)
                 continue;
 
+            var isCollapsed = _collapsedBlocks.Contains(command.Id);
             rows.Add(new CommandRow
             {
                 Command = command,
                 Owner = source,
                 ParentCommand = parentCommand,
                 Depth = depth,
-                Branch = branch
+                Branch = branch,
+                IsCollapsed = isCollapsed
             });
 
-            if (!command.HasBody || command.Type == CommandType.RecordedActions)
+            if (!command.HasBody || command.Type == CommandType.RecordedActions || isCollapsed)
                 continue;
 
             var bodyLabel = command.HasElse ? "THEN" : command.Type == CommandType.Group ? "GROUP" : "DO";
@@ -1800,15 +2394,16 @@ public partial class MainWindow : Window
 
     private void BuildProperties(MacroCommand command)
     {
-        PropertiesPanel.Children.Clear();
-        PropertiesHintText.Text = FriendlyName(command.Type);
-        AddReadOnlyField("Command", FriendlyName(command.Type));
-        AddCommonCommandProperties(command);
-
-        switch (command.Type)
+        _rebuildingProperties = true;
+        try
         {
+            PropertiesPanel.Children.Clear();
+            PropertiesHintText.Text = FriendlyName(command.Type);
+
+            switch (command.Type)
+            {
             case CommandType.Comment:
-                AddTextField("Comment", command.Text, value => command.Text = value, true);
+                AddTextField("Comment", command.Text, value => command.Text = value, true, allowVariables: false);
                 break;
 
             case CommandType.MoveMouse:
@@ -1830,7 +2425,7 @@ public partial class MainWindow : Window
 
             case CommandType.Scroll:
                 AddLocationFields(command);
-                AddNumberField("Wheel amount (120 = up, -120 = down)", command.ScrollAmount, -12000, 12000, value => command.ScrollAmount = value);
+                AddNumberField("Scroll amount (positive = up, negative = down)", command.ScrollAmount, -12000, 12000, value => command.ScrollAmount = value);
                 AddMouseMovementFields(command);
                 break;
 
@@ -1845,18 +2440,15 @@ public partial class MainWindow : Window
             case CommandType.LeftMouseUp:
             case CommandType.RightMouseDown:
             case CommandType.RightMouseUp:
-                AddInfo("Use these with Move Mouse to build click-and-drag or hold actions.");
                 break;
 
             case CommandType.PressKey:
                 AddTextField("Key or combo", command.Key, value => command.Key = value);
-                AddInfo("Examples: E, Space, Enter, F5, Ctrl+C, Ctrl+Shift+S");
                 break;
 
             case CommandType.KeyDown:
             case CommandType.KeyUp:
                 AddTextField("Key", command.Key, value => command.Key = value);
-                AddInfo("Use Key Down + Key Up when you need to hold a key across other commands.");
                 break;
 
             case CommandType.TypeText:
@@ -1870,8 +2462,8 @@ public partial class MainWindow : Window
 
             case CommandType.RepeatKey:
                 AddTextField("Key or combo", command.Key, value => command.Key = value);
+                AdoptLegacyNumberExpression(command, nameof(MacroCommand.RepeatCount), command.RepeatExpression, () => command.RepeatExpression = string.Empty);
                 AddNumberField("Repeat count", command.RepeatCount, 1, 1_000_000, value => command.RepeatCount = value);
-                AddTextField("Repeat count variable / math (optional)", command.RepeatExpression, value => command.RepeatExpression = value);
                 AddNumberField("Delay between presses (ms)", command.WaitMs, 0, 86_400_000, value => command.WaitMs = value);
                 break;
 
@@ -1888,13 +2480,13 @@ public partial class MainWindow : Window
 
             case CommandType.LoopWhileKeyPressed:
                 AddTextField("Key", command.Key, value => command.Key = value);
-                AddNumberField("Idle poll ms (empty loop)", command.PollMs, 10, 5000, value => command.PollMs = value);
+                AddNumberField("Check every (ms)", command.PollMs, 10, 5000, value => command.PollMs = value);
                 AddBlockInfo(command);
                 break;
 
             case CommandType.Wait:
+                AdoptLegacyNumberExpression(command, nameof(MacroCommand.WaitMs), command.WaitExpression, () => command.WaitExpression = string.Empty);
                 AddNumberField("Milliseconds", command.WaitMs, 0, 86_400_000, value => command.WaitMs = value);
-                AddTextField("Variable / math override (optional)", command.WaitExpression, value => command.WaitExpression = value);
                 break;
 
             case CommandType.RandomWait:
@@ -1914,7 +2506,7 @@ public partial class MainWindow : Window
                 if (command.Type == CommandType.WaitUntilColor)
                     AddPollingFields(command);
                 else if (command.Type is CommandType.LoopWhileColor or CommandType.LoopUntilColor)
-                    AddNumberField("Idle poll ms (used if body is empty)", command.PollMs, 10, 5000, value => command.PollMs = value);
+                    AddNumberField("Check every (ms)", command.PollMs, 10, 5000, value => command.PollMs = value);
                 if (command.HasBody)
                     AddBlockInfo(command);
                 break;
@@ -1922,7 +2514,7 @@ public partial class MainWindow : Window
             case CommandType.ClickColor:
             case CommandType.FindColorToVariables:
                 AddColorField(command);
-                AddNumberField("Color tolerance (0-255 per channel)", command.ColorTolerance, 0, 255, value => command.ColorTolerance = value);
+                AddNumberField("Color tolerance", command.ColorTolerance, 0, 255, value => command.ColorTolerance = value);
                 AddSearchAreaFields(command);
                 if (command.Type == CommandType.ClickColor)
                     AddMouseMovementFields(command);
@@ -1933,7 +2525,7 @@ public partial class MainWindow : Window
 
             case CommandType.SampleColorToVariable:
                 AddLocationFields(command);
-                AddTextField("Save color into variable", command.StoreTextVariable, value => command.StoreTextVariable = RuntimeValues.NormalizeName(value));
+                AddVariableNameField("Save color as", command.StoreTextVariable, value => command.StoreTextVariable = value);
                 break;
 
             case CommandType.IfImage:
@@ -1957,7 +2549,7 @@ public partial class MainWindow : Window
                         AddNumberField("Delay between clicks (ms)", command.ClickDelayMs, 20, 1000, value => command.ClickDelayMs = value);
                 }
                 if (command.Type is CommandType.LoopUntilImage or CommandType.LoopWhileImage)
-                    AddNumberField("Idle poll ms (used if body is empty)", command.PollMs, 10, 5000, value => command.PollMs = value);
+                    AddNumberField("Check every (ms)", command.PollMs, 10, 5000, value => command.PollMs = value);
                 if (command.Type == CommandType.FindImageToVariables)
                     AddStorePointVariableFields(command);
                 if (command.HasBody)
@@ -1988,19 +2580,19 @@ public partial class MainWindow : Window
                 break;
 
             case CommandType.SetVariable:
-                AddTextField("Variable name", command.VariableName, value => command.VariableName = RuntimeValues.NormalizeName(value));
-                AddTextField("Value", command.VariableValue, value => command.VariableValue = value);
+                AddVariableNameField("Save as", command.VariableName, value => command.VariableName = value);
+                AddValueOrVariableField("Value", command.VariableValue, value => command.VariableValue = value);
                 break;
 
             case CommandType.AddVariable:
-                AddTextField("Variable name", command.VariableName, value => command.VariableName = RuntimeValues.NormalizeName(value));
-                AddTextField("Amount / text to add", command.VariableValue, value => command.VariableValue = value);
+                AddExistingVariableField("Change this variable", command.VariableName, value => command.VariableName = value);
+                AddValueOrVariableField("Add this amount", command.VariableValue, value => command.VariableValue = value);
                 break;
 
             case CommandType.RandomNumber:
-                AddTextField("Variable name", command.VariableName, value => command.VariableName = RuntimeValues.NormalizeName(value));
-                AddTextField("Minimum", command.VariableValue, value => command.VariableValue = value);
-                AddTextField("Maximum", command.VariableValue2, value => command.VariableValue2 = value);
+                AddVariableNameField("Save random number as", command.VariableName, value => command.VariableName = value);
+                AddValueOrVariableField("Minimum", command.VariableValue, value => command.VariableValue = value);
+                AddValueOrVariableField("Maximum", command.VariableValue2, value => command.VariableValue2 = value);
                 break;
 
             case CommandType.IfVariable:
@@ -2010,7 +2602,7 @@ public partial class MainWindow : Window
                 AddVariableConditionFields(command);
                 if (command.Type == CommandType.WaitUntilVariable) AddPollingFields(command);
                 else if (command.Type is CommandType.LoopWhileVariable or CommandType.LoopUntilVariable)
-                    AddNumberField("Idle poll ms (empty loop)", command.PollMs, 10, 5000, value => command.PollMs = value);
+                    AddNumberField("Check every (ms)", command.PollMs, 10, 5000, value => command.PollMs = value);
                 if (command.HasBody) AddBlockInfo(command);
                 break;
 
@@ -2019,7 +2611,7 @@ public partial class MainWindow : Window
                 break;
 
             case CommandType.ClipboardToVariable:
-                AddTextField("Save into variable", command.VariableName, value => command.VariableName = RuntimeValues.NormalizeName(value));
+                AddVariableNameField("Save as", command.VariableName, value => command.VariableName = value);
                 break;
 
             case CommandType.ReadTextFile:
@@ -2032,13 +2624,13 @@ public partial class MainWindow : Window
 
             case CommandType.PromptText:
                 AddTextField("Question", command.PromptText, value => command.PromptText = value, true);
-                AddTextField("Save answer into variable", command.VariableName, value => command.VariableName = RuntimeValues.NormalizeName(value));
+                AddVariableNameField("Save answer as", command.VariableName, value => command.VariableName = value);
                 AddTextField("Default answer", command.VariableValue, value => command.VariableValue = value);
                 break;
 
             case CommandType.PromptYesNo:
                 AddTextField("Question", command.PromptText, value => command.PromptText = value, true);
-                AddTextField("Save true/false into variable", command.VariableName, value => command.VariableName = RuntimeValues.NormalizeName(value));
+                AddVariableNameField("Save answer as", command.VariableName, value => command.VariableName = value);
                 break;
 
             case CommandType.Group:
@@ -2050,8 +2642,8 @@ public partial class MainWindow : Window
                 break;
 
             case CommandType.LoopTimes:
+                AdoptLegacyNumberExpression(command, nameof(MacroCommand.RepeatCount), command.RepeatExpression, () => command.RepeatExpression = string.Empty);
                 AddNumberField("Repeat count", command.RepeatCount, 0, 1_000_000, value => command.RepeatCount = value);
-                AddTextField("Repeat count variable / math (optional)", command.RepeatExpression, value => command.RepeatExpression = value);
                 AddBlockInfo(command);
                 break;
 
@@ -2061,19 +2653,17 @@ public partial class MainWindow : Window
                 break;
 
             case CommandType.Break:
-                AddInfo("Stops the nearest Loop block and continues after that loop.");
-                break;
-
             case CommandType.Return:
-                AddInfo("Ends the current sequence and returns to the sequence that called it.");
-                break;
-
             case CommandType.StopMacro:
-                AddInfo($"Stops the entire macro immediately, the same as pressing {_appSettings.StopMacroHotkey}.");
                 break;
         }
 
-        AddFailureBehaviorFields(command);
+            AddMoreOptions(command);
+        }
+        finally
+        {
+            _rebuildingProperties = false;
+        }
     }
 
     private void AddMouseMovementFields(MacroCommand command)
@@ -2082,15 +2672,13 @@ public partial class MainWindow : Window
             command.MouseMoveMode = command.MoveDurationMs > 0 ? MouseMoveMode.Smooth : MouseMoveMode.Teleport;
 
         AddLabel("Mouse movement");
-        var mode = new ComboBox
-        {
-            ItemsSource = new[] { MouseMoveMode.Teleport, MouseMoveMode.Smooth },
-            SelectedItem = command.MouseMoveMode,
-            Margin = new Thickness(0, 0, 0, 10)
-        };
+        var mode = new ComboBox { Margin = new Thickness(0, 0, 0, 10) };
+        mode.Items.Add(new ComboBoxItem { Content = "Instant", Tag = MouseMoveMode.Teleport });
+        mode.Items.Add(new ComboBoxItem { Content = "Smooth", Tag = MouseMoveMode.Smooth });
+        mode.SelectedItem = mode.Items.Cast<ComboBoxItem>().FirstOrDefault(x => x.Tag is MouseMoveMode m && m == command.MouseMoveMode);
         mode.SelectionChanged += (_, _) =>
         {
-            if (mode.SelectedItem is not MouseMoveMode selected || selected == command.MouseMoveMode)
+            if (mode.SelectedItem is not ComboBoxItem { Tag: MouseMoveMode selected } || selected == command.MouseMoveMode)
                 return;
 
             command.MouseMoveMode = selected;
@@ -2102,7 +2690,9 @@ public partial class MainWindow : Window
         PropertiesPanel.Children.Add(mode);
 
         if (command.MouseMoveMode == MouseMoveMode.Smooth)
-            AddNumberField("Smooth move duration (ms)", command.MoveDurationMs, 1, 60000, value => command.MoveDurationMs = value);
+        {
+            AddNumberField("Slide time (ms)", command.MoveDurationMs, 1, 60000, value => command.MoveDurationMs = value);
+        }
     }
 
     private void AddRecordedActionsProperties(MacroCommand command)
@@ -2113,21 +2703,25 @@ public partial class MainWindow : Window
             Text = string.IsNullOrWhiteSpace(command.RecordingStopHotkey) ? "F7" : command.RecordingStopHotkey,
             Margin = new Thickness(0, 0, 0, 8)
         };
-        hotkeyBox.LostFocus += (_, _) =>
+        hotkeyBox.TextChanged += (_, _) =>
         {
             var value = hotkeyBox.Text.Trim();
             if (!GlobalInputRecorder.IsValidHotkey(value))
-            {
-                MessageBox.Show(this,
-                    "Invalid hotkey. Examples: F7, F10, Ctrl+F7, Shift+F6.",
-                    "Recorder Hotkey", MessageBoxButton.OK, MessageBoxImage.Information);
-                hotkeyBox.Text = string.IsNullOrWhiteSpace(command.RecordingStopHotkey) ? "F7" : command.RecordingStopHotkey;
                 return;
-            }
-
+            if (value == command.RecordingStopHotkey)
+                return;
             command.RecordingStopHotkey = value;
-            hotkeyBox.Text = value;
-            MarkDirtyAndRefresh(command.Id);
+            MarkDirtyAndRefreshCommandDisplay(command.Id);
+        };
+        hotkeyBox.LostFocus += (_, _) =>
+        {
+            var value = hotkeyBox.Text.Trim();
+            if (GlobalInputRecorder.IsValidHotkey(value))
+                return;
+            MessageBox.Show(this,
+                "Invalid hotkey. Examples: F7, F10, Ctrl+F7, Shift+F6.",
+                "Recorder Hotkey", MessageBoxButton.OK, MessageBoxImage.Information);
+            hotkeyBox.Text = string.IsNullOrWhiteSpace(command.RecordingStopHotkey) ? "F7" : command.RecordingStopHotkey;
         };
         PropertiesPanel.Children.Add(hotkeyBox);
 
@@ -2152,7 +2746,7 @@ public partial class MainWindow : Window
         PropertiesPanel.Children.Add(mouseMovement);
 
         if (command.RecordMouseMovement)
-            AddNumberField("Mouse sample interval (ms)", command.RecordMouseSampleMs, 15, 500, value => command.RecordMouseSampleMs = value);
+            AddNumberField("Mouse sample interval (ms)", command.RecordMouseSampleMs, 15, 500, value => command.RecordMouseSampleMs = value, allowVariables: false);
 
         var recordButton = new Button
         {
@@ -2264,7 +2858,7 @@ public partial class MainWindow : Window
         AddComparePicker(command);
         AddColorField(command);
         AddLocationFields(command);
-        AddNumberField("Color tolerance (0-255 per channel)", command.ColorTolerance, 0, 255, value => command.ColorTolerance = value);
+        AddNumberField("Color tolerance", command.ColorTolerance, 0, 255, value => command.ColorTolerance = value);
 
         var test = new Button { Content = "Test Pixel Now", Margin = new Thickness(0, 0, 0, 12) };
         test.Click += (_, _) =>
@@ -2280,16 +2874,14 @@ public partial class MainWindow : Window
 
     private void AddComparePicker(MacroCommand command)
     {
-        AddLabel("Comparison");
-        var combo = new ComboBox
-        {
-            ItemsSource = Enum.GetValues<CompareMode>(),
-            SelectedItem = command.CompareMode,
-            Margin = new Thickness(0, 0, 0, 12)
-        };
+        AddLabel("Check for");
+        var combo = new ComboBox { Margin = new Thickness(0, 0, 0, 12) };
+        combo.Items.Add(new ComboBoxItem { Content = "Color matches", Tag = CompareMode.Equals });
+        combo.Items.Add(new ComboBoxItem { Content = "Color does not match", Tag = CompareMode.NotEquals });
+        combo.SelectedItem = combo.Items.Cast<ComboBoxItem>().FirstOrDefault(x => x.Tag is CompareMode m && m == command.CompareMode);
         combo.SelectionChanged += (_, _) =>
         {
-            if (combo.SelectedItem is CompareMode mode)
+            if (combo.SelectedItem is ComboBoxItem { Tag: CompareMode mode })
             {
                 command.CompareMode = mode;
                 MarkDirtyAndRefresh(command.Id);
@@ -2304,16 +2896,33 @@ public partial class MainWindow : Window
         var row = new Grid { Margin = new Thickness(0, 0, 0, 12) };
         row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
 
-        var box = new TextBox { Text = command.ColorHex, Margin = new Thickness(0, 0, 7, 0) };
+        var box = new TextBox
+        {
+            Text = command.ColorHex,
+            ToolTip = "Type a color like #FF8800 or choose a saved variable"
+        };
+        box.TextChanged += (_, _) =>
+        {
+            var text = box.Text.Trim();
+            if (string.IsNullOrWhiteSpace(text))
+                return;
+
+            command.ColorHex = Regex.IsMatch(text, @"^(?:0x|#)?[0-9A-Fa-f]{6}$")
+                ? NormalizeColor(text)
+                : text;
+            MarkDirtyAndRefreshCommandDisplay(command.Id);
+        };
         box.LostFocus += (_, _) =>
         {
-            command.ColorHex = NormalizeColor(box.Text);
-            box.Text = command.ColorHex;
-            MarkDirtyAndRefresh(command.Id);
+            var text = box.Text.Trim();
+            if (Regex.IsMatch(text, @"^(?:0x|#)?[0-9A-Fa-f]{6}$"))
+                box.Text = NormalizeColor(text);
         };
 
-        var pick = new Button { Content = "Pick Screen", MinWidth = 95 };
+        var variablePicker = CreateVariablePicker(box);
+        var pick = new Button { Content = "Pick Color + Location", MinWidth = 95, Margin = new Thickness(7, 0, 0, 0) };
         pick.Click += (_, _) =>
         {
             var picker = new PointPickerWindow(true);
@@ -2324,6 +2933,8 @@ public partial class MainWindow : Window
                 {
                     command.X = picker.PickedX;
                     command.Y = picker.PickedY;
+                    command.XExpression = string.Empty;
+                    command.YExpression = string.Empty;
                     command.ColorHex = picker.PickedColor;
                     MarkDirty();
                 }
@@ -2338,8 +2949,10 @@ public partial class MainWindow : Window
         };
 
         Grid.SetColumn(box, 0);
-        Grid.SetColumn(pick, 1);
+        Grid.SetColumn(variablePicker, 1);
+        Grid.SetColumn(pick, 2);
         row.Children.Add(box);
+        row.Children.Add(variablePicker);
         row.Children.Add(pick);
         PropertiesPanel.Children.Add(row);
     }
@@ -2347,39 +2960,51 @@ public partial class MainWindow : Window
     private void AddLocationFields(MacroCommand command, string label = "Location")
     {
         AddLabel(label);
-        var grid = new Grid { Margin = new Thickness(0, 0, 0, 7) };
-        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
 
-        var xLabel = new TextBlock { Text = "X", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 5, 0) };
-        var xBox = new TextBox { Text = command.X.ToString(), Margin = new Thickness(0, 0, 10, 0) };
-        var yLabel = new TextBlock { Text = "Y", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 5, 0) };
-        var yBox = new TextBox { Text = command.Y.ToString() };
-
-        xBox.LostFocus += (_, _) =>
+        var xBox = new TextBox
         {
-            if (int.TryParse(xBox.Text, out var value))
+            Text = string.IsNullOrWhiteSpace(command.XExpression) ? command.X.ToString() : command.XExpression,
+            ToolTip = "Type a number or choose a saved variable"
+        };
+        var yBox = new TextBox
+        {
+            Text = string.IsNullOrWhiteSpace(command.YExpression) ? command.Y.ToString() : command.YExpression,
+            ToolTip = "Type a number or choose a saved variable"
+        };
+
+        xBox.TextChanged += (_, _) =>
+        {
+            var text = xBox.Text.Trim();
+            if (int.TryParse(text, out var value))
             {
                 command.X = value;
-                MarkDirtyAndRefresh(command.Id);
+                command.XExpression = string.Empty;
             }
+            else
+            {
+                command.XExpression = text;
+            }
+            MarkDirtyAndRefreshCommandDisplay(command.Id);
         };
-        yBox.LostFocus += (_, _) =>
+        yBox.TextChanged += (_, _) =>
         {
-            if (int.TryParse(yBox.Text, out var value))
+            var text = yBox.Text.Trim();
+            if (int.TryParse(text, out var value))
             {
                 command.Y = value;
-                MarkDirtyAndRefresh(command.Id);
+                command.YExpression = string.Empty;
             }
+            else
+            {
+                command.YExpression = text;
+            }
+            MarkDirtyAndRefreshCommandDisplay(command.Id);
         };
 
-        Grid.SetColumn(xLabel, 0); Grid.SetColumn(xBox, 1); Grid.SetColumn(yLabel, 2); Grid.SetColumn(yBox, 3);
-        grid.Children.Add(xLabel); grid.Children.Add(xBox); grid.Children.Add(yLabel); grid.Children.Add(yBox);
-        PropertiesPanel.Children.Add(grid);
+        PropertiesPanel.Children.Add(CreateCoordinateRow("X", xBox, command.X.ToString()));
+        PropertiesPanel.Children.Add(CreateCoordinateRow("Y", yBox, command.Y.ToString()));
 
-        var set = new Button { Content = "Set Location From Screen", Margin = new Thickness(0, 0, 0, 12) };
+        var set = new Button { Content = "Pick Location", Margin = new Thickness(0, 0, 0, 12) };
         set.Click += (_, _) =>
         {
             var picker = new PointPickerWindow(false);
@@ -2390,6 +3015,8 @@ public partial class MainWindow : Window
                 {
                     command.X = picker.PickedX;
                     command.Y = picker.PickedY;
+                    command.XExpression = string.Empty;
+                    command.YExpression = string.Empty;
                     MarkDirty();
                 }
             }
@@ -2402,46 +3029,82 @@ public partial class MainWindow : Window
             RefreshCommandList(command.Id);
         };
         PropertiesPanel.Children.Add(set);
-        AddCoordinateModeFields(command);
-        AddCoordinateExpressionFields(command);
+        AddLocationOptionsExpander(command, command.Type == CommandType.DragMouse);
+    }
+
+    private Grid CreateCoordinateRow(string axis, TextBox box, string fallbackValue)
+    {
+        var row = new Grid { Margin = new Thickness(0, 0, 0, 7) };
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+        var label = new TextBlock
+        {
+            Text = axis,
+            Width = 18,
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(0, 0, 5, 0)
+        };
+
+        var variablePicker = CreateVariablePicker(box, fallbackValue);
+        Grid.SetColumn(label, 0);
+        Grid.SetColumn(box, 1);
+        Grid.SetColumn(variablePicker, 2);
+        row.Children.Add(label);
+        row.Children.Add(box);
+        row.Children.Add(variablePicker);
+        return row;
     }
 
     private void AddEndLocationFields(MacroCommand command)
     {
         AddLabel("End location");
-        var grid = new Grid { Margin = new Thickness(0, 0, 0, 7) };
-        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
 
-        var xLabel = new TextBlock { Text = "X", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 5, 0) };
-        var xBox = new TextBox { Text = command.EndX.ToString(), Margin = new Thickness(0, 0, 10, 0) };
-        var yLabel = new TextBlock { Text = "Y", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 5, 0) };
-        var yBox = new TextBox { Text = command.EndY.ToString() };
-
-        xBox.LostFocus += (_, _) =>
+        var xBox = new TextBox
         {
-            if (int.TryParse(xBox.Text, out var value))
+            Text = string.IsNullOrWhiteSpace(command.EndXExpression) ? command.EndX.ToString() : command.EndXExpression,
+            ToolTip = "Type a number or choose a saved variable"
+        };
+        var yBox = new TextBox
+        {
+            Text = string.IsNullOrWhiteSpace(command.EndYExpression) ? command.EndY.ToString() : command.EndYExpression,
+            ToolTip = "Type a number or choose a saved variable"
+        };
+
+        xBox.TextChanged += (_, _) =>
+        {
+            var text = xBox.Text.Trim();
+            if (int.TryParse(text, out var value))
             {
                 command.EndX = value;
-                MarkDirtyAndRefresh(command.Id);
+                command.EndXExpression = string.Empty;
             }
+            else
+            {
+                command.EndXExpression = text;
+            }
+            MarkDirtyAndRefreshCommandDisplay(command.Id);
         };
-        yBox.LostFocus += (_, _) =>
+        yBox.TextChanged += (_, _) =>
         {
-            if (int.TryParse(yBox.Text, out var value))
+            var text = yBox.Text.Trim();
+            if (int.TryParse(text, out var value))
             {
                 command.EndY = value;
-                MarkDirtyAndRefresh(command.Id);
+                command.EndYExpression = string.Empty;
             }
+            else
+            {
+                command.EndYExpression = text;
+            }
+            MarkDirtyAndRefreshCommandDisplay(command.Id);
         };
 
-        Grid.SetColumn(xLabel, 0); Grid.SetColumn(xBox, 1); Grid.SetColumn(yLabel, 2); Grid.SetColumn(yBox, 3);
-        grid.Children.Add(xLabel); grid.Children.Add(xBox); grid.Children.Add(yLabel); grid.Children.Add(yBox);
-        PropertiesPanel.Children.Add(grid);
+        PropertiesPanel.Children.Add(CreateCoordinateRow("X", xBox, command.EndX.ToString()));
+        PropertiesPanel.Children.Add(CreateCoordinateRow("Y", yBox, command.EndY.ToString()));
 
-        var set = new Button { Content = "Set End From Screen", Margin = new Thickness(0, 0, 0, 12) };
+        var set = new Button { Content = "Pick End Location", Margin = new Thickness(0, 0, 0, 12) };
         set.Click += (_, _) =>
         {
             var picker = new PointPickerWindow(false);
@@ -2452,6 +3115,8 @@ public partial class MainWindow : Window
                 {
                     command.EndX = picker.PickedX;
                     command.EndY = picker.PickedY;
+                    command.EndXExpression = string.Empty;
+                    command.EndYExpression = string.Empty;
                     MarkDirty();
                 }
             }
@@ -2464,7 +3129,6 @@ public partial class MainWindow : Window
             RefreshCommandList(command.Id);
         };
         PropertiesPanel.Children.Add(set);
-        AddEndCoordinateExpressionFields(command);
     }
 
     private void AddSearchAreaFields(MacroCommand command)
@@ -2555,13 +3219,17 @@ public partial class MainWindow : Window
         var grid = new Grid { Margin = new Thickness(0, 0, 0, 12) };
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        var box = new TextBox { Text = command.ProgramPath, Margin = new Thickness(0, 0, 7, 0) };
-        box.LostFocus += (_, _) =>
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+        var box = new TextBox { Text = command.ProgramPath };
+        box.TextChanged += (_, _) =>
         {
             command.ProgramPath = box.Text.Trim();
-            MarkDirtyAndRefresh(command.Id);
+            MarkDirtyAndRefreshCommandDisplay(command.Id);
         };
-        var browse = new Button { Content = "Browse…", MinWidth = 85 };
+
+        var variablePicker = CreateVariablePicker(box);
+        var browse = new Button { Content = "Browse…", MinWidth = 76, Margin = new Thickness(7, 0, 0, 0) };
         browse.Click += (_, _) =>
         {
             var dialog = new OpenFileDialog
@@ -2571,13 +3239,17 @@ public partial class MainWindow : Window
             };
             if (dialog.ShowDialog(this) == true)
             {
-                command.ProgramPath = dialog.FileName;
-                box.Text = command.ProgramPath;
-                MarkDirtyAndRefresh(command.Id);
+                box.Text = dialog.FileName;
+                MarkDirtyAndRefreshCommandDisplay(command.Id);
             }
         };
-        Grid.SetColumn(box, 0); Grid.SetColumn(browse, 1);
-        grid.Children.Add(box); grid.Children.Add(browse);
+
+        Grid.SetColumn(box, 0);
+        Grid.SetColumn(variablePicker, 1);
+        Grid.SetColumn(browse, 2);
+        grid.Children.Add(box);
+        grid.Children.Add(variablePicker);
+        grid.Children.Add(browse);
         PropertiesPanel.Children.Add(grid);
         AddTextField("Arguments (optional)", command.ProgramArguments, value => command.ProgramArguments = value);
         AddTextField("Working directory (optional)", command.WorkingDirectory, value => command.WorkingDirectory = value);
@@ -3006,15 +3678,47 @@ public partial class MainWindow : Window
 
     private void AddPollingFields(MacroCommand command)
     {
-        AddNumberField("Poll every (ms)", command.PollMs, 10, 5000, value => command.PollMs = value);
-        AddNumberField("Timeout (ms, 0 = forever)", command.TimeoutMs, 0, 86_400_000, value => command.TimeoutMs = value);
+        var panel = new StackPanel { Margin = new Thickness(2, 7, 2, 2) };
+
+        panel.Children.Add(new TextBlock { Text = "Check every (ms)", FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 0, 0, 5) });
+        panel.Children.Add(CreateInlineNumberInput(command, nameof(MacroCommand.PollMs), command.PollMs, 10, 5000, value => command.PollMs = value));
+
+        panel.Children.Add(new TextBlock { Text = "Give up after (ms)", FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 0, 0, 5) });
+        panel.Children.Add(CreateInlineNumberInput(command, nameof(MacroCommand.TimeoutMs), command.TimeoutMs, 0, 86_400_000, value => command.TimeoutMs = value));
+        panel.Children.Add(new TextBlock
+        {
+            Text = "0 = wait forever.",
+            Foreground = (Brush)FindResource("MutedTextBrush"),
+            FontSize = 11
+        });
+
+        var expander = new Expander
+        {
+            Header = "Timing Options",
+            IsExpanded = _expandedTimingOptions.Contains(command.Id),
+            Foreground = (Brush)FindResource("TextBrush"),
+            Content = new Border
+            {
+                Background = (Brush)FindResource("Panel2Brush"),
+                BorderBrush = (Brush)FindResource("BorderBrushSoft"),
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(9),
+                Padding = new Thickness(11),
+                Margin = new Thickness(0, 7, 0, 0),
+                Child = panel
+            },
+            Margin = new Thickness(0, 0, 0, 10)
+        };
+        expander.Expanded += (_, _) => _expandedTimingOptions.Add(command.Id);
+        expander.Collapsed += (_, _) => { if (!_rebuildingProperties) _expandedTimingOptions.Remove(command.Id); };
+        PropertiesPanel.Children.Add(expander);
     }
 
     private void AddBlockInfo(MacroCommand command)
     {
         AddInfo(command.HasElse
-            ? "Use + Add Inside for THEN commands and + Add Else for ELSE commands."
-            : "Use + Add Inside to place commands inside this loop.");
+            ? "Add to THEN for the true side. Add to ELSE for the other side."
+            : "Add commands to this block to choose what repeats.");
     }
 
     private void AddSequencePicker(MacroCommand command)
@@ -3035,29 +3739,417 @@ public partial class MainWindow : Window
             }
         };
         PropertiesPanel.Children.Add(combo);
-        AddInfo("Sequences work like reusable functions/tabs. A sequence can call another sequence.");
     }
 
-    private void AddNumberField(string label, int currentValue, int min, int max, Action<int> setter)
+    private void AdoptLegacyNumberExpression(MacroCommand command, string propertyName, string legacyExpression, Action clearLegacy)
+    {
+        if (string.IsNullOrWhiteSpace(legacyExpression))
+            return;
+
+        command.ValueExpressions ??= new Dictionary<string, string>();
+        if (!command.ValueExpressions.ContainsKey(propertyName))
+            command.ValueExpressions[propertyName] = legacyExpression.Trim();
+        clearLegacy();
+        MarkDirty();
+    }
+
+    private void AddNumberField(
+        string label,
+        int currentValue,
+        int min,
+        int max,
+        Action<int> setter,
+        bool allowVariables = true,
+        [CallerArgumentExpression(nameof(currentValue))] string? currentValueExpression = null)
     {
         AddLabel(label);
-        var box = new TextBox { Text = currentValue.ToString(), Margin = new Thickness(0, 0, 0, 12) };
+
+        var command = _selectedRow?.Command;
+        var propertyName = ExtractPropertyName(currentValueExpression);
+        var savedExpression = allowVariables && command?.ValueExpressions is not null && !string.IsNullOrWhiteSpace(propertyName)
+            && command.ValueExpressions.TryGetValue(propertyName, out var expression)
+                ? expression
+                : string.Empty;
+
+        var box = new TextBox
+        {
+            Text = string.IsNullOrWhiteSpace(savedExpression) ? currentValue.ToString() : savedExpression,
+            ToolTip = allowVariables
+                ? "Type a number, saved variable, or formula"
+                : null
+        };
+
+        var lastNumber = currentValue;
+        box.TextChanged += (_, _) =>
+        {
+            var text = box.Text.Trim();
+            if (int.TryParse(text, out var value))
+            {
+                value = Math.Clamp(value, min, max);
+                lastNumber = value;
+                setter(value);
+                if (command?.ValueExpressions is not null && !string.IsNullOrWhiteSpace(propertyName))
+                    command.ValueExpressions.Remove(propertyName);
+            }
+            else if (allowVariables && command is not null && !string.IsNullOrWhiteSpace(propertyName))
+            {
+                command.ValueExpressions ??= new Dictionary<string, string>();
+                if (string.IsNullOrWhiteSpace(text))
+                    command.ValueExpressions.Remove(propertyName);
+                else
+                    command.ValueExpressions[propertyName] = text;
+            }
+
+            MarkDirtyAndRefreshCommandDisplay(command?.Id);
+        };
+
         box.LostFocus += (_, _) =>
         {
+            if (allowVariables && !string.IsNullOrWhiteSpace(box.Text) && !int.TryParse(box.Text, out _))
+                return;
+
             if (!int.TryParse(box.Text, out var value))
             {
-                box.Text = currentValue.ToString();
+                box.Text = lastNumber.ToString();
                 return;
             }
+
             value = Math.Clamp(value, min, max);
+            lastNumber = value;
             setter(value);
-            box.Text = value.ToString();
-            MarkDirtyAndRefresh(_selectedRow?.Command?.Id);
+            if (box.Text != value.ToString())
+                box.Text = value.ToString();
+            MarkDirtyAndRefreshCommandDisplay(command?.Id);
+        };
+
+        PropertiesPanel.Children.Add(allowVariables ? CreateVariableInputRow(box, currentValue.ToString()) : WrapInput(box));
+    }
+
+    private static string ExtractPropertyName(string? expression)
+    {
+        if (string.IsNullOrWhiteSpace(expression))
+            return string.Empty;
+        var text = expression.Trim();
+        var dot = text.LastIndexOf('.');
+        return dot >= 0 ? text[(dot + 1)..].Trim() : text;
+    }
+
+    private TextBox CreateValueBox(string currentValue, Thickness margin, string? tooltip = null)
+    {
+        return new TextBox
+        {
+            Text = currentValue,
+            Margin = margin,
+            ToolTip = tooltip ?? "Type a number, a saved variable name, or a simple formula"
+        };
+    }
+
+    private void AddVariableNameField(string label, string currentValue, Action<string> setter)
+    {
+        AddLabel(label);
+        var box = new TextBox
+        {
+            Text = currentValue,
+            Margin = new Thickness(0, 0, 0, 12),
+            ToolTip = "Type the name you want to save this value as"
+        };
+        box.TextChanged += (_, _) =>
+        {
+            setter(box.Text.Trim());
+            MarkDirtyAndRefreshCommandDisplay(_selectedRow?.Command?.Id);
         };
         PropertiesPanel.Children.Add(box);
     }
 
-    private void AddTextField(string label, string currentValue, Action<string> setter, bool multiline = false)
+    private void AddExistingVariableField(string label, string currentValue, Action<string> setter)
+    {
+        AddLabel(label);
+        var variableNames = GetSavedVariableNames();
+        var combo = new ComboBox
+        {
+            Margin = new Thickness(0, 0, 0, 12),
+            ToolTip = "Choose a variable that has been saved in this macro"
+        };
+
+        combo.Items.Add("None");
+        foreach (var name in variableNames)
+            combo.Items.Add(name);
+
+        var selectedName = variableNames.FirstOrDefault(name =>
+            string.Equals(name, currentValue?.Trim(), StringComparison.OrdinalIgnoreCase));
+        combo.SelectedItem = selectedName ?? "None";
+        combo.IsEnabled = variableNames.Count > 0;
+
+        combo.SelectionChanged += (_, _) =>
+        {
+            if (combo.SelectedItem is not string value)
+                return;
+
+            var nextValue = value == "None" ? string.Empty : value;
+            if (string.Equals(nextValue, currentValue, StringComparison.OrdinalIgnoreCase))
+                return;
+
+            setter(nextValue);
+            currentValue = nextValue;
+            MarkDirtyAndRefreshCommandDisplay(_selectedRow?.Command?.Id);
+        };
+
+        PropertiesPanel.Children.Add(combo);
+    }
+
+    private List<string> GetSavedVariableNames()
+    {
+        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        void AddName(string? value)
+        {
+            var name = value?.Trim();
+            if (!string.IsNullOrWhiteSpace(name))
+                names.Add(name);
+        }
+
+        // Variables explicitly created in the Variables manager are real saved variables too.
+        foreach (var variable in _project.Variables ?? new List<ProjectVariable>())
+            AddName(variable.Name);
+
+        void ScanCommands(IEnumerable<MacroCommand> commands)
+        {
+            foreach (var command in commands)
+            {
+                switch (command.Type)
+                {
+                    case CommandType.SetVariable:
+                    case CommandType.RandomNumber:
+                    case CommandType.ClipboardToVariable:
+                    case CommandType.ReadTextFile:
+                    case CommandType.PromptText:
+                    case CommandType.PromptYesNo:
+                        AddName(command.VariableName);
+                        break;
+
+                    case CommandType.FindColorToVariables:
+                    case CommandType.FindImageToVariables:
+                        AddName(command.StoreXVariable);
+                        AddName(command.StoreYVariable);
+                        break;
+
+                    case CommandType.SampleColorToVariable:
+                        AddName(command.StoreTextVariable);
+                        break;
+                }
+
+                ScanCommands(command.Children);
+                ScanCommands(command.ElseChildren);
+            }
+        }
+
+        foreach (var sequence in _project.Sequences)
+            ScanCommands(sequence.Commands);
+
+        return names.OrderBy(name => name, StringComparer.OrdinalIgnoreCase).ToList();
+    }
+
+    private ComboBox CreateVariablePicker(TextBox target, string? fallbackValue = null)
+    {
+        var names = GetSavedVariableNames();
+        var combo = new ComboBox
+        {
+            MinWidth = 112,
+            MaxWidth = 142,
+            Margin = new Thickness(7, 0, 0, 0),
+            VerticalAlignment = VerticalAlignment.Top,
+            ToolTip = "Use a saved variable in this field"
+        };
+
+        combo.Items.Add("None");
+        foreach (var name in names)
+            combo.Items.Add(name);
+
+        var initialMatch = names.FirstOrDefault(name =>
+            string.Equals(name, target.Text.Trim(), StringComparison.OrdinalIgnoreCase));
+        var previousLiteralValue = initialMatch is null ? target.Text : fallbackValue ?? string.Empty;
+        var updating = false;
+
+        void MatchPickerToText()
+        {
+            if (updating)
+                return;
+
+            var text = target.Text.Trim();
+            var match = names.FirstOrDefault(name =>
+                string.Equals(name, text, StringComparison.OrdinalIgnoreCase));
+
+            if (match is null)
+                previousLiteralValue = target.Text;
+
+            updating = true;
+            try
+            {
+                combo.SelectedItem = match ?? "None";
+            }
+            finally
+            {
+                updating = false;
+            }
+        }
+
+        combo.SelectedItem = initialMatch ?? "None";
+        combo.IsEnabled = names.Count > 0;
+        target.TextChanged += (_, _) => MatchPickerToText();
+        combo.SelectionChanged += (_, _) =>
+        {
+            if (updating || combo.SelectedItem is not string selected)
+                return;
+
+            updating = true;
+            try
+            {
+                if (selected == "None")
+                {
+                    target.Text = previousLiteralValue;
+                }
+                else
+                {
+                    var currentMatch = names.Any(name =>
+                        string.Equals(name, target.Text.Trim(), StringComparison.OrdinalIgnoreCase));
+                    if (!currentMatch)
+                        previousLiteralValue = target.Text;
+                    target.Text = selected;
+                }
+
+                target.CaretIndex = target.Text.Length;
+                target.Focus();
+            }
+            finally
+            {
+                updating = false;
+            }
+        };
+
+        return combo;
+    }
+
+    private FrameworkElement CreateVariableInputRow(TextBox box, string? fallbackValue = null)
+    {
+        var row = new Grid { Margin = new Thickness(0, 0, 0, 12) };
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        box.Margin = new Thickness(0);
+        var picker = CreateVariablePicker(box, fallbackValue);
+        Grid.SetColumn(box, 0);
+        Grid.SetColumn(picker, 1);
+        row.Children.Add(box);
+        row.Children.Add(picker);
+        return row;
+    }
+
+    private static FrameworkElement WrapInput(TextBox box)
+    {
+        box.Margin = new Thickness(0, 0, 0, 12);
+        return box;
+    }
+
+    private void AddValueOrVariableField(string label, string currentValue, Action<string> setter)
+    {
+        AddLabel(label);
+        var box = new TextBox
+        {
+            Text = currentValue,
+            ToolTip = "Type a value, saved variable name, or simple formula"
+        };
+        box.TextChanged += (_, _) =>
+        {
+            setter(box.Text.Trim());
+            MarkDirtyAndRefreshCommandDisplay(_selectedRow?.Command?.Id);
+        };
+        PropertiesPanel.Children.Add(CreateVariableInputRow(box));
+    }
+
+    private void AddFilePathField(string label, string currentValue, Action<string> setter, bool saveFile = false)
+    {
+        AddLabel(label);
+        var row = new Grid { Margin = new Thickness(0, 0, 0, 12) };
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+        var box = new TextBox
+        {
+            Text = currentValue,
+            ToolTip = "Select a file, type a path, or use a saved variable"
+        };
+        box.TextChanged += (_, _) =>
+        {
+            setter(box.Text.Trim());
+            MarkDirtyAndRefreshCommandDisplay(_selectedRow?.Command?.Id);
+        };
+
+        var variablePicker = CreateVariablePicker(box);
+        var browse = new Button { Content = "Browse…", MinWidth = 76, Margin = new Thickness(7, 0, 0, 0) };
+        browse.Click += (_, _) =>
+        {
+            if (saveFile)
+            {
+                var dialog = new SaveFileDialog
+                {
+                    Title = "Choose file",
+                    Filter = "Text files (*.txt)|*.txt|All files (*.*)|*.*",
+                    AddExtension = false,
+                    OverwritePrompt = false
+                };
+                if (dialog.ShowDialog(this) == true)
+                    box.Text = dialog.FileName;
+            }
+            else
+            {
+                var dialog = new OpenFileDialog
+                {
+                    Title = "Choose file",
+                    Filter = "Text files (*.txt)|*.txt|All files (*.*)|*.*"
+                };
+                if (dialog.ShowDialog(this) == true)
+                    box.Text = dialog.FileName;
+            }
+        };
+
+        Grid.SetColumn(box, 0);
+        Grid.SetColumn(variablePicker, 1);
+        Grid.SetColumn(browse, 2);
+        row.Children.Add(box);
+        row.Children.Add(variablePicker);
+        row.Children.Add(browse);
+        PropertiesPanel.Children.Add(row);
+    }
+
+    private void AddCommandOverview(MacroCommand command)
+    {
+        var panel = new StackPanel();
+        panel.Children.Add(new TextBlock
+        {
+            Text = FriendlyName(command.Type),
+            FontWeight = FontWeights.SemiBold,
+            FontSize = 15,
+            Foreground = (Brush)FindResource("TextBrush")
+        });
+
+        PropertiesPanel.Children.Add(new Border
+        {
+            Background = (Brush)FindResource("Panel2Brush"),
+            BorderBrush = (Brush)FindResource("BorderBrushDark"),
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(9),
+            Padding = new Thickness(11),
+            Margin = new Thickness(0, 0, 0, 14),
+            Child = panel
+        });
+    }
+
+    private void AddTextField(
+        string label,
+        string currentValue,
+        Action<string> setter,
+        bool multiline = false,
+        bool allowVariables = true)
     {
         AddLabel(label);
         var box = new TextBox
@@ -3065,15 +4157,14 @@ public partial class MainWindow : Window
             Text = currentValue,
             AcceptsReturn = multiline,
             TextWrapping = multiline ? TextWrapping.Wrap : TextWrapping.NoWrap,
-            MinHeight = multiline ? 80 : 0,
-            Margin = new Thickness(0, 0, 0, 12)
+            MinHeight = multiline ? 80 : 0
         };
-        box.LostFocus += (_, _) =>
+        box.TextChanged += (_, _) =>
         {
             setter(box.Text);
-            MarkDirtyAndRefresh(_selectedRow?.Command?.Id);
+            MarkDirtyAndRefreshCommandDisplay(_selectedRow?.Command?.Id);
         };
-        PropertiesPanel.Children.Add(box);
+        PropertiesPanel.Children.Add(allowVariables ? CreateVariableInputRow(box) : WrapInput(box));
     }
 
     private void AddReadOnlyField(string label, string value)
@@ -3089,7 +4180,22 @@ public partial class MainWindow : Window
 
     private void AddInfo(string text)
     {
-        // Intentionally hidden in the cleaner UI.
+        if (string.IsNullOrWhiteSpace(text))
+            return;
+
+        PropertiesPanel.Children.Add(new TextBlock
+        {
+            Text = text,
+            TextWrapping = TextWrapping.Wrap,
+            Foreground = (Brush)FindResource("MutedTextBrush"),
+            FontSize = 12,
+            Margin = new Thickness(0, 0, 0, 10)
+        });
+    }
+
+    private void AddCommandHelp(CommandType type)
+    {
+        AddInfo(CommandHelp.Get(type));
     }
 
     private void AddLabel(string text)
@@ -3114,6 +4220,13 @@ public partial class MainWindow : Window
         RefreshCommandList(selectedId);
     }
 
+    private void MarkDirtyAndRefreshCommandDisplay(Guid? selectedId)
+    {
+        MarkDirty();
+        if (_selectedRow?.Command is { } command && (!selectedId.HasValue || command.Id == selectedId.Value))
+            _selectedRow.RefreshDisplay();
+    }
+
     private static string NormalizeColor(string value)
     {
         var text = value.Trim().ToUpperInvariant();
@@ -3128,79 +4241,8 @@ public partial class MainWindow : Window
         return "0x" + text;
     }
 
-    private static string FriendlyName(CommandType type) => type switch
-    {
-        CommandType.Comment => "Comment",
-        CommandType.MoveMouse => "Move Mouse",
-        CommandType.Click => "Click Location",
-        CommandType.DoubleClick => "Double Click Location",
-        CommandType.RightClick => "Right Click Location",
-        CommandType.Scroll => "Scroll",
-        CommandType.DragMouse => "Drag Mouse",
-        CommandType.LeftMouseDown => "Left Mouse Down",
-        CommandType.LeftMouseUp => "Left Mouse Up",
-        CommandType.RightMouseDown => "Right Mouse Down",
-        CommandType.RightMouseUp => "Right Mouse Up",
-        CommandType.PressKey => "Press Key / Combo",
-        CommandType.KeyDown => "Key Down",
-        CommandType.KeyUp => "Key Up",
-        CommandType.TypeText => "Type Text",
-        CommandType.HoldKey => "Hold Key",
-        CommandType.RepeatKey => "Repeat Key",
-        CommandType.WaitUntilKeyPressed => "Wait Until Key Pressed",
-        CommandType.WaitUntilKeyReleased => "Wait Until Key Released",
-        CommandType.IfKeyPressed => "IF Key Pressed",
-        CommandType.LoopWhileKeyPressed => "Loop While Key Pressed",
-        CommandType.Wait => "Wait",
-        CommandType.RandomWait => "Random Wait",
-        CommandType.RecordedActions => "Record Actions",
-        CommandType.IfColor => "IF Color",
-        CommandType.WaitUntilColor => "Wait Until Color at Location",
-        CommandType.LoopWhileColor => "Loop While Color",
-        CommandType.LoopUntilColor => "Loop Until Color",
-        CommandType.ClickColor => "Find + Click Color",
-        CommandType.FindColorToVariables => "Find Color → Variables",
-        CommandType.SampleColorToVariable => "Read Pixel Color → Variable",
-        CommandType.IfImage => "IF Image Found",
-        CommandType.WaitUntilImage => "Wait Until Image",
-        CommandType.WaitUntilImageGone => "Wait Until Image Gone",
-        CommandType.ClickImage => "Find + Click Image",
-        CommandType.DoubleClickImage => "Find + Double Click Image",
-        CommandType.MoveToImage => "Move To Image",
-        CommandType.LoopUntilImage => "Loop Until Image",
-        CommandType.LoopWhileImage => "Loop While Image Exists",
-        CommandType.FindImageToVariables => "Find Image → Variables",
-        CommandType.IfWindow => "IF Window Exists",
-        CommandType.FocusWindow => "Focus Window",
-        CommandType.WaitForWindow => "Wait For Window",
-        CommandType.WaitForWindowGone => "Wait For Window Gone",
-        CommandType.MinimizeWindow => "Minimize Window",
-        CommandType.MaximizeWindow => "Maximize Window",
-        CommandType.RestoreWindow => "Restore Window",
-        CommandType.CloseWindow => "Close Window",
-        CommandType.RunProgram => "Open Program / File / URL",
-        CommandType.SetVariable => "Set Variable",
-        CommandType.AddVariable => "Add / Subtract Variable",
-        CommandType.RandomNumber => "Random Number",
-        CommandType.IfVariable => "IF Variable",
-        CommandType.WaitUntilVariable => "Wait Until Variable",
-        CommandType.LoopWhileVariable => "Loop While Variable",
-        CommandType.LoopUntilVariable => "Loop Until Variable",
-        CommandType.SetClipboard => "Set Clipboard",
-        CommandType.ClipboardToVariable => "Clipboard → Variable",
-        CommandType.ReadTextFile => "Read Text File → Variable",
-        CommandType.WriteTextFile => "Write / Append Text File",
-        CommandType.PromptText => "Ask User For Text",
-        CommandType.PromptYesNo => "Ask User Yes / No",
-        CommandType.Group => "Command Group",
-        CommandType.RunSequence => "Run Sequence",
-        CommandType.LoopTimes => "Loop X Times",
-        CommandType.LoopForever => "Loop Forever",
-        CommandType.Break => "Break Loop",
-        CommandType.Return => "Return",
-        CommandType.StopMacro => "Stop Macro",
-        _ => type.ToString()
-    };
+    private static string FriendlyName(CommandType type)
+        => type == CommandType.Comment ? "Comment" : CommandCatalog.QuickLabel(type);
 
     // ---------------- RUNNER ----------------
 
@@ -3285,7 +4327,7 @@ public partial class MainWindow : Window
         }
 
         if (error is not null)
-            MessageBox.Show(this, error.Message, "Command test stopped", MessageBoxButton.OK, MessageBoxImage.Error);
+            MessageBox.Show(this, FriendlyErrorMessage(error, $"testing {command.DisplayText()}"), "Command test stopped", MessageBoxButton.OK, MessageBoxImage.Error);
     }
 
     private void CheckMacroButton_Click(object sender, RoutedEventArgs e)
@@ -3311,10 +4353,6 @@ public partial class MainWindow : Window
             else if (!variableNames.Add(name))
                 errors.Add($"Project variable '{name}' is defined more than once.");
         }
-
-        if (_project.RuntimeSettings?.UseProjectRuntimeSettings == true
-            && !sequenceNames.Contains(_project.RuntimeSettings.StartupSequence))
-            errors.Add($"Macro startup sequence '{_project.RuntimeSettings.StartupSequence}' does not exist.");
 
         foreach (var sequence in _project.Sequences)
             ValidateCommands(sequence.Name, sequence.Commands, sequenceNames, errors, warnings);
@@ -3342,9 +4380,9 @@ public partial class MainWindow : Window
                 continue;
 
             if (CommandCatalog.UsesColor(command.Type)
-                && !command.ColorHex.Contains('{')
+                && !GetSavedVariableNames().Any(name => name.Equals(command.ColorHex.Trim(), StringComparison.OrdinalIgnoreCase))
                 && !ScreenTools.TryParseColor(command.ColorHex, out _, out _, out _))
-                errors.Add($"{sequenceName}: invalid color '{command.ColorHex}' in {FriendlyName(command.Type)}.");
+                errors.Add($"{sequenceName}: invalid color or variable '{command.ColorHex}' in {FriendlyName(command.Type)}.");
 
             if (command.Type == CommandType.RunSequence
                 && !command.TargetSequence.Contains('{')
@@ -3449,7 +4487,7 @@ public partial class MainWindow : Window
         }
 
         if (error is not null)
-            MessageBox.Show(this, error.Message, "Macro stopped", MessageBoxButton.OK, MessageBoxImage.Error);
+            MessageBox.Show(this, FriendlyErrorMessage(error, $"running {name}"), "Macro stopped", MessageBoxButton.OK, MessageBoxImage.Error);
     }
 
     private void PauseButton_Click(object sender, RoutedEventArgs e)
