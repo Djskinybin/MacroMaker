@@ -29,8 +29,8 @@ public sealed class WelcomeWindow : Window
         Title = "MacroMaker";
         Width = 650;
         Height = 500;
-        MinWidth = 560;
-        MinHeight = 420;
+        MinWidth = 500;
+        MinHeight = 380;
         WindowStartupLocation = WindowStartupLocation.CenterOwner;
         ResizeMode = ResizeMode.CanResize;
         Background = (Brush)Application.Current.FindResource("BgBrush");

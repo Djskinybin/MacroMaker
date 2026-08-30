@@ -12,7 +12,7 @@ public sealed class MacroCheckWindow : Window
         Title = "Check Macro";
         Width = 620;
         Height = 520;
-        MinWidth = 520;
+        MinWidth = 460;
         MinHeight = 380;
         WindowStartupLocation = WindowStartupLocation.CenterOwner;
         Background = Brush("BgBrush");

@@ -7,11 +7,22 @@ namespace MacroMaker;
 public sealed class MacroEngine
 {
     private readonly MacroProject _project;
-    private readonly Random _random = new();
     private readonly RuntimeValues _values;
+    private readonly object _parallelLock = new();
+    private readonly Dictionary<string, Task> _parallelSequences = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _activeSequences = new(StringComparer.OrdinalIgnoreCase);
+    private readonly SemaphoreSlim _inputGate = new(1, 1);
+    private readonly SemaphoreSlim _promptGate = new(1, 1);
+    private readonly object _heldInputLock = new();
+    private readonly object _cooldownLock = new();
+    private readonly Dictionary<Guid, long> _conditionLastTriggered = new();
+    private readonly HashSet<string> _heldKeys = new(StringComparer.OrdinalIgnoreCase);
+    private bool _leftMouseHeld;
+    private bool _rightMouseHeld;
+    private Exception? _parallelFailure;
     private IReadOnlyDictionary<string, string>? _runOverrides;
     private CancellationTokenSource? _cts;
-    private bool _paused;
+    private volatile bool _paused;
 
     public MacroEngine(MacroProject project)
     {
@@ -44,21 +55,29 @@ public sealed class MacroEngine
         try
         {
             await RunSequenceAsync(sequenceName, _cts!.Token, 0);
+            await WaitForParallelSequencesAsync(_cts.Token);
             if (!_cts.IsCancellationRequested)
                 StatusChanged?.Invoke("Finished");
         }
         catch (OperationCanceledException)
         {
+            var parallelFailure = GetParallelFailure();
+            if (parallelFailure is not null)
+            {
+                StatusChanged?.Invoke("Error");
+                throw new InvalidOperationException($"A simultaneously running tab failed: {parallelFailure.Message}", parallelFailure);
+            }
             StatusChanged?.Invoke("Stopped");
         }
         catch (Exception ex)
         {
+            _cts?.Cancel();
             StatusChanged?.Invoke("Error");
             throw new InvalidOperationException($"Macro stopped: {ex.Message}", ex);
         }
         finally
         {
-            EndRun();
+            await ShutdownRunAsync();
         }
     }
 
@@ -76,21 +95,29 @@ public sealed class MacroEngine
         try
         {
             await ExecuteCommandsAsync(label, commands, _cts!.Token, 0);
+            await WaitForParallelSequencesAsync(_cts.Token);
             if (!_cts.IsCancellationRequested)
                 StatusChanged?.Invoke(finishedText);
         }
         catch (OperationCanceledException)
         {
+            var parallelFailure = GetParallelFailure();
+            if (parallelFailure is not null)
+            {
+                StatusChanged?.Invoke("Error");
+                throw new InvalidOperationException($"A simultaneously running tab failed: {parallelFailure.Message}", parallelFailure);
+            }
             StatusChanged?.Invoke("Stopped");
         }
         catch (Exception ex)
         {
+            _cts?.Cancel();
             StatusChanged?.Invoke("Error");
             throw new InvalidOperationException($"Macro stopped: {ex.Message}", ex);
         }
         finally
         {
-            EndRun();
+            await ShutdownRunAsync();
         }
     }
 
@@ -105,10 +132,38 @@ public sealed class MacroEngine
         _runOverrides = null;
         _cts = new CancellationTokenSource();
         _paused = false;
+        lock (_parallelLock)
+        {
+            _parallelSequences.Clear();
+            _activeSequences.Clear();
+            _parallelFailure = null;
+        }
+        lock (_heldInputLock)
+        {
+            _heldKeys.Clear();
+            _leftMouseHeld = false;
+            _rightMouseHeld = false;
+        }
+        lock (_cooldownLock)
+            _conditionLastTriggered.Clear();
         IsRunning = true;
         PlaybackSpeedPercent = Math.Clamp(PlaybackSpeedPercent, 10, 400);
         StateChanged?.Invoke();
         StatusChanged?.Invoke(status);
+    }
+
+    private async Task ShutdownRunAsync()
+    {
+        try
+        {
+            _cts?.Cancel();
+            await DrainParallelSequencesAsync();
+        }
+        finally
+        {
+            await ReleaseHeldInputsAsync();
+            EndRun();
+        }
     }
 
     private void EndRun()
@@ -117,6 +172,12 @@ public sealed class MacroEngine
         _paused = false;
         _cts?.Dispose();
         _cts = null;
+        lock (_parallelLock)
+        {
+            _parallelSequences.Clear();
+            _activeSequences.Clear();
+            _parallelFailure = null;
+        }
         StateChanged?.Invoke();
     }
 
@@ -137,15 +198,44 @@ public sealed class MacroEngine
         if (depth > 32)
             throw new InvalidOperationException("Sequence call depth exceeded 32. Check for accidental sequence recursion.");
 
-        var sequenceName = _values.ResolveText(sequenceNameRaw);
+        var sequenceName = (sequenceNameRaw ?? string.Empty).Trim();
         var sequence = _project.Sequences.FirstOrDefault(s =>
             s.Name.Equals(sequenceName, StringComparison.OrdinalIgnoreCase));
 
         if (sequence is null)
             throw new InvalidOperationException($"Sequence '{sequenceName}' does not exist.");
 
-        var signal = await ExecuteCommandsAsync(sequence.Name, sequence.Commands, token, depth);
-        _ = signal;
+        if (!sequence.Enabled && !sequence.Name.Equals("Starting Sequence", StringComparison.OrdinalIgnoreCase))
+        {
+            StatusChanged?.Invoke($"Skipped disabled tab: {sequence.Name}");
+            return;
+        }
+
+        lock (_parallelLock)
+        {
+            if (!_activeSequences.Add(sequence.Name))
+                throw new InvalidOperationException($"Sequence '{sequence.Name}' is already running. A tab cannot start another copy of itself while it is active.");
+        }
+
+        try
+        {
+            while (true)
+            {
+                var signal = await ExecuteCommandsAsync(sequence.Name, sequence.Commands, token, depth);
+                if (signal != ExecutionSignal.Restart)
+                    break;
+
+                // Restart only this tab invocation. Other simultaneous tabs keep
+                // running and all tabs continue sharing the same variables,
+                // Pause state, Stop token, and macro session.
+                await YieldLoopAsync(0, token);
+            }
+        }
+        finally
+        {
+            lock (_parallelLock)
+                _activeSequences.Remove(sequence.Name);
+        }
     }
 
     private async Task<ExecutionSignal> ExecuteCommandsAsync(
@@ -171,92 +261,152 @@ public sealed class MacroEngine
 
                 case CommandType.MoveMouse:
                 {
-                    var point = CoordinateResolver.ResolvePoint(command, _values);
-                    await InputController.MoveMouseAsync(point.X, point.Y, EffectiveMoveDuration(command), token);
+                    await WithInputGateAsync(async () =>
+                    {
+                        var point = CoordinateResolver.ResolvePoint(command, _values);
+                        await InputController.MoveMouseAsync(point.X, point.Y, EffectiveMoveDuration(command), token);
+                    }, token);
                     break;
                 }
 
                 case CommandType.Click:
                 {
-                    await MoveForClickAsync(command, token);
-                    InputController.LeftClick();
+                    await WithInputGateAsync(async () =>
+                    {
+                        if (ShouldMoveBeforeClick(command))
+                            await MoveForClickAsync(command, token);
+                        InputController.LeftClick();
+                    }, token);
                     break;
                 }
 
                 case CommandType.DoubleClick:
                 {
-                    await MoveForClickAsync(command, token);
-                    InputController.LeftClick();
-                    await DelayPausableAsync(Math.Clamp(command.ClickDelayMs, 20, 1000), token);
-                    InputController.LeftClick();
+                    await WithInputGateAsync(async () =>
+                    {
+                        if (ShouldMoveBeforeClick(command))
+                            await MoveForClickAsync(command, token);
+                        InputController.LeftClick();
+                        await DelayPausableAsync(Math.Clamp(command.ClickDelayMs, 20, 1000), token);
+                        InputController.LeftClick();
+                    }, token);
                     break;
                 }
 
                 case CommandType.RightClick:
-                    await MoveForClickAsync(command, token);
-                    InputController.RightClick();
+                    await WithInputGateAsync(async () =>
+                    {
+                        if (ShouldMoveBeforeClick(command))
+                            await MoveForClickAsync(command, token);
+                        InputController.RightClick();
+                    }, token);
                     break;
 
                 case CommandType.Scroll:
-                    await MoveForClickAsync(command, token);
-                    InputController.Scroll(command.ScrollAmount);
+                    await WithInputGateAsync(async () =>
+                    {
+                        await MoveForClickAsync(command, token);
+                        InputController.Scroll(command.ScrollAmount);
+                    }, token);
                     break;
 
                 case CommandType.DragMouse:
                 {
-                    var start = CoordinateResolver.ResolvePoint(command, _values);
-                    var end = CoordinateResolver.ResolvePoint(command, _values, true);
-                    await InputController.MoveMouseAsync(start.X, start.Y, EffectiveMoveDuration(command), token);
-                    InputController.LeftDown();
-                    try
+                    await WithInputGateAsync(async () =>
                     {
-                        await InputController.MoveMouseAsync(end.X, end.Y, ScaleDuration(Math.Clamp(command.DragDurationMs, 1, 60000)), token);
-                    }
-                    finally
-                    {
-                        InputController.LeftUp();
-                    }
+                        var start = CoordinateResolver.ResolvePoint(command, _values);
+                        var end = CoordinateResolver.ResolvePoint(command, _values, true);
+                        await InputController.MoveMouseAsync(start.X, start.Y, EffectiveMoveDuration(command), token);
+                        InputController.LeftDown();
+                        try
+                        {
+                            await InputController.MoveMouseAsync(end.X, end.Y, ScaleDuration(Math.Clamp(command.DragDurationMs, 1, 60000)), token);
+                        }
+                        finally
+                        {
+                            InputController.LeftUp();
+                        }
+                    }, token);
                     break;
                 }
 
                 case CommandType.LeftMouseDown:
-                    InputController.LeftDown();
+                    await WithInputGateAsync(() =>
+                    {
+                        InputController.LeftDown();
+                        lock (_heldInputLock) _leftMouseHeld = true;
+                    }, token);
                     break;
                 case CommandType.LeftMouseUp:
-                    InputController.LeftUp();
+                    await WithInputGateAsync(() =>
+                    {
+                        InputController.LeftUp();
+                        lock (_heldInputLock) _leftMouseHeld = false;
+                    }, token);
                     break;
                 case CommandType.RightMouseDown:
-                    InputController.RightDown();
+                    await WithInputGateAsync(() =>
+                    {
+                        InputController.RightDown();
+                        lock (_heldInputLock) _rightMouseHeld = true;
+                    }, token);
                     break;
                 case CommandType.RightMouseUp:
-                    InputController.RightUp();
+                    await WithInputGateAsync(() =>
+                    {
+                        InputController.RightUp();
+                        lock (_heldInputLock) _rightMouseHeld = false;
+                    }, token);
                     break;
 
                 case CommandType.PressKey:
-                    InputController.PressKey(_values.ResolveText(command.Key));
+                    await WithInputGateAsync(() => InputController.PressKey(_values.ResolveText(command.Key)), token);
                     break;
                 case CommandType.KeyDown:
-                    InputController.KeyDown(_values.ResolveText(command.Key));
+                {
+                    var key = _values.ResolveText(command.Key);
+                    if (!InputController.TryGetVirtualKey(key, out _))
+                        throw new InvalidOperationException($"Unknown key: {key}");
+                    await WithInputGateAsync(() =>
+                    {
+                        InputController.KeyDown(key);
+                        lock (_heldInputLock) _heldKeys.Add(key);
+                    }, token);
                     break;
+                }
                 case CommandType.KeyUp:
-                    InputController.KeyUp(_values.ResolveText(command.Key));
+                {
+                    var key = _values.ResolveText(command.Key);
+                    if (!InputController.TryGetVirtualKey(key, out _))
+                        throw new InvalidOperationException($"Unknown key: {key}");
+                    await WithInputGateAsync(() =>
+                    {
+                        InputController.KeyUp(key);
+                        lock (_heldInputLock) _heldKeys.Remove(key);
+                    }, token);
                     break;
+                }
                 case CommandType.TypeText:
-                    InputController.TypeText(_values.ResolveText(command.Text));
+                    await WithInputGateAsync(() => InputController.TypeText(_values.ResolveText(command.Text)), token);
                     break;
 
                 case CommandType.HoldKey:
                 {
                     var key = _values.ResolveText(command.Key);
-                    InputController.KeyDown(key);
-                    try
+                    if (!InputController.TryGetVirtualKey(key, out _))
+                        throw new InvalidOperationException($"Unknown key: {key}");
+                    await WithInputGateAsync(async () =>
                     {
-                        await DelayPausableAsync(Math.Max(1, command.HoldMs), token);
-                    }
-                    finally
-                    {
-                        InputController.KeyUp(key);
-                    }
+                        InputController.KeyDown(key);
+                        try
+                        {
+                            await DelayPausableAsync(Math.Max(1, command.HoldMs), token);
+                        }
+                        finally
+                        {
+                            InputController.KeyUp(key);
+                        }
+                    }, token);
                     break;
                 }
 
@@ -267,7 +417,7 @@ public sealed class MacroEngine
                     for (var i = 0; i < count; i++)
                     {
                         token.ThrowIfCancellationRequested();
-                        InputController.PressKey(key);
+                        await WithInputGateAsync(() => InputController.PressKey(key), token);
                         if (i + 1 < count)
                             await DelayPausableAsync(Math.Max(0, command.WaitMs), token);
                     }
@@ -292,7 +442,10 @@ public sealed class MacroEngine
                     var key = _values.ResolveText(command.Key);
                     if (!InputController.TryGetVirtualKey(key, out _))
                         throw new InvalidOperationException($"Unknown key: {key}");
-                    var branch = KeyIsDown(key) ? command.Children : command.ElseChildren;
+                    var matched = KeyIsDown(key);
+                    if (matched && !TryConsumeConditionCooldown(command))
+                        break;
+                    var branch = matched ? command.Children : command.ElseChildren;
                     var signal = await ExecuteCommandsAsync(sequenceName, branch, token, depth);
                     if (signal != ExecutionSignal.None)
                         return signal;
@@ -310,8 +463,8 @@ public sealed class MacroEngine
                         await WaitWhilePausedAsync(token);
                         var signal = await ExecuteCommandsAsync(sequenceName, command.Children, token, depth);
                         if (signal == ExecutionSignal.Break) break;
-                        if (signal == ExecutionSignal.Return) return signal;
-                        if (command.Children.Count == 0) await DelayPausableAsync(Math.Max(10, command.PollMs), token);
+                        if (signal != ExecutionSignal.None) return signal;
+                        await YieldLoopAsync(Math.Max(0, command.PollMs), token);
                     }
                     break;
                 }
@@ -328,7 +481,7 @@ public sealed class MacroEngine
                 {
                     var min = Math.Max(0, Math.Min(command.MinWaitMs, command.MaxWaitMs));
                     var max = Math.Max(min, Math.Max(command.MinWaitMs, command.MaxWaitMs));
-                    var delay = max == min ? min : _random.Next(min, max + 1);
+                    var delay = NextInclusive(min, max);
                     StatusChanged?.Invoke($"Waiting {delay} ms (random)");
                     await DelayPausableAsync(delay, token);
                     break;
@@ -344,8 +497,10 @@ public sealed class MacroEngine
 
                 case CommandType.IfColor:
                 {
-                    var (matched, current, point, target) = ColorCondition(command);
-                    StatusChanged?.Invoke($"Checking {target} at {point.X}, {point.Y}  •  Current {current}");
+                    var (matched, current, point, target) = await ColorConditionAsync(command, token);
+                    StatusChanged?.Invoke($"Checking {target}  •  Current {current}");
+                    if (matched && !TryConsumeConditionCooldown(command))
+                        break;
                     var branch = matched ? command.Children : command.ElseChildren;
                     var signal = await ExecuteCommandsAsync(sequenceName, branch, token, depth);
                     if (signal != ExecutionSignal.None)
@@ -366,14 +521,14 @@ public sealed class MacroEngine
                     {
                         token.ThrowIfCancellationRequested();
                         await WaitWhilePausedAsync(token);
-                        var (matched, current, point, target) = ColorCondition(command);
+                        var (matched, current, point, target) = await ColorConditionAsync(command, token);
                         StatusChanged?.Invoke($"Looping while {point.X}, {point.Y} matches condition {target}  •  Current {current}");
                         if (!matched)
                             break;
                         var signal = await ExecuteCommandsAsync(sequenceName, command.Children, token, depth);
                         if (signal == ExecutionSignal.Break) break;
-                        if (signal == ExecutionSignal.Return) return signal;
-                        if (command.Children.Count == 0) await DelayPausableAsync(Math.Max(10, command.PollMs), token);
+                        if (signal != ExecutionSignal.None) return signal;
+                        await YieldLoopAsync(Math.Max(0, command.PollMs), token);
                     }
                     break;
                 }
@@ -384,14 +539,14 @@ public sealed class MacroEngine
                     {
                         token.ThrowIfCancellationRequested();
                         await WaitWhilePausedAsync(token);
-                        var (matched, current, point, target) = ColorCondition(command);
+                        var (matched, current, point, target) = await ColorConditionAsync(command, token);
                         StatusChanged?.Invoke($"Waiting until {point.X}, {point.Y} matches condition {target}  •  Current {current}");
                         if (matched)
                             break;
                         var signal = await ExecuteCommandsAsync(sequenceName, command.Children, token, depth);
                         if (signal == ExecutionSignal.Break) break;
-                        if (signal == ExecutionSignal.Return) return signal;
-                        if (command.Children.Count == 0) await DelayPausableAsync(Math.Max(10, command.PollMs), token);
+                        if (signal != ExecutionSignal.None) return signal;
+                        await YieldLoopAsync(Math.Max(0, command.PollMs), token);
                     }
                     break;
                 }
@@ -399,8 +554,7 @@ public sealed class MacroEngine
                 case CommandType.ClickColor:
                 case CommandType.FindColorToVariables:
                 {
-                    var search = CoordinateResolver.ResolveImageSearch(command, _values);
-                    search.ColorHex = _values.ResolveText(command.ColorHex);
+                    var search = ResolveColorSearch(command);
                     var point = await RunFindColorWithPolicyAsync(command, search, token, depth);
                     if (point is null)
                         break;
@@ -408,8 +562,11 @@ public sealed class MacroEngine
                     StoreFoundPoint(point.Value.X, point.Value.Y, command, "LastColorX", "LastColorY");
                     if (command.Type == CommandType.ClickColor)
                     {
-                        await InputController.MoveMouseAsync(point.Value.X, point.Value.Y, EffectiveMoveDuration(command), token);
-                        InputController.LeftClick();
+                        await WithInputGateAsync(async () =>
+                        {
+                            await InputController.MoveMouseAsync(point.Value.X, point.Value.Y, EffectiveMoveDuration(command), token);
+                            InputController.LeftClick();
+                        }, token);
                     }
                     break;
                 }
@@ -431,7 +588,10 @@ public sealed class MacroEngine
                     var match = await ImageMatcher.FindAsync(resolved, token, text => StatusChanged?.Invoke(text));
                     if (match.HasValue)
                         StoreImageMatch(match.Value);
-                    var branch = match.HasValue ? command.Children : command.ElseChildren;
+                    var matched = match.HasValue;
+                    if (matched && !TryConsumeConditionCooldown(command))
+                        break;
+                    var branch = matched ? command.Children : command.ElseChildren;
                     var signal = await ExecuteCommandsAsync(sequenceName, branch, token, depth);
                     if (signal != ExecutionSignal.None)
                         return signal;
@@ -461,17 +621,20 @@ public sealed class MacroEngine
 
                     var x = match.Value.CenterX + command.ImageOffsetX;
                     var y = match.Value.CenterY + command.ImageOffsetY;
-                    await InputController.MoveMouseAsync(x, y, EffectiveMoveDuration(command), token);
-                    if (command.Type == CommandType.ClickImage)
+                    await WithInputGateAsync(async () =>
                     {
-                        InputController.LeftClick();
-                    }
-                    else if (command.Type == CommandType.DoubleClickImage)
-                    {
-                        InputController.LeftClick();
-                        await DelayPausableAsync(Math.Clamp(command.ClickDelayMs, 20, 1000), token);
-                        InputController.LeftClick();
-                    }
+                        await InputController.MoveMouseAsync(x, y, EffectiveMoveDuration(command), token);
+                        if (command.Type == CommandType.ClickImage)
+                        {
+                            InputController.LeftClick();
+                        }
+                        else if (command.Type == CommandType.DoubleClickImage)
+                        {
+                            InputController.LeftClick();
+                            await DelayPausableAsync(Math.Clamp(command.ClickDelayMs, 20, 1000), token);
+                            InputController.LeftClick();
+                        }
+                    }, token);
                     break;
                 }
 
@@ -491,8 +654,8 @@ public sealed class MacroEngine
                         }
                         var signal = await ExecuteCommandsAsync(sequenceName, command.Children, token, depth);
                         if (signal == ExecutionSignal.Break) break;
-                        if (signal == ExecutionSignal.Return) return signal;
-                        if (command.Children.Count == 0) await DelayPausableAsync(Math.Max(10, command.PollMs), token);
+                        if (signal != ExecutionSignal.None) return signal;
+                        await YieldLoopAsync(Math.Max(0, command.PollMs), token);
                     }
                     break;
                 }
@@ -511,8 +674,8 @@ public sealed class MacroEngine
                         StoreImageMatch(match.Value);
                         var signal = await ExecuteCommandsAsync(sequenceName, command.Children, token, depth);
                         if (signal == ExecutionSignal.Break) break;
-                        if (signal == ExecutionSignal.Return) return signal;
-                        if (command.Children.Count == 0) await DelayPausableAsync(Math.Max(10, command.PollMs), token);
+                        if (signal != ExecutionSignal.None) return signal;
+                        await YieldLoopAsync(Math.Max(0, command.PollMs), token);
                     }
                     break;
                 }
@@ -520,7 +683,10 @@ public sealed class MacroEngine
                 case CommandType.IfWindow:
                 {
                     var title = _values.ResolveText(command.WindowTitle);
-                    var branch = WindowTools.Exists(title) ? command.Children : command.ElseChildren;
+                    var matched = WindowTools.Exists(title);
+                    if (matched && !TryConsumeConditionCooldown(command))
+                        break;
+                    var branch = matched ? command.Children : command.ElseChildren;
                     var signal = await ExecuteCommandsAsync(sequenceName, branch, token, depth);
                     if (signal != ExecutionSignal.None)
                         return signal;
@@ -581,7 +747,7 @@ public sealed class MacroEngine
                 }
 
                 case CommandType.SetVariable:
-                    _values.Set(command.VariableName, _values.ResolveText(command.VariableValue));
+                    _values.Set(command.VariableName, _values.ResolveValue(command.VariableValue));
                     StatusChanged?.Invoke($"{RuntimeValues.NormalizeName(command.VariableName)} = {_values.Get(command.VariableName)}");
                     break;
 
@@ -595,16 +761,17 @@ public sealed class MacroEngine
                     var min = _values.ResolveInt(command.VariableValue, 0);
                     var max = _values.ResolveInt(command.VariableValue2, 100);
                     if (max < min) (min, max) = (max, min);
-                    var number = min == max ? min : _random.Next(min, max + 1);
+                    var number = NextInclusive(min, max);
                     _values.Set(command.VariableName, number.ToString());
                     break;
                 }
 
                 case CommandType.IfVariable:
                 {
-                    var branch = _values.Compare(command.VariableName, command.VariableCompareMode, command.VariableValue)
-                        ? command.Children
-                        : command.ElseChildren;
+                    var matched = _values.Compare(command.VariableName, command.VariableCompareMode, command.VariableValue);
+                    if (matched && !TryConsumeConditionCooldown(command))
+                        break;
+                    var branch = matched ? command.Children : command.ElseChildren;
                     var signal = await ExecuteCommandsAsync(sequenceName, branch, token, depth);
                     if (signal != ExecutionSignal.None)
                         return signal;
@@ -623,8 +790,8 @@ public sealed class MacroEngine
                         token.ThrowIfCancellationRequested();
                         var signal = await ExecuteCommandsAsync(sequenceName, command.Children, token, depth);
                         if (signal == ExecutionSignal.Break) break;
-                        if (signal == ExecutionSignal.Return) return signal;
-                        if (command.Children.Count == 0) await DelayPausableAsync(Math.Max(10, command.PollMs), token);
+                        if (signal != ExecutionSignal.None) return signal;
+                        await YieldLoopAsync(Math.Max(0, command.PollMs), token);
                     }
                     break;
 
@@ -634,8 +801,8 @@ public sealed class MacroEngine
                         token.ThrowIfCancellationRequested();
                         var signal = await ExecuteCommandsAsync(sequenceName, command.Children, token, depth);
                         if (signal == ExecutionSignal.Break) break;
-                        if (signal == ExecutionSignal.Return) return signal;
-                        if (command.Children.Count == 0) await DelayPausableAsync(Math.Max(10, command.PollMs), token);
+                        if (signal != ExecutionSignal.None) return signal;
+                        await YieldLoopAsync(Math.Max(0, command.PollMs), token);
                     }
                     break;
 
@@ -699,17 +866,72 @@ public sealed class MacroEngine
                 {
                     var prompt = _values.ResolveText(command.PromptText);
                     var initial = _values.ResolveText(command.VariableValue);
-                    var result = await RuntimePromptWindow.AskTextAsync(prompt, initial);
-                    if (result.Accepted)
+                    await _promptGate.WaitAsync(token);
+                    try
+                    {
+                        var result = await RuntimePromptWindow.AskTextAsync(prompt, initial, token);
+                        if (!result.Accepted)
+                        {
+                            _cts?.Cancel();
+                            token.ThrowIfCancellationRequested();
+                        }
                         _values.Set(command.VariableName, result.Value);
+                    }
+                    finally
+                    {
+                        _promptGate.Release();
+                    }
+                    break;
+                }
+
+                case CommandType.PromptSelect:
+                {
+                    var prompt = _values.ResolveText(command.PromptText);
+                    // Dropdown entries are literal choices. The editor promises that
+                    // the exact selected option text is saved, so an option that happens
+                    // to match a variable name must not be substituted at runtime.
+                    var options = (command.PromptOptions ?? new List<string>())
+                        .Where(option => !string.IsNullOrWhiteSpace(option))
+                        .ToList();
+                    if (options.Count == 0)
+                        throw new InvalidOperationException("Ask User from Dropdown needs at least one option.");
+
+                    await _promptGate.WaitAsync(token);
+                    try
+                    {
+                        var result = await RuntimePromptWindow.AskSelectAsync(prompt, options, token);
+                        if (!result.Accepted)
+                        {
+                            _cts?.Cancel();
+                            token.ThrowIfCancellationRequested();
+                        }
+                        _values.Set(command.VariableName, result.Value);
+                    }
+                    finally
+                    {
+                        _promptGate.Release();
+                    }
                     break;
                 }
 
                 case CommandType.PromptYesNo:
                 {
                     var prompt = _values.ResolveText(command.PromptText);
-                    var yes = await RuntimePromptWindow.AskYesNoAsync(prompt);
-                    _values.Set(command.VariableName, yes ? "true" : "false");
+                    await _promptGate.WaitAsync(token);
+                    try
+                    {
+                        var result = await RuntimePromptWindow.AskYesNoAsync(prompt, token);
+                        if (!result.Accepted)
+                        {
+                            _cts?.Cancel();
+                            token.ThrowIfCancellationRequested();
+                        }
+                        _values.Set(command.VariableName, result.Value ? "true" : "false");
+                    }
+                    finally
+                    {
+                        _promptGate.Release();
+                    }
                     break;
                 }
 
@@ -722,7 +944,17 @@ public sealed class MacroEngine
                 }
 
                 case CommandType.RunSequence:
-                    await RunSequenceAsync(command.TargetSequence, token, depth + 1);
+                    if (command.RunSequenceMode == SequenceRunMode.RunSimultaneously)
+                    {
+                        StartParallelSequence(command.TargetSequence, sequenceName, token, depth + 1);
+                        // Let the new background sequence begin before a following tight loop
+                        // in the current sequence can monopolize this execution context.
+                        await YieldLoopAsync(0, token);
+                    }
+                    else
+                    {
+                        await RunSequenceAsync(command.TargetSequence, token, depth + 1);
+                    }
                     break;
 
                 case CommandType.LoopTimes:
@@ -734,7 +966,9 @@ public sealed class MacroEngine
                         await WaitWhilePausedAsync(token);
                         var signal = await ExecuteCommandsAsync(sequenceName, command.Children, token, depth);
                         if (signal == ExecutionSignal.Break) break;
-                        if (signal == ExecutionSignal.Return) return signal;
+                        if (signal != ExecutionSignal.None) return signal;
+                        if (i + 1 < count)
+                            await YieldLoopAsync(0, token);
                     }
                     break;
                 }
@@ -746,8 +980,13 @@ public sealed class MacroEngine
                         await WaitWhilePausedAsync(token);
                         var signal = await ExecuteCommandsAsync(sequenceName, command.Children, token, depth);
                         if (signal == ExecutionSignal.Break) break;
-                        if (signal == ExecutionSignal.Return) return signal;
-                        if (command.Children.Count == 0) await DelayPausableAsync(10, token);
+                        if (signal != ExecutionSignal.None) return signal;
+
+                        // A 0 ms interval means "no intentional delay", not "never yield".
+                        // Yielding here is important when Starting Sequence and one or more
+                        // simultaneous tabs each contain their own Forever loops.
+                        var interval = Math.Clamp(command.LoopIntervalMs, 0, 60000);
+                        await YieldLoopAsync(interval, token);
                     }
                     break;
 
@@ -755,6 +994,8 @@ public sealed class MacroEngine
                     return ExecutionSignal.Break;
                 case CommandType.Return:
                     return ExecutionSignal.Return;
+                case CommandType.RestartCurrentTab:
+                    return ExecutionSignal.Restart;
                 case CommandType.StopMacro:
                     _cts?.Cancel();
                     token.ThrowIfCancellationRequested();
@@ -765,14 +1006,182 @@ public sealed class MacroEngine
         return ExecutionSignal.None;
     }
 
-    private (bool Matched, string Current, (int X, int Y) Point, string Target) ColorCondition(MacroCommand command)
+    private Task<(bool Matched, string Current, (int X, int Y) Point, string Target)> ColorConditionAsync(MacroCommand command, CancellationToken token)
+        => Task.Run(() => ColorCondition(command, token), token);
+
+    private (bool Matched, string Current, (int X, int Y) Point, string Target) ColorCondition(MacroCommand command, CancellationToken token)
     {
-        var point = CoordinateResolver.ResolvePoint(command, _values);
-        var target = _values.ResolveText(command.ColorHex);
-        var current = ScreenTools.GetPixelHex(point.X, point.Y);
-        var matches = ScreenTools.ColorMatches(point.X, point.Y, target, command.ColorTolerance);
-        var result = command.CompareMode == CompareMode.Equals ? matches : !matches;
-        return (result, current, point, target);
+        var targets = ResolveColorTargets(command);
+        var regions = ResolveColorConditionRegions(command);
+        var useAll = command.ColorLocationGroupMode == LocationGroupMode.All && regions.Count > 1;
+
+        (int X, int Y, string Hex)? firstFound = null;
+        var perRegion = new List<bool>(regions.Count);
+        foreach (var item in regions)
+        {
+            token.ThrowIfCancellationRequested();
+            var found = ScreenTools.FindColorInRegion(item.Region, targets, token);
+            perRegion.Add(found.HasValue);
+            if (firstFound is null && found.HasValue)
+                firstFound = found;
+        }
+
+        var perRegionConditions = command.CompareMode == CompareMode.Equals
+            ? perRegion
+            : perRegion.Select(value => !value).ToList();
+        var result = useAll
+            ? perRegionConditions.All(value => value)
+            : perRegionConditions.Any(value => value);
+
+        var first = regions[0];
+        var point = firstFound.HasValue
+            ? (firstFound.Value.X, firstFound.Value.Y)
+            : first.ReferencePoint;
+        var current = firstFound.HasValue
+            ? firstFound.Value.Hex
+            : first.IsPixel ? ScreenTools.GetPixelHex(first.ReferencePoint.X, first.ReferencePoint.Y) : "No match";
+
+        var colorText = string.Join(" OR ", targets.Select(target => $"{target.Hex} ±{target.Tolerance}"));
+        var regionJoin = useAll ? " AND " : " OR ";
+        var regionText = string.Join(regionJoin, regions.Select(item => item.Description));
+        return (result, current, point, $"{colorText} {regionText}");
+    }
+
+    private List<(ScreenRegion Region, string Description, (int X, int Y) ReferencePoint, bool IsPixel)> ResolveColorConditionRegions(MacroCommand command)
+    {
+        var list = new List<(ScreenRegion, string, (int X, int Y), bool)>();
+
+        // Backward compatibility for projects saved by the short-lived radius build.
+        if (command.ColorSearchMode is null && command.ColorSearchRadius > 0)
+        {
+            var center = CoordinateResolver.ResolvePoint(command, _values);
+            var radius = Math.Clamp(command.ColorSearchRadius, 0, 5000);
+            list.Add((
+                new ScreenRegion(center.X - radius, center.Y - radius, radius * 2 + 1, radius * 2 + 1),
+                $"within {radius}px of {center.X}, {center.Y}",
+                center,
+                false));
+            return list;
+        }
+
+        var mode = command.ColorSearchMode ?? ColorConditionSearchMode.Pixel;
+        if (mode == ColorConditionSearchMode.FullScreen)
+        {
+            var full = ScreenTools.VirtualScreenRegion();
+            list.Add((full, "on full screen", (full.X + full.Width / 2, full.Y + full.Height / 2), false));
+            return list;
+        }
+
+        if (mode == ColorConditionSearchMode.SearchArea)
+        {
+            var resolved = CoordinateResolver.ResolveImageSearch(command, _values);
+            var width = Math.Max(1, resolved.SearchWidth);
+            var height = Math.Max(1, resolved.SearchHeight);
+            var primary = new ScreenRegion(resolved.SearchX, resolved.SearchY, width, height);
+            list.Add((primary, $"in area {primary.X}, {primary.Y}, {primary.Width}×{primary.Height}",
+                (primary.X + primary.Width / 2, primary.Y + primary.Height / 2), false));
+
+            foreach (var target in command.ColorSearchTargets ?? new List<ColorSearchTarget>())
+            {
+                var area = ResolveExtraSearchArea(target, command.CoordinateMode);
+                list.Add((area, $"in area {area.X}, {area.Y}, {area.Width}×{area.Height}",
+                    (area.X + area.Width / 2, area.Y + area.Height / 2), false));
+            }
+        }
+        else
+        {
+            var primary = CoordinateResolver.ResolvePoint(command, _values);
+            list.Add((new ScreenRegion(primary.X, primary.Y, 1, 1), $"at {primary.X}, {primary.Y}", primary, true));
+            foreach (var target in command.ColorSearchTargets ?? new List<ColorSearchTarget>())
+            {
+                var point = ResolveExtraPoint(target, command.CoordinateMode);
+                list.Add((new ScreenRegion(point.X, point.Y, 1, 1), $"at {point.X}, {point.Y}", point, true));
+            }
+        }
+
+        return list;
+    }
+
+    private (int X, int Y) ResolveExtraPoint(ColorSearchTarget target, CoordinateMode mode)
+    {
+        var x = _values.ResolveInt(target.XExpression, target.X);
+        var y = _values.ResolveInt(target.YExpression, target.Y);
+        return ResolveCoordinatePair(x, y, mode);
+    }
+
+    private ScreenRegion ResolveExtraSearchArea(ColorSearchTarget target, CoordinateMode mode)
+    {
+        var x = _values.ResolveInt(target.SearchXExpression, target.SearchX);
+        var y = _values.ResolveInt(target.SearchYExpression, target.SearchY);
+        var width = Math.Max(1, _values.ResolveInt(target.SearchWidthExpression, target.SearchWidth));
+        var height = Math.Max(1, _values.ResolveInt(target.SearchHeightExpression, target.SearchHeight));
+        var point = ResolveCoordinatePair(x, y, mode);
+        return new ScreenRegion(point.X, point.Y, width, height);
+    }
+
+    private static (int X, int Y) ResolveCoordinatePair(int x, int y, CoordinateMode mode)
+    {
+        return mode switch
+        {
+            CoordinateMode.ActiveWindow when WindowTools.TryGetForegroundRect(out var region) => (region.X + x, region.Y + y),
+            CoordinateMode.RelativeToMouse when NativeMethods.GetCursorPos(out var mouse) => (mouse.X + x, mouse.Y + y),
+            _ => (x, y)
+        };
+    }
+
+    private List<(string Hex, int Tolerance)> ResolveColorTargets(MacroCommand command)
+    {
+        var targets = new List<(string Hex, int Tolerance)>();
+
+        void AddTarget(string rawHex, int tolerance)
+        {
+            var hex = _values.ResolveText(rawHex).Trim();
+            if (!ScreenTools.TryParseColor(hex, out _, out _, out _))
+                throw new InvalidOperationException($"Color '{hex}' is not valid. Use a value like 0xFFFFFF or a variable containing a valid color.");
+            targets.Add((hex, Math.Clamp(tolerance, 0, 255)));
+        }
+
+        AddTarget(command.ColorHex, command.ColorTolerance);
+        foreach (var option in command.ColorAlternatives ?? new List<ColorMatchOption>())
+        {
+            var tolerance = _values.ResolveInt(option.ToleranceExpression, option.Tolerance);
+            AddTarget(option.ColorHex, tolerance);
+        }
+
+        return targets;
+    }
+
+    private MacroCommand ResolveColorSearch(MacroCommand command)
+    {
+        var search = CoordinateResolver.ResolveImageSearch(command, _values);
+        var targets = ResolveColorTargets(command);
+        search.ColorHex = targets[0].Hex;
+        search.ColorTolerance = targets[0].Tolerance;
+        search.ColorAlternatives = targets.Skip(1)
+            .Select(target => new ColorMatchOption
+            {
+                ColorHex = target.Hex,
+                Tolerance = target.Tolerance,
+                ToleranceExpression = string.Empty
+            })
+            .ToList();
+        return search;
+    }
+
+    private bool TryConsumeConditionCooldown(MacroCommand command)
+    {
+        var cooldown = Math.Clamp(command.CooldownMs, 0, 86_400_000);
+        if (cooldown <= 0)
+            return true;
+
+        var now = Environment.TickCount64;
+        lock (_cooldownLock)
+        {
+            if (_conditionLastTriggered.TryGetValue(command.Id, out var last) && now - last < cooldown)
+                return false;
+            _conditionLastTriggered[command.Id] = now;
+            return true;
+        }
     }
 
     private static bool KeyIsDown(string key)
@@ -799,6 +1208,12 @@ public sealed class MacroEngine
 
     private int ResolveRepeatCount(MacroCommand command) =>
         Math.Clamp(_values.ResolveInt(command.RepeatExpression, command.RepeatCount), 0, 1_000_000);
+
+    private static bool ShouldMoveBeforeClick(MacroCommand command)
+    {
+        // null is the legacy value for old macros, which always moved to X/Y first.
+        return command.MoveBeforeClick ?? true;
+    }
 
     private async Task MoveForClickAsync(MacroCommand command, CancellationToken token)
     {
@@ -843,7 +1258,7 @@ public sealed class MacroEngine
         {
             token.ThrowIfCancellationRequested();
             await WaitWhilePausedAsync(token);
-            var (matched, current, point, target) = ColorCondition(command);
+            var (matched, current, point, target) = await ColorConditionAsync(command, token);
             StatusChanged?.Invoke($"Waiting until {point.X}, {point.Y} {relation} {target}  •  Current {current}");
             if (matched)
                 return true;
@@ -896,12 +1311,20 @@ public sealed class MacroEngine
         return found;
     }
 
+    private static string DescribeColorTargets(MacroCommand command)
+    {
+        var items = new List<string> { $"{command.ColorHex} ±{command.ColorTolerance}" };
+        items.AddRange((command.ColorAlternatives ?? new List<ColorMatchOption>())
+            .Select(option => $"{option.ColorHex} ±{option.Tolerance}"));
+        return string.Join(" OR ", items);
+    }
+
     private async Task<(int X, int Y)?> RunFindColorWithPolicyAsync(MacroCommand command, MacroCommand resolved, CancellationToken token, int depth)
     {
         (int X, int Y)? point = null;
         await RunFailureAwareAsync(command, "color search", async () =>
         {
-            StatusChanged?.Invoke($"Searching for {resolved.ColorHex} in the selected area");
+            StatusChanged?.Invoke($"Searching for {DescribeColorTargets(resolved)} in the selected area");
             point = await ColorFinder.FindAsync(resolved, token);
             return point.HasValue;
         }, token, depth);
@@ -977,6 +1400,228 @@ public sealed class MacroEngine
         return "image";
     }
 
+    private async Task WithInputGateAsync(Func<Task> action, CancellationToken token)
+    {
+        await _inputGate.WaitAsync(token);
+        try
+        {
+            token.ThrowIfCancellationRequested();
+            await action();
+        }
+        finally
+        {
+            _inputGate.Release();
+        }
+    }
+
+    private async Task WithInputGateAsync(Action action, CancellationToken token)
+    {
+        await _inputGate.WaitAsync(token);
+        try
+        {
+            token.ThrowIfCancellationRequested();
+            action();
+        }
+        finally
+        {
+            _inputGate.Release();
+        }
+    }
+
+    private async Task ReleaseHeldInputsAsync()
+    {
+        await _inputGate.WaitAsync();
+        try
+        {
+            List<string> keys;
+            bool left;
+            bool right;
+            lock (_heldInputLock)
+            {
+                keys = _heldKeys.ToList();
+                _heldKeys.Clear();
+                left = _leftMouseHeld;
+                right = _rightMouseHeld;
+                _leftMouseHeld = false;
+                _rightMouseHeld = false;
+            }
+
+            foreach (var key in keys)
+            {
+                try { InputController.KeyUp(key); } catch { }
+            }
+            if (left)
+            {
+                try { InputController.LeftUp(); } catch { }
+            }
+            if (right)
+            {
+                try { InputController.RightUp(); } catch { }
+            }
+        }
+        finally
+        {
+            _inputGate.Release();
+        }
+    }
+
+    private async Task DrainParallelSequencesAsync()
+    {
+        while (true)
+        {
+            Task[] tasks;
+            lock (_parallelLock)
+            {
+                foreach (var completed in _parallelSequences
+                             .Where(pair => pair.Value.IsCompleted)
+                             .Select(pair => pair.Key)
+                             .ToList())
+                    _parallelSequences.Remove(completed);
+
+                if (_parallelSequences.Count == 0)
+                    return;
+
+                tasks = _parallelSequences.Values.ToArray();
+            }
+
+            try
+            {
+                await Task.WhenAll(tasks).ConfigureAwait(false);
+            }
+            catch
+            {
+                // Individual background errors are captured in _parallelFailure.
+                // Shutdown still waits for every task so no tab survives the run.
+            }
+        }
+    }
+
+    private static int NextInclusive(int min, int max)
+    {
+        if (max <= min)
+            return min;
+        return (int)Random.Shared.NextInt64(min, (long)max + 1L);
+    }
+
+    private void StartParallelSequence(string sequenceNameRaw, string callerSequenceName, CancellationToken token, int depth)
+    {
+        var sequenceName = (sequenceNameRaw ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(sequenceName))
+            throw new InvalidOperationException("Choose a sequence to run.");
+
+        lock (_parallelLock)
+        {
+            if (sequenceName.Equals(callerSequenceName, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException($"Sequence '{sequenceName}' cannot launch itself.");
+
+            // Repeated simultaneous launches from a fast/Forever loop are a no-op
+            // while that target tab is already active. This prevents duplicate clicks
+            // without turning a harmless repeated launch into a macro-stopping error.
+            if (_activeSequences.Contains(sequenceName))
+                return;
+
+            foreach (var completed in _parallelSequences
+                         .Where(pair => pair.Value.IsCompleted)
+                         .Select(pair => pair.Key)
+                         .ToList())
+            {
+                _parallelSequences.Remove(completed);
+            }
+
+            // Only one simultaneous instance of a tab may be active.
+            // The old guard was keyed by the Run Sequence command ID, so two
+            // different commands could start the same target tab at once and
+            // duplicate actions such as Click.
+            if (_parallelSequences.TryGetValue(sequenceName, out var existing) &&
+                !existing.IsCompleted)
+            {
+                return;
+            }
+
+            if (_parallelSequences.Count >= 64)
+                throw new InvalidOperationException(
+                    "Too many tabs are running simultaneously. Stop the macro or reduce parallel Run Sequence commands.");
+
+            var task = Task.Run(async () =>
+            {
+                try
+                {
+                    await RunSequenceAsync(sequenceName, token, depth).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (token.IsCancellationRequested)
+                {
+                    // Normal Stop or cancellation caused by another parallel failure.
+                }
+                catch (Exception ex)
+                {
+                    lock (_parallelLock)
+                    {
+                        _parallelFailure ??= ex;
+                    }
+                    _cts?.Cancel();
+                }
+            }, CancellationToken.None);
+
+            _parallelSequences[sequenceName] = task;
+        }
+    }
+
+    private async Task WaitForParallelSequencesAsync(CancellationToken token)
+    {
+        while (true)
+        {
+            Task[] tasks;
+            lock (_parallelLock)
+            {
+                foreach (var completed in _parallelSequences.Where(pair => pair.Value.IsCompleted).Select(pair => pair.Key).ToList())
+                    _parallelSequences.Remove(completed);
+
+                if (_parallelSequences.Count == 0)
+                    break;
+
+                tasks = _parallelSequences.Values.ToArray();
+            }
+
+            await Task.WhenAll(tasks).ConfigureAwait(false);
+
+            var failure = GetParallelFailure();
+            if (failure is not null)
+                throw new InvalidOperationException($"A simultaneously running tab failed: {failure.Message}", failure);
+
+            token.ThrowIfCancellationRequested();
+        }
+
+        var finalFailure = GetParallelFailure();
+        if (finalFailure is not null)
+            throw new InvalidOperationException($"A simultaneously running tab failed: {finalFailure.Message}", finalFailure);
+
+        token.ThrowIfCancellationRequested();
+    }
+
+    private Exception? GetParallelFailure()
+    {
+        lock (_parallelLock)
+            return _parallelFailure;
+    }
+
+    private async Task YieldLoopAsync(int milliseconds, CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        await WaitWhilePausedAsync(token);
+
+        if (milliseconds > 0)
+        {
+            await DelayPausableAsync(milliseconds, token);
+            return;
+        }
+
+        // Task.Yield gives other simultaneous sequences (and the UI thread for the
+        // Starting Sequence) a chance to run without adding a user-visible delay.
+        await Task.Yield();
+        token.ThrowIfCancellationRequested();
+        await WaitWhilePausedAsync(token);
+    }
+
     private async Task DelayPausableAsync(int milliseconds, CancellationToken token)
     {
         var remaining = ScaleDuration(milliseconds);
@@ -1003,6 +1648,7 @@ public sealed class MacroEngine
     {
         None,
         Break,
-        Return
+        Return,
+        Restart
     }
 }

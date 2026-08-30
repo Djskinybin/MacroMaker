@@ -257,6 +257,8 @@ internal static class InputController
         ["K"] = 0x4B, ["L"] = 0x4C, ["M"] = 0x4D, ["N"] = 0x4E, ["O"] = 0x4F,
         ["P"] = 0x50, ["Q"] = 0x51, ["R"] = 0x52, ["S"] = 0x53, ["T"] = 0x54,
         ["U"] = 0x55, ["V"] = 0x56, ["W"] = 0x57, ["X"] = 0x58, ["Y"] = 0x59, ["Z"] = 0x5A,
+        ["WIN"] = 0x5B,
+        ["WINDOWS"] = 0x5B,
         ["LWIN"] = 0x5B,
         ["RWIN"] = 0x5C,
         ["NUMPAD0"] = 0x60, ["NUMPAD1"] = 0x61, ["NUMPAD2"] = 0x62, ["NUMPAD3"] = 0x63,
@@ -406,25 +408,71 @@ internal static class InputController
         var modifiers = new List<ushort>();
         for (var i = 0; i < parts.Length - 1; i++)
         {
-            if (TryGetVirtualKey(parts[i], out var modifier))
-            {
-                KeyDown(modifier);
-                modifiers.Add(modifier);
-            }
+            if (!TryGetVirtualKey(parts[i], out var modifier))
+                throw new InvalidOperationException($"Unknown key in combo: {parts[i]}");
+            KeyDown(modifier);
+            modifiers.Add(modifier);
         }
 
-        if (TryGetVirtualKey(parts[^1], out var key))
+        try
+        {
+            // Punctuation such as !, @ and ? may require Shift/Alt/Ctrl according
+            // to the active keyboard layout. VkKeyScan includes those modifier bits.
+            var last = parts[^1];
+            if (last.Length == 1 && !NamedKeys.ContainsKey(last))
+            {
+                PressCharacterWithLayoutModifiers(last[0]);
+            }
+            else if (TryGetVirtualKey(last, out var key))
+            {
+                KeyDown(key);
+                KeyUp(key);
+            }
+            else if (last.Length == 1)
+            {
+                TypeText(last);
+            }
+            else
+            {
+                throw new InvalidOperationException($"Unknown key: {last}");
+            }
+        }
+        finally
+        {
+            // Never leave an explicit Ctrl/Shift/Alt/Win modifier held if an
+            // unusual keyboard-layout mapping or SendInput call fails midway.
+            for (var i = modifiers.Count - 1; i >= 0; i--)
+                KeyUp(modifiers[i]);
+        }
+    }
+
+    private static void PressCharacterWithLayoutModifiers(char ch)
+    {
+        var scan = NativeMethods.VkKeyScan(ch);
+        if (scan == -1)
+        {
+            TypeText(ch.ToString());
+            return;
+        }
+
+        var key = (ushort)(scan & 0xFF);
+        var flags = (scan >> 8) & 0xFF;
+        var modifiers = new List<ushort>();
+        if ((flags & 1) != 0) modifiers.Add(0x10); // Shift
+        if ((flags & 2) != 0) modifiers.Add(0x11); // Ctrl
+        if ((flags & 4) != 0) modifiers.Add(0x12); // Alt
+
+        foreach (var modifier in modifiers) KeyDown(modifier);
+        try
         {
             KeyDown(key);
             KeyUp(key);
         }
-        else if (parts[^1].Length == 1)
+        finally
         {
-            TypeText(parts[^1]);
+            for (var i = modifiers.Count - 1; i >= 0; i--)
+                KeyUp(modifiers[i]);
         }
-
-        for (var i = modifiers.Count - 1; i >= 0; i--)
-            KeyUp(modifiers[i]);
     }
 
     public static void KeyDown(string key)

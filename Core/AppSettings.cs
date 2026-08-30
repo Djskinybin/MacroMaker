@@ -25,6 +25,7 @@ public sealed class CommandDefaultProfile
     public MouseMoveMode MouseMoveMode { get; set; } = MouseMoveMode.Smooth;
     public int MoveDurationMs { get; set; } = 50;
     public int ClickDelayMs { get; set; } = 100;
+    public bool MoveBeforeClick { get; set; }
     public int ScrollAmount { get; set; } = -120;
     public int DragDurationMs { get; set; } = 500;
     public int HoldMs { get; set; } = 500;
@@ -45,6 +46,8 @@ public sealed class CommandDefaultProfile
 
     public string ColorHex { get; set; } = "0x000000";
     public int ColorTolerance { get; set; }
+    public ColorConditionSearchMode ColorSearchMode { get; set; } = ColorConditionSearchMode.Pixel;
+    public int ColorSearchRadius { get; set; }
     public CompareMode CompareMode { get; set; } = CompareMode.Equals;
 
     public int ImageTolerance { get; set; } = 25;
@@ -75,11 +78,13 @@ public sealed class CommandDefaultProfile
     public string FilePath { get; set; } = string.Empty;
     public bool AppendFile { get; set; }
     public string PromptText { get; set; } = "Enter a value:";
+    public List<string> PromptOptions { get; set; } = new() { "Option 1", "Option 2" };
     public FailureAction FailureAction { get; set; } = FailureAction.Continue;
     public int FailureRetryCount { get; set; } = 2;
     public int FailureRetryDelayMs { get; set; } = 250;
 
     public int RepeatCount { get; set; } = 3;
+    public int LoopIntervalMs { get; set; } = 50;
 
     public CommandDefaultProfile DeepClone() => new()
     {
@@ -92,6 +97,7 @@ public sealed class CommandDefaultProfile
         MouseMoveMode = MouseMoveMode,
         MoveDurationMs = MoveDurationMs,
         ClickDelayMs = ClickDelayMs,
+        MoveBeforeClick = MoveBeforeClick,
         ScrollAmount = ScrollAmount,
         DragDurationMs = DragDurationMs,
         HoldMs = HoldMs,
@@ -107,6 +113,8 @@ public sealed class CommandDefaultProfile
         TimeoutMs = TimeoutMs,
         ColorHex = ColorHex,
         ColorTolerance = ColorTolerance,
+        ColorSearchMode = ColorSearchMode,
+        ColorSearchRadius = ColorSearchRadius,
         CompareMode = CompareMode,
         ImageTolerance = ImageTolerance,
         ImageIncludeSubfolders = ImageIncludeSubfolders,
@@ -133,17 +141,19 @@ public sealed class CommandDefaultProfile
         FilePath = FilePath,
         AppendFile = AppendFile,
         PromptText = PromptText,
+        PromptOptions = (PromptOptions ?? new List<string>()).ToList(),
         FailureAction = FailureAction,
         FailureRetryCount = FailureRetryCount,
         FailureRetryDelayMs = FailureRetryDelayMs,
-        RepeatCount = RepeatCount
+        RepeatCount = RepeatCount,
+        LoopIntervalMs = LoopIntervalMs
     };
 }
 
 public sealed class AppSettings
 {
     public AppTheme Theme { get; set; } = AppTheme.Dark;
-    public int DefaultsRevision { get; set; } = 3;
+    public int DefaultsRevision { get; set; } = 4;
     public bool CheckForUpdatesOnStartup { get; set; } = true;
     public DateTime LastSuccessfulUpdateCheckUtc { get; set; } = DateTime.MinValue;
 
@@ -158,6 +168,7 @@ public sealed class AppSettings
     public int RunHudOpacityPercent { get; set; } = 92;
     public bool ShowAdvancedCommands { get; set; } = true; // Legacy setting; all commands are always shown now.
     public bool AutoSaveProjectChanges { get; set; } = true;
+    public bool CompactBlockLabels { get; set; }
     public List<string> RecentProjects { get; set; } = new();
     public List<CommandType> QuickAddCommands { get; set; } = new()
     {
@@ -194,10 +205,7 @@ internal static class CommandDefaultsFactory
 
     public static CommandDefaultProfile Create(CommandType type)
     {
-        var p = new CommandDefaultProfile { Type = type };
-        if (type == CommandType.LoopUntilColor)
-            p.CompareMode = CompareMode.NotEquals;
-        return p;
+        return new CommandDefaultProfile { Type = type };
     }
 }
 
@@ -222,11 +230,23 @@ internal static class AppSettingsStore
             if (!File.Exists(SettingsPath))
                 return new AppSettings();
 
-            var json = File.ReadAllText(SettingsPath);
+            string json;
+            AppSettings settings;
+            try
+            {
+                json = File.ReadAllText(SettingsPath);
+                settings = JsonSerializer.Deserialize<AppSettings>(json, JsonOptions)
+                           ?? throw new InvalidOperationException("Settings file was empty.");
+            }
+            catch when (File.Exists(SettingsPath + ".bak"))
+            {
+                json = File.ReadAllText(SettingsPath + ".bak");
+                settings = JsonSerializer.Deserialize<AppSettings>(json, JsonOptions)
+                           ?? new AppSettings();
+            }
+
             var hadProfilesInFile = json.Contains("\"CommandDefaults\"", StringComparison.OrdinalIgnoreCase);
             var needsV141DefaultsMigration = !json.Contains("\"DefaultsRevision\"", StringComparison.OrdinalIgnoreCase);
-            var settings = JsonSerializer.Deserialize<AppSettings>(json, JsonOptions)
-                           ?? new AppSettings();
             var needsZeroDefaultsMigration = !json.Contains("\"DefaultsRevision\"", StringComparison.OrdinalIgnoreCase)
                                             || settings.DefaultsRevision < 3;
             Repair(settings, !hadProfilesInFile, needsV141DefaultsMigration, needsZeroDefaultsMigration);
@@ -242,7 +262,7 @@ internal static class AppSettingsStore
     {
         Repair(settings, false, false, false);
         Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath)!);
-        File.WriteAllText(SettingsPath, JsonSerializer.Serialize(settings, JsonOptions));
+        AtomicFile.WriteAllText(SettingsPath, JsonSerializer.Serialize(settings, JsonOptions), keepBackup: true);
     }
 
     private static void Repair(AppSettings settings, bool migrateLegacy, bool migrateV141Defaults, bool migrateZeroDefaults)
@@ -336,7 +356,16 @@ internal static class AppSettingsStore
             }
         }
 
-        settings.DefaultsRevision = 3;
+        // Rev 4 fixes the shipped default for "Repeat Until Color Matches".
+        // Existing command instances are left alone; this only repairs the default profile.
+        if (settings.DefaultsRevision < 4)
+        {
+            var untilColor = settings.CommandDefaults.FirstOrDefault(p => p.Type == CommandType.LoopUntilColor);
+            if (untilColor is not null && untilColor.CompareMode == CompareMode.NotEquals)
+                untilColor.CompareMode = CompareMode.Equals;
+        }
+
+        settings.DefaultsRevision = 4;
 
         foreach (var p in settings.CommandDefaults)
             RepairProfile(p);
@@ -388,13 +417,19 @@ internal static class AppSettingsStore
         p.PollMs = Math.Clamp(p.PollMs, 10, 5000);
         p.TimeoutMs = Math.Clamp(p.TimeoutMs, 0, 86_400_000);
         p.ColorTolerance = Math.Clamp(p.ColorTolerance, 0, 255);
+        p.ColorSearchRadius = Math.Clamp(p.ColorSearchRadius, 0, 5000);
         p.ImageTolerance = Math.Clamp(p.ImageTolerance, 0, 255);
         p.RepeatCount = Math.Clamp(p.RepeatCount, 0, 1_000_000);
+        p.LoopIntervalMs = Math.Clamp(p.LoopIntervalMs, 0, 60_000);
         p.FailureRetryCount = Math.Clamp(p.FailureRetryCount, 0, 100);
         p.FailureRetryDelayMs = Math.Clamp(p.FailureRetryDelayMs, 0, 60_000);
         if (string.IsNullOrWhiteSpace(p.ColorHex)) p.ColorHex = "0x000000";
         if (string.IsNullOrWhiteSpace(p.Key)) p.Key = "E";
         if (string.IsNullOrWhiteSpace(p.RecordingStopHotkey)) p.RecordingStopHotkey = "F7";
+        p.PromptOptions ??= new List<string>();
+        p.PromptOptions = p.PromptOptions.Where(option => !string.IsNullOrWhiteSpace(option)).ToList();
+        if (p.Type == CommandType.PromptSelect && p.PromptOptions.Count == 0)
+            p.PromptOptions.AddRange(new[] { "Option 1", "Option 2" });
     }
 }
 
@@ -469,8 +504,8 @@ internal static class CommandCatalog
         }),
         ("Variables", new[]
         {
-            new Option("Variables", "Save Value", CommandType.SetVariable),
-            new Option("Variables", "Change Saved Value", CommandType.AddVariable),
+            new Option("Variables", "Set Variable", CommandType.SetVariable),
+            new Option("Variables", "Change Variable", CommandType.AddVariable),
             new Option("Variables", "Save Random Number", CommandType.RandomNumber),
             new Option("Variables", "If Saved Value Matches", CommandType.IfVariable),
             new Option("Variables", "Wait for Saved Value", CommandType.WaitUntilVariable),
@@ -484,16 +519,17 @@ internal static class CommandCatalog
             new Option("Clipboard / Files / Questions", "Read Text File + Save It", CommandType.ReadTextFile),
             new Option("Clipboard / Files / Questions", "Write Text File", CommandType.WriteTextFile),
             new Option("Clipboard / Files / Questions", "Ask User for Text", CommandType.PromptText),
+            new Option("Clipboard / Files / Questions", "Ask User from Dropdown", CommandType.PromptSelect),
             new Option("Clipboard / Files / Questions", "Ask User Yes / No", CommandType.PromptYesNo)
         }),
         ("Logic / Loops", new[]
         {
             new Option("Logic / Loops", "Group Commands", CommandType.Group),
             new Option("Logic / Loops", "Run Another Tab", CommandType.RunSequence),
+            new Option("Logic / Loops", "Restart Current Tab", CommandType.RestartCurrentTab),
             new Option("Logic / Loops", "Repeat X Times", CommandType.LoopTimes),
             new Option("Logic / Loops", "Repeat Forever", CommandType.LoopForever),
             new Option("Logic / Loops", "Exit Current Repeat", CommandType.Break),
-            new Option("Logic / Loops", "Return to Previous Tab", CommandType.Return),
             new Option("Logic / Loops", "Stop Macro", CommandType.StopMacro)
         }),
         ("Advanced Input", new[]
@@ -638,6 +674,10 @@ internal static class WindowTheme
 
     public static void Attach(Window window)
     {
+        // WPF is PerMonitorV2 DPI-aware through app.manifest. Layout rounding keeps
+        // borders/text controls stable at 125%, 150% and 200% Windows scaling.
+        window.UseLayoutRounding = true;
+        window.SnapsToDevicePixels = true;
         window.SourceInitialized += (_, _) => Apply(window, ThemeManager.CurrentTheme);
     }
 

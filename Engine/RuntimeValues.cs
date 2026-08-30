@@ -6,7 +6,13 @@ namespace MacroMaker;
 internal sealed class RuntimeValues
 {
     private static readonly Regex BareIdentifierRegex = new(@"\b([A-Za-z_][A-Za-z0-9_]*)\b", RegexOptions.Compiled);
+    private static readonly Regex ValidVariableNameRegex = new(@"^[A-Za-z_][A-Za-z0-9_]*$", RegexOptions.Compiled);
+    private static readonly HashSet<string> BuiltInNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "MouseX", "MouseY", "ScreenWidth", "ScreenHeight", "Date", "Time", "Now"
+    };
     private readonly Dictionary<string, string> _values = new(StringComparer.OrdinalIgnoreCase);
+    private readonly object _sync = new();
 
     public RuntimeValues(MacroProject project)
     {
@@ -15,16 +21,23 @@ internal sealed class RuntimeValues
 
     public void Reset(MacroProject project)
     {
-        _values.Clear();
-        foreach (var variable in project.Variables ?? new List<ProjectVariable>())
+        lock (_sync)
         {
-            var name = NormalizeName(variable.Name);
-            if (name.Length > 0)
-                _values[name] = variable.Value ?? string.Empty;
+            _values.Clear();
+            foreach (var variable in project.Variables ?? new List<ProjectVariable>())
+            {
+                var name = NormalizeName(variable.Name);
+                if (name.Length > 0)
+                    _values[name] = variable.Value ?? string.Empty;
+            }
         }
     }
 
-    public IReadOnlyDictionary<string, string> Snapshot() => new Dictionary<string, string>(_values, StringComparer.OrdinalIgnoreCase);
+    public IReadOnlyDictionary<string, string> Snapshot()
+    {
+        lock (_sync)
+            return new Dictionary<string, string>(_values, StringComparer.OrdinalIgnoreCase);
+    }
 
     public MacroCommand ResolveNumericExpressions(MacroCommand source)
     {
@@ -57,25 +70,69 @@ internal sealed class RuntimeValues
         var normalized = NormalizeName(name);
         if (TryGetBuiltIn(normalized, out var builtIn))
             return builtIn;
-        return _values.TryGetValue(normalized, out var value) ? value : string.Empty;
+        lock (_sync)
+        {
+            if (_values.TryGetValue(normalized, out var value))
+                return value;
+        }
+
+        throw new InvalidOperationException($"Variable '{normalized}' does not exist yet. Set it first or make sure the command that creates it runs before this one.");
+    }
+
+    public bool Exists(string name)
+    {
+        var normalized = NormalizeName(name);
+        if (IsBuiltInName(normalized))
+            return true;
+        lock (_sync)
+            return _values.ContainsKey(normalized);
     }
 
     public void Set(string name, string value)
     {
-        var normalized = NormalizeName(name);
-        if (normalized.Length == 0)
-            throw new InvalidOperationException("Variable name cannot be empty.");
-        _values[normalized] = value ?? string.Empty;
+        var normalized = ValidateWritableVariableName(name);
+        lock (_sync)
+            _values[normalized] = value ?? string.Empty;
     }
 
     public void Add(string name, string amountOrText)
     {
-        var current = Get(name);
-        var resolved = ResolveText(amountOrText);
-        if (TryNumber(current, out var a) && TryNumber(resolved, out var b))
-            Set(name, FormatNumber(a + b));
-        else
-            Set(name, current + resolved);
+        var normalized = ValidateWritableVariableName(name);
+        var resolved = ResolveValue(amountOrText);
+        lock (_sync)
+        {
+            if (!_values.TryGetValue(normalized, out var current))
+                throw new InvalidOperationException($"Variable '{normalized}' does not exist yet. Use Set Variable first.");
+
+            if (TryNumber(current, out var a) && TryNumber(resolved, out var b))
+                _values[normalized] = FormatNumber(a + b);
+            else
+                _values[normalized] = current + resolved;
+        }
+    }
+
+    public string ResolveValue(string? text)
+    {
+        var source = text ?? string.Empty;
+        var resolved = ResolveText(source);
+        if (!string.Equals(resolved, source, StringComparison.Ordinal))
+            return resolved;
+
+        // Treat valid arithmetic as a numeric assignment, while leaving ordinary
+        // text (including text containing dashes or slashes) unchanged.
+        if (Regex.IsMatch(source, @"[+\-*/()]"))
+        {
+            try
+            {
+                return ResolveInt(source, 0).ToString(CultureInfo.InvariantCulture);
+            }
+            catch
+            {
+                // Not a numeric formula; keep it as normal text.
+            }
+        }
+
+        return source;
     }
 
     public string ResolveText(string? text)
@@ -87,8 +144,11 @@ internal sealed class RuntimeValues
         // is a variable or built-in name, use its value. Otherwise keep the text literal.
         if (TryGetBuiltIn(trimmed, out var builtIn))
             return builtIn;
-        if (_values.TryGetValue(trimmed, out var value))
-            return value;
+        lock (_sync)
+        {
+            if (_values.TryGetValue(trimmed, out var value))
+                return value;
+        }
 
         return source;
     }
@@ -107,18 +167,27 @@ internal sealed class RuntimeValues
             var name = NormalizeName(match.Groups[1].Value);
             if (TryGetBuiltIn(name, out var builtIn))
                 return builtIn;
-            return _values.TryGetValue(name, out var value) ? value : match.Value;
+            lock (_sync)
+                return _values.TryGetValue(name, out var value) ? value : match.Value;
         });
 
         if (int.TryParse(expanded, NumberStyles.Integer, CultureInfo.InvariantCulture, out var direct))
             return direct;
 
         if (double.TryParse(expanded, NumberStyles.Float, CultureInfo.InvariantCulture, out var number))
-            return (int)Math.Round(number);
+            return ToInt32(number, expression);
+
+        var unknown = BareIdentifierRegex.Match(expanded);
+        if (unknown.Success)
+            throw new InvalidOperationException($"Variable '{unknown.Groups[1].Value}' does not exist yet. Set it first or make sure the command that creates it runs before this one.");
 
         try
         {
-            return (int)Math.Round(SimpleExpression.Evaluate(expanded));
+            return ToInt32(SimpleExpression.Evaluate(expanded), expression);
+        }
+        catch (InvalidOperationException)
+        {
+            throw;
         }
         catch
         {
@@ -129,7 +198,7 @@ internal sealed class RuntimeValues
     public bool Compare(string variableName, VariableCompareMode mode, string compareTo)
     {
         var left = Get(variableName);
-        var right = ResolveText(compareTo);
+        var right = ResolveValue(compareTo);
 
         if (TryNumber(left, out var leftNumber) && TryNumber(right, out var rightNumber))
         {
@@ -164,6 +233,94 @@ internal sealed class RuntimeValues
     }
 
     public static string NormalizeName(string? value) => (value ?? string.Empty).Trim();
+
+    public static bool IsValidVariableName(string? value)
+        => ValidVariableNameRegex.IsMatch(NormalizeName(value));
+
+    public static bool IsBuiltInName(string? value)
+        => BuiltInNames.Contains(NormalizeName(value));
+
+    public static bool IsReservedVariableName(string? value)
+        => IsBuiltInName(value);
+
+    public static IReadOnlyCollection<string> BuiltInVariableNames => BuiltInNames;
+
+    public static IEnumerable<string> ExtractIdentifiers(string? expression)
+        => BareIdentifierRegex.Matches(expression ?? string.Empty).Select(match => match.Groups[1].Value);
+
+    public static bool TryValidateNumericExpression(string? expression, ISet<string> knownVariables, out string error)
+    {
+        error = string.Empty;
+        if (string.IsNullOrWhiteSpace(expression))
+            return true;
+
+        var expanded = BareIdentifierRegex.Replace(expression.Trim(), match =>
+        {
+            var name = NormalizeName(match.Groups[1].Value);
+            return IsBuiltInName(name) || knownVariables.Contains(name) ? "1" : match.Value;
+        });
+
+        // Plain numeric literals (including scientific notation such as 1e3)
+        // should not be mistaken for variable identifiers.
+        if (int.TryParse(expanded, NumberStyles.Integer, CultureInfo.InvariantCulture, out _))
+            return true;
+        if (double.TryParse(expanded, NumberStyles.Float, CultureInfo.InvariantCulture, out var literal))
+        {
+            if (double.IsFinite(literal) && literal >= int.MinValue && literal <= int.MaxValue)
+                return true;
+            error = "a result outside the supported number range";
+            return false;
+        }
+
+        var unknown = BareIdentifierRegex.Match(expanded);
+        if (unknown.Success)
+        {
+            error = $"unknown variable '{unknown.Groups[1].Value}'";
+            return false;
+        }
+
+        try
+        {
+            var value = SimpleExpression.Evaluate(expanded);
+            if (!double.IsFinite(value) || value < int.MinValue || value > int.MaxValue)
+            {
+                error = "a result outside the supported number range";
+                return false;
+            }
+            return true;
+        }
+        catch
+        {
+            if (int.TryParse(expanded, NumberStyles.Integer, CultureInfo.InvariantCulture, out _))
+                return true;
+            if (double.TryParse(expanded, NumberStyles.Float, CultureInfo.InvariantCulture, out var direct))
+            {
+                if (double.IsFinite(direct) && direct >= int.MinValue && direct <= int.MaxValue)
+                    return true;
+                error = "a result outside the supported number range";
+                return false;
+            }
+            error = "an invalid formula";
+            return false;
+        }
+    }
+
+    private static int ToInt32(double value, string? expression)
+    {
+        if (!double.IsFinite(value) || value < int.MinValue || value > int.MaxValue)
+            throw new InvalidOperationException($"Number or formula '{expression}' is outside the supported whole-number range.");
+        return (int)Math.Round(value);
+    }
+
+    private static string ValidateWritableVariableName(string? value)
+    {
+        var normalized = NormalizeName(value);
+        if (!IsValidVariableName(normalized))
+            throw new InvalidOperationException($"'{normalized}' is not a valid variable name. Use letters, numbers, and underscores, and do not start with a number.");
+        if (IsReservedVariableName(normalized))
+            throw new InvalidOperationException($"'{normalized}' is a built-in MacroMaker value and cannot be used as a saved variable name.");
+        return normalized;
+    }
 
     private static bool TryNumber(string value, out double number) =>
         double.TryParse(value.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out number);

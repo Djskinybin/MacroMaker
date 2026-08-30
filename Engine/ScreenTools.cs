@@ -55,6 +55,74 @@ internal static class ScreenTools
         }
     }
 
+    public static bool ColorMatchesAny(string currentHex, IEnumerable<(string Hex, int Tolerance)> targets)
+    {
+        if (!TryParseColor(currentHex, out var r, out var g, out var b))
+            return false;
+
+        foreach (var target in targets)
+        {
+            if (!TryParseColor(target.Hex, out var tr, out var tg, out var tb))
+                continue;
+
+            var tolerance = Math.Clamp(target.Tolerance, 0, 255);
+            if (Math.Abs(r - tr) <= tolerance &&
+                Math.Abs(g - tg) <= tolerance &&
+                Math.Abs(b - tb) <= tolerance)
+                return true;
+        }
+
+        return false;
+    }
+
+
+    public static (int X, int Y, string Hex)? FindColorInRegion(
+        ScreenRegion requestedRegion,
+        IEnumerable<(string Hex, int Tolerance)> targets,
+        CancellationToken token = default)
+    {
+        var parsedTargets = new List<(int R, int G, int B, int Tolerance)>();
+        foreach (var target in targets)
+        {
+            if (TryParseColor(target.Hex, out var r, out var g, out var b))
+                parsedTargets.Add((r, g, b, Math.Clamp(target.Tolerance, 0, 255)));
+        }
+        if (parsedTargets.Count == 0)
+            return null;
+
+        var full = VirtualScreenRegion();
+        var left = Math.Max(requestedRegion.X, full.X);
+        var top = Math.Max(requestedRegion.Y, full.Y);
+        var right = Math.Min(requestedRegion.X + requestedRegion.Width, full.X + full.Width);
+        var bottom = Math.Min(requestedRegion.Y + requestedRegion.Height, full.Y + full.Height);
+        var region = new ScreenRegion(left, top, Math.Max(0, right - left), Math.Max(0, bottom - top));
+        if (region.IsEmpty)
+            return null;
+
+        var buffer = ToBgra32(CaptureRegion(region));
+        for (var y = 0; y < buffer.Height; y++)
+        {
+            if ((y & 15) == 0)
+                token.ThrowIfCancellationRequested();
+            for (var x = 0; x < buffer.Width; x++)
+            {
+                var i = y * buffer.Stride + x * 4;
+                var b = buffer.Pixels[i];
+                var g = buffer.Pixels[i + 1];
+                var r = buffer.Pixels[i + 2];
+                foreach (var target in parsedTargets)
+                {
+                    if (Math.Abs(r - target.R) <= target.Tolerance &&
+                        Math.Abs(g - target.G) <= target.Tolerance &&
+                        Math.Abs(b - target.B) <= target.Tolerance)
+                        return (region.X + x, region.Y + y, $"0x{r:X2}{g:X2}{b:X2}");
+                }
+            }
+        }
+
+        return null;
+    }
+
     public static bool TryParseColor(string value, out int r, out int g, out int b)
     {
         r = g = b = 0;
@@ -416,8 +484,19 @@ internal static class ColorFinder
 
     public static (int X, int Y)? Find(MacroCommand command, CancellationToken token)
     {
-        if (!ScreenTools.TryParseColor(command.ColorHex, out var tr, out var tg, out var tb))
+        var targets = new List<(int R, int G, int B, int Tolerance)>();
+        AddTarget(command.ColorHex, command.ColorTolerance);
+        foreach (var option in command.ColorAlternatives ?? new List<ColorMatchOption>())
+            AddTarget(option.ColorHex, option.Tolerance);
+
+        if (targets.Count == 0)
             return null;
+
+        void AddTarget(string colorHex, int tolerance)
+        {
+            if (ScreenTools.TryParseColor(colorHex, out var r, out var g, out var b))
+                targets.Add((r, g, b, Math.Clamp(tolerance, 0, 255)));
+        }
 
         var full = ScreenTools.VirtualScreenRegion();
         var region = command.SearchWidth <= 0 || command.SearchHeight <= 0
@@ -433,7 +512,6 @@ internal static class ColorFinder
             return null;
 
         var buffer = ScreenTools.ToBgra32(ScreenTools.CaptureRegion(region));
-        var tolerance = Math.Clamp(command.ColorTolerance, 0, 255);
 
         for (var y = 0; y < buffer.Height; y++)
         {
@@ -446,10 +524,13 @@ internal static class ColorFinder
                 var b = buffer.Pixels[i];
                 var g = buffer.Pixels[i + 1];
                 var r = buffer.Pixels[i + 2];
-                if (Math.Abs(r - tr) <= tolerance &&
-                    Math.Abs(g - tg) <= tolerance &&
-                    Math.Abs(b - tb) <= tolerance)
-                    return (region.X + x, region.Y + y);
+                foreach (var target in targets)
+                {
+                    if (Math.Abs(r - target.R) <= target.Tolerance &&
+                        Math.Abs(g - target.G) <= target.Tolerance &&
+                        Math.Abs(b - target.B) <= target.Tolerance)
+                        return (region.X + x, region.Y + y);
+                }
             }
         }
 

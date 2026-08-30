@@ -22,7 +22,7 @@ public sealed class QuickAddSettingsWindow : Window
         Title = "Quick Add Editor";
         Width = 720;
         Height = 570;
-        MinWidth = 640;
+        MinWidth = 540;
         MinHeight = 500;
         WindowStartupLocation = WindowStartupLocation.CenterOwner;
         Background = Brush("BgBrush");

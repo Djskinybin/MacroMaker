@@ -18,6 +18,7 @@ public sealed class SettingsWindow : Window
     private readonly ComboBox _hudCornerCombo;
     private readonly TextBox _hudOpacityBox;
     private readonly CheckBox _autoSaveCheck;
+    private readonly CheckBox _compactBlockLabelsCheck;
 
     public SettingsWindow(AppSettings current)
     {
@@ -27,7 +28,7 @@ public sealed class SettingsWindow : Window
         Title = "Macro Maker Settings";
         Width = 660;
         Height = 680;
-        MinWidth = 580;
+        MinWidth = 520;
         MinHeight = 520;
         WindowStartupLocation = WindowStartupLocation.CenterOwner;
         Background = Brush("BgBrush");
@@ -71,9 +72,17 @@ public sealed class SettingsWindow : Window
         _autoSaveCheck = new CheckBox
         {
             Content = "Auto-save saved projects after changes",
-            IsChecked = current.AutoSaveProjectChanges
+            IsChecked = current.AutoSaveProjectChanges,
+            Margin = new Thickness(0, 0, 0, 8)
         };
         editorPanel.Children.Add(_autoSaveCheck);
+
+        _compactBlockLabelsCheck = new CheckBox
+        {
+            Content = "Compact block labels (hide helper comments)",
+            IsChecked = current.CompactBlockLabels
+        };
+        editorPanel.Children.Add(_compactBlockLabelsCheck);
 
         content.Children.Add(SectionCard("Controls & Running", "Set global macro hotkeys and run behavior.", out var controlsPanel));
 
@@ -272,6 +281,7 @@ public sealed class SettingsWindow : Window
             Settings.RunHudCorner = _hudCornerCombo.SelectedItem is HudCorner corner ? corner : HudCorner.TopLeft;
             Settings.RunHudOpacityPercent = int.TryParse(_hudOpacityBox.Text, out var opacity) ? Math.Clamp(opacity, 35, 100) : 92;
             Settings.AutoSaveProjectChanges = _autoSaveCheck.IsChecked == true;
+            Settings.CompactBlockLabels = _compactBlockLabelsCheck.IsChecked == true;
             Settings.CheckForUpdatesOnStartup = _autoUpdateCheck.IsChecked == true;
             DialogResult = true;
         };
@@ -345,6 +355,8 @@ public sealed class SettingsWindow : Window
         RunHudOpacityPercent = source.RunHudOpacityPercent,
         ShowAdvancedCommands = true,
         AutoSaveProjectChanges = source.AutoSaveProjectChanges,
+        CompactBlockLabels = source.CompactBlockLabels,
+        RecentProjects = source.RecentProjects?.ToList() ?? new List<string>(),
         QuickAddCommands = source.QuickAddCommands.ToList(),
         CommandDefaults = source.CommandDefaults.Select(x => x.DeepClone()).ToList(),
         DefaultMouseMoveMode = source.DefaultMouseMoveMode,

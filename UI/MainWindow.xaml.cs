@@ -6,7 +6,10 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using System.Windows;
+using System.Windows.Automation;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
+using System.Windows.Documents;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Interop;
@@ -17,6 +20,7 @@ namespace MacroMaker;
 public partial class MainWindow : Window
 {
     private const string ProjectFileName = "macro.json";
+    private const int MaxHistoryEntries = 150;
     private static readonly string RecoveryFilePath = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "MacroMaker", "Recovery", "unsaved-recovery.json");
     private MacroProject _project = new();
@@ -58,6 +62,8 @@ public partial class MainWindow : Window
     private Point _commandDragStartPoint;
     private CommandRow? _commandDragStartRow;
     private bool _commandDragInProgress;
+    private Popup? _commandDragPreview;
+    private DropIndicatorAdorner? _commandDropIndicator;
     private const string CommandDragDataFormat = "MacroMaker.CommandRows";
 
     private static readonly JsonSerializerOptions JsonOptions = new()
@@ -215,9 +221,21 @@ public partial class MainWindow : Window
                     $"That folder is not a MacroMaker project. Expected '{ProjectFileName}' inside it.\n\n" +
                     "Tip: for an older .macro.json save, put that file inside its own folder and open the folder.");
 
-            var json = File.ReadAllText(projectFile);
-            var project = JsonSerializer.Deserialize<MacroProject>(json, JsonOptions)
+            MacroProject project;
+            var loadedBackup = false;
+            try
+            {
+                var json = File.ReadAllText(projectFile);
+                project = JsonSerializer.Deserialize<MacroProject>(json, JsonOptions)
                           ?? throw new InvalidOperationException("The project file was empty.");
+            }
+            catch when (File.Exists(projectFile + ".bak"))
+            {
+                var backupJson = File.ReadAllText(projectFile + ".bak");
+                project = JsonSerializer.Deserialize<MacroProject>(backupJson, JsonOptions)
+                          ?? throw new InvalidOperationException("The project file and its backup were empty.");
+                loadedBackup = true;
+            }
 
             project.Sequences ??= new List<MacroSequence>();
             project.RecorderSettings ??= new RecorderSettings();
@@ -243,7 +261,7 @@ public partial class MainWindow : Window
             _projectPath = folder;
             ProjectPaths.CurrentFolder = folder;
             Directory.CreateDirectory(Path.Combine(folder, "Images"));
-            _dirty = false;
+            _dirty = loadedBackup;
             _collapsedBlocks.Clear();
             DeleteUnsavedRecovery();
             RebuildEngine();
@@ -251,7 +269,9 @@ public partial class MainWindow : Window
                 sequence.Name.Equals("Starting Sequence", StringComparison.OrdinalIgnoreCase)));
             RefreshTabs();
             UpdateProjectTitle();
-            StatusText.Text = $"Project loaded: {Path.GetFileName(folder)}";
+            StatusText.Text = loadedBackup
+                ? $"Recovered from backup: {Path.GetFileName(folder)} — save to replace the damaged project file"
+                : $"Project loaded: {Path.GetFileName(folder)}";
             ResetHistory();
             RememberRecentProject(folder);
             return true;
@@ -273,7 +293,15 @@ public partial class MainWindow : Window
         _appSettings.RecentProjects.Insert(0, folder);
         if (_appSettings.RecentProjects.Count > 8)
             _appSettings.RecentProjects.RemoveRange(8, _appSettings.RecentProjects.Count - 8);
-        AppSettingsStore.Save(_appSettings);
+        try
+        {
+            AppSettingsStore.Save(_appSettings);
+        }
+        catch
+        {
+            // Failing to update the recent-project list must never make an
+            // otherwise successful project open/save look like it failed.
+        }
     }
 
     private static string? FindProjectFile(string folder)
@@ -298,8 +326,32 @@ public partial class MainWindow : Window
                 command.MouseMoveMode = command.MoveDurationMs > 0 ? MouseMoveMode.Smooth : MouseMoveMode.Teleport;
 
             command.ImagePriority ??= new List<string>();
+            command.ColorAlternatives ??= new List<ColorMatchOption>();
+            command.ColorSearchTargets ??= new List<ColorSearchTarget>();
+            command.ValueExpressions ??= new Dictionary<string, string>();
             command.Children ??= new List<MacroCommand>();
             command.ElseChildren ??= new List<MacroCommand>();
+            command.ColorSearchRadius = Math.Clamp(command.ColorSearchRadius, 0, 5000);
+            if (command.Type is CommandType.IfColor or CommandType.WaitUntilColor or CommandType.LoopWhileColor or CommandType.LoopUntilColor
+                && command.ColorSearchMode is null)
+            {
+                if (command.ColorSearchRadius > 0)
+                {
+                    var radius = command.ColorSearchRadius;
+                    command.ColorSearchMode = ColorConditionSearchMode.SearchArea;
+                    command.SearchX = command.X - radius;
+                    command.SearchY = command.Y - radius;
+                    command.SearchWidth = radius * 2 + 1;
+                    command.SearchHeight = radius * 2 + 1;
+                    command.ColorSearchRadius = 0;
+                }
+                else
+                {
+                    command.ColorSearchMode = ColorConditionSearchMode.Pixel;
+                }
+            }
+            command.LoopIntervalMs = Math.Clamp(command.LoopIntervalMs, 0, 60000);
+            command.CooldownMs = Math.Clamp(command.CooldownMs, 0, 86_400_000);
             command.FailureRetryCount = Math.Clamp(command.FailureRetryCount, 0, 100);
             command.FailureRetryDelayMs = Math.Clamp(command.FailureRetryDelayMs, 0, 60000);
             command.ElseChildren ??= new List<MacroCommand>();
@@ -322,8 +374,12 @@ public partial class MainWindow : Window
     {
         var owner = dialogOwner ?? this;
         var previousProjectPath = _projectPath;
+        var previousProjectName = _project.Name;
+        var targetProjectPath = _projectPath;
+        var targetProjectName = _project.Name;
+        var choosingNewFolder = forceDialog || string.IsNullOrWhiteSpace(_projectPath);
 
-        if (forceDialog || string.IsNullOrWhiteSpace(_projectPath))
+        if (choosingNewFolder)
         {
             var defaultName = _project.Name == "Untitled Macro" ? "My Macro" : _project.Name;
             var namePrompt = new TextPromptWindow("Save Macro As", "Macro name:", defaultName) { Owner = owner };
@@ -344,49 +400,53 @@ public partial class MainWindow : Window
             if (dialog.ShowDialog(owner) != true)
                 return false;
 
-            var targetFolder = Path.Combine(dialog.FolderName, folderName);
-            var existingProject = Path.Combine(targetFolder, ProjectFileName);
+            targetProjectPath = Path.Combine(dialog.FolderName, folderName);
+            targetProjectName = displayName;
+            var existingProject = Path.Combine(targetProjectPath, ProjectFileName);
             if (File.Exists(existingProject) &&
                 MessageBox.Show(owner,
                     $"A MacroMaker project named '{folderName}' already exists there. Replace its macro.json?\n\nImages already in that project will be kept.",
                     "Existing Project", MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes)
                 return false;
-
-            _projectPath = targetFolder;
-            _project.Name = displayName;
-            Directory.CreateDirectory(_projectPath);
-            Directory.CreateDirectory(Path.Combine(_projectPath, "Images"));
-
-            // Save As copies the project's image library with it, so all
-            // relative image/folder references continue to work in the new folder.
-            if (!string.IsNullOrWhiteSpace(previousProjectPath) &&
-                !Path.GetFullPath(previousProjectPath).Equals(Path.GetFullPath(_projectPath), StringComparison.OrdinalIgnoreCase))
-            {
-                var previousImages = Path.Combine(previousProjectPath, "Images");
-                if (Directory.Exists(previousImages))
-                    CopyImageFolderRecursive(previousImages, Path.Combine(_projectPath, "Images"));
-            }
-
-            ProjectPaths.CurrentFolder = _projectPath;
         }
+
+        if (string.IsNullOrWhiteSpace(targetProjectPath))
+            return false;
 
         try
         {
-            Directory.CreateDirectory(_projectPath!);
-            Directory.CreateDirectory(Path.Combine(_projectPath!, "Images"));
-            ProjectPaths.CurrentFolder = _projectPath;
+            Directory.CreateDirectory(targetProjectPath);
+            Directory.CreateDirectory(Path.Combine(targetProjectPath, "Images"));
 
+            // Copy images before committing the new project identity. If copying or
+            // writing fails, MacroMaker keeps the original project open.
+            if (choosingNewFolder && !string.IsNullOrWhiteSpace(previousProjectPath) &&
+                !Path.GetFullPath(previousProjectPath).Equals(Path.GetFullPath(targetProjectPath), StringComparison.OrdinalIgnoreCase))
+            {
+                var previousImages = Path.Combine(previousProjectPath, "Images");
+                if (Directory.Exists(previousImages))
+                    CopyImageFolderRecursive(previousImages, Path.Combine(targetProjectPath, "Images"));
+            }
+
+            _project.Name = targetProjectName;
             var json = JsonSerializer.Serialize(_project, JsonOptions);
-            File.WriteAllText(Path.Combine(_projectPath!, ProjectFileName), json);
+            AtomicFile.WriteAllText(Path.Combine(targetProjectPath, ProjectFileName), json, keepBackup: true);
+
+            _projectPath = targetProjectPath;
+            ProjectPaths.CurrentFolder = targetProjectPath;
             _dirty = false;
             DeleteUnsavedRecovery();
             UpdateProjectTitle();
-            StatusText.Text = $"Saved: {Path.GetFileName(_projectPath)}";
-            RememberRecentProject(_projectPath!);
+            StatusText.Text = $"Saved: {Path.GetFileName(targetProjectPath)}";
+            RememberRecentProject(targetProjectPath);
             return true;
         }
         catch (Exception ex)
         {
+            _project.Name = previousProjectName;
+            _projectPath = previousProjectPath;
+            ProjectPaths.CurrentFolder = previousProjectPath;
+            UpdateProjectTitle();
             MessageBox.Show(owner, ex.Message, "Could not save project", MessageBoxButton.OK, MessageBoxImage.Error);
             return false;
         }
@@ -662,7 +722,7 @@ public partial class MainWindow : Window
             return;
 
         if (!string.IsNullOrEmpty(_historySnapshot))
-            _undoHistory.Push(_historySnapshot);
+            PushHistory(_undoHistory, _historySnapshot);
 
         _redoHistory.Clear();
         _historySnapshot = current;
@@ -679,7 +739,7 @@ public partial class MainWindow : Window
 
         var current = SerializeProjectSnapshot();
         var previous = _undoHistory.Pop();
-        _redoHistory.Push(current);
+        PushHistory(_redoHistory, current);
         ApplyHistorySnapshot(previous);
         StatusText.Text = "Undo";
     }
@@ -691,7 +751,7 @@ public partial class MainWindow : Window
 
         var current = SerializeProjectSnapshot();
         var next = _redoHistory.Pop();
-        _undoHistory.Push(current);
+        PushHistory(_undoHistory, current);
         ApplyHistorySnapshot(next);
         StatusText.Text = "Redo";
     }
@@ -736,6 +796,18 @@ public partial class MainWindow : Window
         }
     }
 
+    private static void PushHistory(Stack<string> history, string snapshot)
+    {
+        history.Push(snapshot);
+        if (history.Count <= MaxHistoryEntries)
+            return;
+
+        var newest = history.Take(MaxHistoryEntries).Reverse().ToList();
+        history.Clear();
+        foreach (var item in newest)
+            history.Push(item);
+    }
+
     private void UpdateUndoButtons()
     {
         if (UndoButton is not null) UndoButton.IsEnabled = _undoHistory.Count > 0 && _engine?.IsRunning != true;
@@ -754,19 +826,20 @@ public partial class MainWindow : Window
             if (string.IsNullOrWhiteSpace(_projectPath))
             {
                 Directory.CreateDirectory(Path.GetDirectoryName(RecoveryFilePath)!);
-                await File.WriteAllTextAsync(RecoveryFilePath, json);
+                await AtomicFile.WriteAllTextAsync(RecoveryFilePath, json, keepBackup: false);
                 StatusText.Text = "Unsaved work backed up";
                 return;
             }
 
-            await File.WriteAllTextAsync(Path.Combine(_projectPath!, ProjectFileName), json);
+            await AtomicFile.WriteAllTextAsync(Path.Combine(_projectPath!, ProjectFileName), json, keepBackup: true);
             _dirty = false;
             UpdateProjectTitle();
             StatusText.Text = "Auto-saved";
         }
-        catch
+        catch (Exception ex)
         {
-            // Auto-save/recovery should never interrupt editing. Manual Save still reports errors.
+            // Auto-save should not interrupt editing, but it must not fail silently.
+            StatusText.Text = $"Auto-save failed: {ex.Message}";
         }
     }
 
@@ -775,6 +848,22 @@ public partial class MainWindow : Window
         var modifiers = Keyboard.Modifiers;
         var control = (modifiers & ModifierKeys.Control) != 0;
         var shift = (modifiers & ModifierKeys.Shift) != 0;
+
+        // Ctrl+Tab works like a normal tabbed editor and remains available while
+        // focus is inside a property field. F6 cycles the major editor panes.
+        if (control && e.Key == Key.Tab)
+        {
+            SelectRelativeSequence(shift ? -1 : 1);
+            e.Handled = true;
+            return;
+        }
+
+        if (!control && e.Key == Key.F6)
+        {
+            FocusNextMajorPane(shift ? -1 : 1);
+            e.Handled = true;
+            return;
+        }
 
         // Saving should work even while the user is typing in a property field.
         if (control && e.Key == Key.S)
@@ -786,6 +875,22 @@ public partial class MainWindow : Window
 
         if (Keyboard.FocusedElement is TextBox or ComboBox)
             return;
+
+        if (CommandList.IsKeyboardFocusWithin && _selectedRow is { IsCollapsible: true, Command: { } selectedBlock })
+        {
+            if (e.Key == Key.Right && _selectedRow.IsCollapsed)
+            {
+                ToggleCollapsed(selectedBlock);
+                e.Handled = true;
+                return;
+            }
+            if (e.Key == Key.Left && !_selectedRow.IsCollapsed)
+            {
+                ToggleCollapsed(selectedBlock);
+                e.Handled = true;
+                return;
+            }
+        }
 
         if (control && e.Key == Key.Z && !shift)
         {
@@ -899,13 +1004,25 @@ public partial class MainWindow : Window
 
         foreach (var sequence in _project.Sequences)
         {
+            var tabLabel = sequence.Enabled || IsStartingSequence(sequence) ? sequence.Name : $"⏸ {sequence.Name}";
             var button = new Button
             {
-                Content = sequence.Name,
+                Content = new TextBlock
+                {
+                    Text = tabLabel,
+                    MaxWidth = 180,
+                    TextTrimming = TextTrimming.CharacterEllipsis,
+                    VerticalAlignment = VerticalAlignment.Center
+                },
                 Tag = sequence,
                 Margin = new Thickness(0, 0, 7, 0),
                 MinWidth = 125,
+                MaxWidth = 215,
                 Height = 38,
+                Opacity = sequence.Enabled || IsStartingSequence(sequence) ? 1.0 : 0.62,
+                ToolTip = sequence.Enabled || IsStartingSequence(sequence)
+                    ? sequence.Name
+                    : $"{sequence.Name} — disabled and skipped when another tab runs it.",
                 Background = sequence == _currentSequence
                     ? (Brush)FindResource("Panel3Brush")
                     : (Brush)FindResource("Panel2Brush"),
@@ -913,6 +1030,7 @@ public partial class MainWindow : Window
                     ? (Brush)FindResource("AccentBrush")
                     : (Brush)FindResource("BorderBrushDark")
             };
+            AutomationProperties.SetName(button, $"Sequence tab: {sequence.Name}{(sequence.Enabled || IsStartingSequence(sequence) ? string.Empty : ", disabled")}");
 
             button.Click += SequenceTab_Click;
             button.MouseDoubleClick += SequenceTab_MouseDoubleClick;
@@ -920,6 +1038,62 @@ public partial class MainWindow : Window
         }
 
         DeleteTabButton.IsEnabled = _currentSequence is not null && !IsStartingSequence(_currentSequence);
+        if (TabOptionsButton is not null)
+            TabOptionsButton.IsEnabled = _currentSequence is not null;
+    }
+
+    private void TabOptionsButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_currentSequence is null)
+            return;
+
+        var sequence = _currentSequence;
+        var menu = new ContextMenu
+        {
+            PlacementTarget = TabOptionsButton,
+            Placement = PlacementMode.Bottom,
+            StaysOpen = false
+        };
+
+        var duplicate = new MenuItem { Header = "Duplicate Tab" };
+        duplicate.Click += (_, _) => DuplicateCurrentTab();
+        menu.Items.Add(duplicate);
+
+        if (!IsStartingSequence(sequence))
+        {
+            var toggle = new MenuItem { Header = sequence.Enabled ? "Disable Tab" : "Enable Tab" };
+            toggle.Click += (_, _) =>
+            {
+                sequence.Enabled = !sequence.Enabled;
+                MarkDirty();
+                RefreshTabs();
+                StatusText.Text = sequence.Enabled ? $"Enabled tab '{sequence.Name}'" : $"Disabled tab '{sequence.Name}'";
+            };
+            menu.Items.Add(toggle);
+        }
+
+        menu.IsOpen = true;
+    }
+
+    private void DuplicateCurrentTab()
+    {
+        if (_currentSequence is null)
+            return;
+
+        var baseName = _currentSequence.Name + " Copy";
+        var name = baseName;
+        var suffix = 2;
+        while (_project.Sequences.Any(sequence => sequence.Name.Equals(name, StringComparison.OrdinalIgnoreCase)))
+            name = $"{baseName} {suffix++}";
+
+        var clone = _currentSequence.DeepClone(name);
+        // Duplicating Starting Sequence creates a normal tab; only the original
+        // fixed Starting Sequence has special startup behavior.
+        clone.Enabled = true;
+        _project.Sequences.Add(clone);
+        MarkDirty();
+        SelectSequence(clone);
+        StatusText.Text = $"Duplicated tab as '{name}'";
     }
 
     private void AddTabButton_Click(object sender, RoutedEventArgs e)
@@ -956,7 +1130,9 @@ public partial class MainWindow : Window
         foreach (var command in EnumerateAllCommands())
         {
             if (command.Type == CommandType.RunSequence && command.TargetSequence.Equals(name, StringComparison.OrdinalIgnoreCase))
-                command.TargetSequence = "Starting Sequence";
+                command.TargetSequence = string.Empty;
+            if (command.FailureAction == FailureAction.RunSequence && command.FailureSequence.Equals(name, StringComparison.OrdinalIgnoreCase))
+                command.FailureSequence = string.Empty;
         }
 
         MarkDirty();
@@ -994,6 +1170,8 @@ public partial class MainWindow : Window
         {
             if (command.Type == CommandType.RunSequence && command.TargetSequence.Equals(old, StringComparison.OrdinalIgnoreCase))
                 command.TargetSequence = name;
+            if (command.FailureAction == FailureAction.RunSequence && command.FailureSequence.Equals(old, StringComparison.OrdinalIgnoreCase))
+                command.FailureSequence = name;
         }
 
         MarkDirty();
@@ -1175,7 +1353,16 @@ public partial class MainWindow : Window
             return;
 
         _appSettings = dialog.Settings;
-        AppSettingsStore.Save(_appSettings);
+        try
+        {
+            AppSettingsStore.Save(_appSettings);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this,
+                $"The settings are applied for this session, but MacroMaker could not save them to disk.\n\n{ex.Message}",
+                "Could not save settings", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
         if (!_appSettings.AutoSaveProjectChanges)
             _autoSaveTimer.Stop();
         else if (_dirty)
@@ -1253,21 +1440,21 @@ public partial class MainWindow : Window
                 ColorHex = NormalizeColor(m.Groups[3].Value),
                 CompareMode = CompareMode.NotEquals
             };
-            loop.Children.Add(new MacroCommand { Type = CommandType.Click, X = clickX, Y = clickY });
+            loop.Children.Add(new MacroCommand { Type = CommandType.Click, X = clickX, Y = clickY, MoveBeforeClick = true });
             return loop;
         }
 
         m = Regex.Match(text, @"^click(?: at)?\s+(-?\d+)\s*[, ]\s*(-?\d+)$", RegexOptions.IgnoreCase);
         if (m.Success && TryPoint(m, 1, 2, out var cx, out var cy))
-            return new MacroCommand { Type = CommandType.Click, X = cx, Y = cy };
+            return new MacroCommand { Type = CommandType.Click, X = cx, Y = cy, MoveBeforeClick = true };
 
         m = Regex.Match(text, @"^double click(?: at)?\s+(-?\d+)\s*[, ]\s*(-?\d+)$", RegexOptions.IgnoreCase);
         if (m.Success && TryPoint(m, 1, 2, out var dcx, out var dcy))
-            return new MacroCommand { Type = CommandType.DoubleClick, X = dcx, Y = dcy };
+            return new MacroCommand { Type = CommandType.DoubleClick, X = dcx, Y = dcy, MoveBeforeClick = true };
 
         m = Regex.Match(text, @"^right click(?: at)?\s+(-?\d+)\s*[, ]\s*(-?\d+)$", RegexOptions.IgnoreCase);
         if (m.Success && TryPoint(m, 1, 2, out var rcx, out var rcy))
-            return new MacroCommand { Type = CommandType.RightClick, X = rcx, Y = rcy };
+            return new MacroCommand { Type = CommandType.RightClick, X = rcx, Y = rcy, MoveBeforeClick = true };
 
         m = Regex.Match(text, @"^move(?: mouse)?(?: to)?\s+(-?\d+)\s*[, ]\s*(-?\d+)(?:\s+over\s+(\d+)\s*ms)?$", RegexOptions.IgnoreCase);
         if (m.Success && TryPoint(m, 1, 2, out var mx, out var my))
@@ -1377,8 +1564,8 @@ public partial class MainWindow : Window
         if (Regex.IsMatch(text, @"^break$|^break loop$", RegexOptions.IgnoreCase))
             return new MacroCommand { Type = CommandType.Break };
 
-        if (Regex.IsMatch(text, @"^return$", RegexOptions.IgnoreCase))
-            return new MacroCommand { Type = CommandType.Return };
+        if (Regex.IsMatch(text, @"^restart(?: current)? tab$", RegexOptions.IgnoreCase))
+            return new MacroCommand { Type = CommandType.RestartCurrentTab };
 
 
         if (Regex.IsMatch(text, @"^then$|^else$|^[{}]$", RegexOptions.IgnoreCase))
@@ -1443,12 +1630,76 @@ public partial class MainWindow : Window
 
         OpenCommandMenu(sender as FrameworkElement, type =>
         {
+            var tail = parent;
+            while (tail.ElseChildren.Count == 1
+                   && tail.ElseChildren[0].IsElseIf
+                   && tail.ElseChildren[0].HasElse)
+            {
+                tail = tail.ElseChildren[0];
+            }
+
             var command = CreateCommand(type);
-            parent.ElseChildren.Add(command);
+            tail.ElseChildren.Add(command);
             MarkDirty();
             RefreshCommandList(command.Id);
             StatusText.Text = "Added to ELSE";
         });
+    }
+
+    private void AddElseIfButton_Click(object sender, RoutedEventArgs e)
+    {
+        var parent = ResolveIfParent();
+        if (parent is null)
+        {
+            StatusText.Text = "ELSE IF is available on IF commands";
+            return;
+        }
+
+        var menu = new ContextMenu
+        {
+            PlacementTarget = sender as FrameworkElement ?? AddElseIfButton,
+            Placement = PlacementMode.Top,
+            StaysOpen = false
+        };
+
+        var choices = new (string Label, CommandType Type)[]
+        {
+            ("If Color", CommandType.IfColor),
+            ("If Image", CommandType.IfImage),
+            ("If Variable", CommandType.IfVariable),
+            ("If Window", CommandType.IfWindow),
+            ("If Key Pressed", CommandType.IfKeyPressed)
+        };
+
+        foreach (var choice in choices)
+        {
+            var item = new MenuItem { Header = choice.Label, Tag = choice.Type };
+            item.Click += (_, _) =>
+            {
+                var tail = parent;
+                while (tail.ElseChildren.Count == 1
+                       && tail.ElseChildren[0].IsElseIf
+                       && tail.ElseChildren[0].HasElse)
+                {
+                    tail = tail.ElseChildren[0];
+                }
+
+                var previousElse = tail.ElseChildren.ToList();
+                tail.ElseChildren.Clear();
+
+                var branch = CreateCommand(choice.Type);
+                branch.IsElseIf = true;
+                branch.ElseChildren.AddRange(previousElse);
+                tail.ElseChildren.Add(branch);
+
+                MarkDirty();
+                RefreshCommandList(branch.Id);
+                StatusText.Text = "Added ELSE IF";
+            };
+            menu.Items.Add(item);
+        }
+
+        menu.IsOpen = true;
     }
 
     private bool TryResolveBlockTarget(out MacroCommand parent, out List<MacroCommand> target, out string label)
@@ -1515,7 +1766,7 @@ public partial class MainWindow : Window
 
     private void UpdateBlockButtonState()
     {
-        if (AddBlockButton is null || AddElseButton is null)
+        if (AddBlockButton is null || AddElseButton is null || AddElseIfButton is null)
             return;
 
         if (TryResolveBlockTarget(out _, out _, out var label))
@@ -1539,6 +1790,8 @@ public partial class MainWindow : Window
         var ifParent = ResolveIfParent();
         AddElseButton.Visibility = ifParent is null ? Visibility.Collapsed : Visibility.Visible;
         AddElseButton.IsEnabled = ifParent is not null;
+        AddElseIfButton.Visibility = ifParent is null ? Visibility.Collapsed : Visibility.Visible;
+        AddElseIfButton.IsEnabled = ifParent is not null;
     }
 
     private void OpenCommandMenu(FrameworkElement? target, Action<CommandType> onSelected)
@@ -1566,6 +1819,7 @@ public partial class MainWindow : Window
             MouseMoveMode = defaults.MouseMoveMode == MouseMoveMode.Legacy ? MouseMoveMode.Smooth : defaults.MouseMoveMode,
             MoveDurationMs = defaults.MoveDurationMs,
             ClickDelayMs = defaults.ClickDelayMs,
+            MoveBeforeClick = defaults.MoveBeforeClick,
             ScrollAmount = defaults.ScrollAmount,
             DragDurationMs = defaults.DragDurationMs,
             HoldMs = defaults.HoldMs,
@@ -1581,6 +1835,8 @@ public partial class MainWindow : Window
             TimeoutMs = defaults.TimeoutMs,
             ColorHex = defaults.ColorHex,
             ColorTolerance = defaults.ColorTolerance,
+            ColorSearchMode = defaults.ColorSearchMode,
+            ColorSearchRadius = defaults.ColorSearchRadius,
             CompareMode = defaults.CompareMode,
             ImageTolerance = defaults.ImageTolerance,
             ImageIncludeSubfolders = defaults.ImageIncludeSubfolders,
@@ -1607,10 +1863,12 @@ public partial class MainWindow : Window
             FilePath = defaults.FilePath,
             AppendFile = defaults.AppendFile,
             PromptText = defaults.PromptText,
+            PromptOptions = (defaults.PromptOptions ?? new List<string>()).ToList(),
             FailureAction = defaults.FailureAction,
             FailureRetryCount = defaults.FailureRetryCount,
             FailureRetryDelayMs = defaults.FailureRetryDelayMs,
-            RepeatCount = defaults.RepeatCount
+            RepeatCount = defaults.RepeatCount,
+            LoopIntervalMs = defaults.LoopIntervalMs
         };
 
         switch (type)
@@ -1772,6 +2030,27 @@ public partial class MainWindow : Window
         var duplicate = new MenuItem { Header = selected.Count == 1 ? "Duplicate Command" : $"Duplicate {selected.Count} Commands", InputGestureText = "Ctrl+D" };
         duplicate.Click += DuplicateCommandButton_Click;
         menu.Items.Add(duplicate);
+
+        if (selected.Count == 1)
+        {
+            menu.Items.Add(new Separator());
+            var renameDisplay = new MenuItem { Header = "Rename Display Name…" };
+            renameDisplay.Click += (_, _) => RenameSelectedCommandDisplayName();
+            menu.Items.Add(renameDisplay);
+
+            var copyProperties = new MenuItem { Header = "Copy Properties" };
+            copyProperties.Click += (_, _) => CopySelectedProperties();
+            menu.Items.Add(copyProperties);
+
+            var pasteProperties = new MenuItem
+            {
+                Header = "Paste Properties",
+                IsEnabled = _copiedProperties is not null && _copiedProperties.Type == command.Type
+            };
+            pasteProperties.Click += (_, _) => PasteSelectedProperties();
+            menu.Items.Add(pasteProperties);
+        }
+
         menu.Items.Add(new Separator());
 
         var allEnabled = selected.All(row => row.Command!.Enabled);
@@ -1828,7 +2107,13 @@ public partial class MainWindow : Window
             return;
         }
         if (item?.DataContext is CommandRow { IsHeader: false, Command: not null } row)
+        {
             _commandDragStartRow = row;
+            // WPF normally collapses an Extended selection when a selected row is
+            // clicked without Ctrl. Keep the group selected so it can be dragged as one.
+            if (item.IsSelected && CommandList.SelectedItems.Count > 1 && Keyboard.Modifiers == ModifierKeys.None)
+                e.Handled = true;
+        }
     }
 
     private void CommandList_PreviewMouseMove(object sender, MouseEventArgs e)
@@ -1856,6 +2141,7 @@ public partial class MainWindow : Window
 
         var data = new DataObject(CommandDragDataFormat, string.Join(";", rows.Select(row => row.Command!.Id)));
         _commandDragInProgress = true;
+        ShowCommandDragPreview(rows);
         try
         {
             DragDrop.DoDragDrop(CommandList, data, DragDropEffects.Move);
@@ -1864,20 +2150,31 @@ public partial class MainWindow : Window
         {
             _commandDragInProgress = false;
             _commandDragStartRow = null;
+            ClearCommandDragVisuals();
         }
     }
 
     private void CommandList_DragOver(object sender, DragEventArgs e)
     {
+        UpdateCommandDragPreviewPosition(e);
+        AutoScrollCommandList(e);
+
         if (!TryGetDragIds(e.Data, out var ids) || !CanDropCommands(ids, e))
         {
+            RemoveCommandDropIndicator();
             e.Effects = DragDropEffects.None;
             e.Handled = true;
             return;
         }
 
+        UpdateCommandDropIndicator(e);
         e.Effects = DragDropEffects.Move;
         e.Handled = true;
+    }
+
+    private void CommandList_DragLeave(object sender, DragEventArgs e)
+    {
+        RemoveCommandDropIndicator();
     }
 
     private void CommandList_Drop(object sender, DragEventArgs e)
@@ -1906,6 +2203,12 @@ public partial class MainWindow : Window
         {
             targetOwner = _currentSequence.Commands;
         }
+        else if (targetRow.IsHeader && targetRow.Label == "END LOOP" && targetRow.ParentCommand is not null)
+        {
+            targetOwner = targetRow.Owner ?? _currentSequence.Commands;
+            targetCommand = targetRow.ParentCommand;
+            insertAfter = true;
+        }
         else if (targetRow.IsHeader)
         {
             targetOwner = targetRow.Owner ?? _currentSequence.Commands;
@@ -1923,7 +2226,7 @@ public partial class MainWindow : Window
             row.Owner!.Remove(row.Command!);
 
         var insertIndex = targetOwner.Count;
-        if (targetRow?.IsHeader == true)
+        if (targetRow?.IsHeader == true && targetRow.Label != "END LOOP")
         {
             insertIndex = 0;
         }
@@ -1936,10 +2239,182 @@ public partial class MainWindow : Window
         targetOwner.InsertRange(Math.Clamp(insertIndex, 0, targetOwner.Count), commands);
 
         var selectedIds = commands.Select(command => command.Id).ToList();
+        RemoveCommandDropIndicator();
         MarkDirty();
         RefreshCommandList(selectedIds.FirstOrDefault(), selectedIds);
         StatusText.Text = commands.Count == 1 ? "Command moved" : $"{commands.Count} commands moved";
         e.Handled = true;
+    }
+
+    private void ShowCommandDragPreview(IReadOnlyList<CommandRow> rows)
+    {
+        var text = rows.Count == 1
+            ? rows[0].Command?.DisplayText() ?? "Command"
+            : string.Join("\n", rows.Take(4).Select(row => "• " + (row.Command?.DisplayText() ?? "Command")))
+              + (rows.Count > 4 ? $"\n• +{rows.Count - 4} more" : string.Empty);
+
+        _commandDragPreview = new Popup
+        {
+            AllowsTransparency = true,
+            IsHitTestVisible = false,
+            Placement = PlacementMode.AbsolutePoint,
+            StaysOpen = true,
+            Child = new Border
+            {
+                Background = (Brush)FindResource("PanelBrush"),
+                BorderBrush = (Brush)FindResource("AccentBrush"),
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(8),
+                Padding = new Thickness(10, 7, 10, 7),
+                Opacity = 0.96,
+                Child = new StackPanel
+                {
+                    Children =
+                    {
+                        new TextBlock
+                        {
+                            Text = rows.Count == 1 ? "Moving" : $"Moving {rows.Count} commands",
+                            Foreground = (Brush)FindResource("AccentBrush"),
+                            FontWeight = FontWeights.SemiBold,
+                            FontSize = 11
+                        },
+                        new TextBlock
+                        {
+                            Text = text,
+                            Foreground = (Brush)FindResource("TextBrush"),
+                            MaxWidth = 320,
+                            TextWrapping = TextWrapping.Wrap
+                        }
+                    }
+                }
+            }
+        };
+        var screenPoint = CommandList.PointToScreen(Mouse.GetPosition(CommandList));
+        var source = PresentationSource.FromVisual(CommandList);
+        if (source?.CompositionTarget is not null)
+            screenPoint = source.CompositionTarget.TransformFromDevice.Transform(screenPoint);
+        _commandDragPreview.HorizontalOffset = screenPoint.X + 14;
+        _commandDragPreview.VerticalOffset = screenPoint.Y + 14;
+        _commandDragPreview.IsOpen = true;
+    }
+
+    private void UpdateCommandDragPreviewPosition(DragEventArgs e)
+    {
+        if (_commandDragPreview is null || !_commandDragPreview.IsOpen)
+            return;
+
+        var screenPoint = CommandList.PointToScreen(e.GetPosition(CommandList));
+        var source = PresentationSource.FromVisual(CommandList);
+        if (source?.CompositionTarget is not null)
+            screenPoint = source.CompositionTarget.TransformFromDevice.Transform(screenPoint);
+
+        _commandDragPreview.HorizontalOffset = screenPoint.X + 14;
+        _commandDragPreview.VerticalOffset = screenPoint.Y + 14;
+    }
+
+    private void UpdateCommandDropIndicator(DragEventArgs e)
+    {
+        var item = FindVisualParent<ListBoxItem>(e.OriginalSource as DependencyObject);
+        var insertAfter = false;
+
+        if (item is null && CommandList.Items.Count > 0)
+        {
+            item = CommandList.ItemContainerGenerator.ContainerFromIndex(CommandList.Items.Count - 1) as ListBoxItem;
+            insertAfter = true;
+        }
+        else if (item?.DataContext is CommandRow row)
+        {
+            insertAfter = row.IsHeader && row.Label == "END LOOP"
+                || (!row.IsHeader && e.GetPosition(item).Y >= item.ActualHeight / 2);
+        }
+
+        if (item is null)
+        {
+            RemoveCommandDropIndicator();
+            return;
+        }
+
+        if (_commandDropIndicator?.AdornedElement == item && _commandDropIndicator.InsertAfter == insertAfter)
+            return;
+
+        RemoveCommandDropIndicator();
+        var layer = AdornerLayer.GetAdornerLayer(item);
+        if (layer is null)
+            return;
+
+        _commandDropIndicator = new DropIndicatorAdorner(item, insertAfter, (Brush)FindResource("AccentBrush"));
+        layer.Add(_commandDropIndicator);
+    }
+
+    private void RemoveCommandDropIndicator()
+    {
+        if (_commandDropIndicator is null)
+            return;
+
+        AdornerLayer.GetAdornerLayer(_commandDropIndicator.AdornedElement)?.Remove(_commandDropIndicator);
+        _commandDropIndicator = null;
+    }
+
+    private void ClearCommandDragVisuals()
+    {
+        RemoveCommandDropIndicator();
+        if (_commandDragPreview is not null)
+        {
+            _commandDragPreview.IsOpen = false;
+            _commandDragPreview = null;
+        }
+    }
+
+    private void AutoScrollCommandList(DragEventArgs e)
+    {
+        var viewer = FindVisualChild<ScrollViewer>(CommandList);
+        if (viewer is null)
+            return;
+
+        var point = e.GetPosition(CommandList);
+        const double edge = 36;
+        if (point.Y < edge)
+            viewer.LineUp();
+        else if (point.Y > CommandList.ActualHeight - edge)
+            viewer.LineDown();
+    }
+
+    private static T? FindVisualChild<T>(DependencyObject parent) where T : DependencyObject
+    {
+        for (var i = 0; i < VisualTreeHelper.GetChildrenCount(parent); i++)
+        {
+            var child = VisualTreeHelper.GetChild(parent, i);
+            if (child is T match)
+                return match;
+            var nested = FindVisualChild<T>(child);
+            if (nested is not null)
+                return nested;
+        }
+        return null;
+    }
+
+    private sealed class DropIndicatorAdorner : Adorner
+    {
+        private readonly Brush _brush;
+        public bool InsertAfter { get; }
+
+        public DropIndicatorAdorner(UIElement adornedElement, bool insertAfter, Brush brush)
+            : base(adornedElement)
+        {
+            InsertAfter = insertAfter;
+            _brush = brush;
+            IsHitTestVisible = false;
+        }
+
+        protected override void OnRender(DrawingContext drawingContext)
+        {
+            base.OnRender(drawingContext);
+            var width = Math.Max(12, AdornedElement.RenderSize.Width);
+            var y = InsertAfter ? Math.Max(1, AdornedElement.RenderSize.Height - 1) : 1;
+            var pen = new Pen(_brush, 3);
+            drawingContext.DrawLine(pen, new Point(4, y), new Point(width - 4, y));
+            drawingContext.DrawEllipse(_brush, null, new Point(5, y), 4, 4);
+        }
     }
 
     private bool CanDropCommands(HashSet<Guid> ids, DragEventArgs e)
@@ -2312,7 +2787,8 @@ public partial class MainWindow : Window
                 Label = "EMPTY",
                 Owner = _currentSequence.Commands,
                 Depth = 0,
-                Branch = CommandBranch.Root
+                Branch = CommandBranch.Root,
+                CompactLabels = _appSettings.CompactBlockLabels
             });
         }
 
@@ -2356,13 +2832,15 @@ public partial class MainWindow : Window
                 ParentCommand = parentCommand,
                 Depth = depth,
                 Branch = branch,
-                IsCollapsed = isCollapsed
+                IsCollapsed = isCollapsed,
+                CompactLabels = _appSettings.CompactBlockLabels
             });
 
             if (!command.HasBody || command.Type == CommandType.RecordedActions || isCollapsed)
                 continue;
 
             var bodyLabel = command.HasElse ? "THEN" : command.Type == CommandType.Group ? "GROUP" : "DO";
+            var compactLoopBody = _appSettings.CompactBlockLabels && command.IsLoop && !command.HasElse;
             rows.Add(new CommandRow
             {
                 IsHeader = true,
@@ -2370,24 +2848,132 @@ public partial class MainWindow : Window
                 Owner = command.Children,
                 ParentCommand = command,
                 Depth = depth + 1,
-                Branch = CommandBranch.Body
+                Branch = CommandBranch.Body,
+                CompactLabels = _appSettings.CompactBlockLabels
             });
-            FlattenCommands(command.Children, rows, depth + 2, CommandBranch.Body, command);
+            // In compact mode the loop body label is blank, but the row stays as a
+            // drop target so an empty loop can still accept dragged commands.
+            FlattenCommands(command.Children, rows, depth + (compactLoopBody ? 1 : 2), CommandBranch.Body, command);
 
-            if (command.HasElse && command.ElseChildren.Count > 0)
+            if (command.HasElse)
+            {
+                if (command.ElseChildren.Count == 1 && command.ElseChildren[0].IsElseIf)
+                {
+                    FlattenElseIfChain(command.ElseChildren, command, rows, depth + 1);
+                }
+                else
+                {
+                    rows.Add(new CommandRow
+                    {
+                        IsHeader = true,
+                        Label = "ELSE",
+                        Owner = command.ElseChildren,
+                        ParentCommand = command,
+                        Depth = depth + 1,
+                        Branch = CommandBranch.Else,
+                        CompactLabels = _appSettings.CompactBlockLabels
+                    });
+                    FlattenCommands(command.ElseChildren, rows, depth + 2, CommandBranch.Else, command);
+                }
+            }
+
+            if (command.IsLoop)
             {
                 rows.Add(new CommandRow
                 {
                     IsHeader = true,
-                    Label = "ELSE",
-                    Owner = command.ElseChildren,
+                    Label = "END LOOP",
+                    Owner = source,
                     ParentCommand = command,
-                    Depth = depth + 1,
-                    Branch = CommandBranch.Else
+                    Depth = depth,
+                    Branch = branch,
+                    CompactLabels = _appSettings.CompactBlockLabels
                 });
-                FlattenCommands(command.ElseChildren, rows, depth + 2, CommandBranch.Else, command);
             }
         }
+    }
+
+    private void FlattenElseIfChain(List<MacroCommand> owner, MacroCommand outerParent, List<CommandRow> rows, int depth)
+    {
+        if (owner.Count != 1 || !owner[0].IsElseIf)
+        {
+            rows.Add(new CommandRow
+            {
+                IsHeader = true,
+                Label = "ELSE",
+                Owner = owner,
+                ParentCommand = outerParent,
+                Depth = depth,
+                Branch = CommandBranch.Else,
+                CompactLabels = _appSettings.CompactBlockLabels
+            });
+            FlattenCommands(owner, rows, depth + 1, CommandBranch.Else, outerParent);
+            return;
+        }
+
+        var currentOwner = owner;
+        var currentParent = outerParent;
+
+        while (currentOwner.Count == 1 && currentOwner[0].IsElseIf)
+        {
+            var command = currentOwner[0];
+            var isCollapsed = _collapsedBlocks.Contains(command.Id);
+            rows.Add(new CommandRow
+            {
+                Command = command,
+                Owner = currentOwner,
+                ParentCommand = currentParent,
+                Depth = depth,
+                Branch = CommandBranch.Else,
+                IsCollapsed = isCollapsed,
+                CompactLabels = _appSettings.CompactBlockLabels,
+                DisplayOverride = ElseIfDisplay(command)
+            });
+
+            if (isCollapsed)
+                return;
+
+            rows.Add(new CommandRow
+            {
+                IsHeader = true,
+                Label = "THEN",
+                Owner = command.Children,
+                ParentCommand = command,
+                Depth = depth + 1,
+                Branch = CommandBranch.Body,
+                CompactLabels = _appSettings.CompactBlockLabels
+            });
+            FlattenCommands(command.Children, rows, depth + 2, CommandBranch.Body, command);
+
+            if (command.ElseChildren.Count == 1 && command.ElseChildren[0].IsElseIf)
+            {
+                currentOwner = command.ElseChildren;
+                currentParent = command;
+                continue;
+            }
+
+            rows.Add(new CommandRow
+            {
+                IsHeader = true,
+                Label = "ELSE",
+                Owner = command.ElseChildren,
+                ParentCommand = command,
+                Depth = depth,
+                Branch = CommandBranch.Else,
+                CompactLabels = _appSettings.CompactBlockLabels
+            });
+            FlattenCommands(command.ElseChildren, rows, depth + 1, CommandBranch.Else, command);
+            return;
+        }
+    }
+
+    private static string ElseIfDisplay(MacroCommand command)
+    {
+        var display = command.DisplayText();
+        var index = display.IndexOf("If ", StringComparison.OrdinalIgnoreCase);
+        return index >= 0
+            ? display[..index] + "Else if " + display[(index + 3)..]
+            : "Else If — " + display;
     }
 
     // ---------------- PROPERTIES ----------------
@@ -2413,13 +2999,11 @@ public partial class MainWindow : Window
 
             case CommandType.Click:
             case CommandType.RightClick:
-                AddLocationFields(command);
-                AddMouseMovementFields(command);
+                AddClickTargetFields(command);
                 break;
 
             case CommandType.DoubleClick:
-                AddLocationFields(command);
-                AddMouseMovementFields(command);
+                AddClickTargetFields(command);
                 AddNumberField("Delay between clicks (ms)", command.ClickDelayMs, 20, 1000, value => command.ClickDelayMs = value);
                 break;
 
@@ -2513,8 +3097,7 @@ public partial class MainWindow : Window
 
             case CommandType.ClickColor:
             case CommandType.FindColorToVariables:
-                AddColorField(command);
-                AddNumberField("Color tolerance", command.ColorTolerance, 0, 255, value => command.ColorTolerance = value);
+                AddColorTargetsFields(command);
                 AddSearchAreaFields(command);
                 if (command.Type == CommandType.ClickColor)
                     AddMouseMovementFields(command);
@@ -2580,8 +3163,8 @@ public partial class MainWindow : Window
                 break;
 
             case CommandType.SetVariable:
-                AddVariableNameField("Save as", command.VariableName, value => command.VariableName = value);
-                AddValueOrVariableField("Value", command.VariableValue, value => command.VariableValue = value);
+                AddVariableNameField("Variable name", command.VariableName, value => command.VariableName = value);
+                AddValueOrVariableField("Set value to", command.VariableValue, value => command.VariableValue = value);
                 break;
 
             case CommandType.AddVariable:
@@ -2628,6 +3211,12 @@ public partial class MainWindow : Window
                 AddTextField("Default answer", command.VariableValue, value => command.VariableValue = value);
                 break;
 
+            case CommandType.PromptSelect:
+                AddTextField("Question", command.PromptText, value => command.PromptText = value, true);
+                AddVariableNameField("Save selected option as", command.VariableName, value => command.VariableName = value);
+                AddPromptOptionsFields(command);
+                break;
+
             case CommandType.PromptYesNo:
                 AddTextField("Question", command.PromptText, value => command.PromptText = value, true);
                 AddVariableNameField("Save answer as", command.VariableName, value => command.VariableName = value);
@@ -2648,15 +3237,27 @@ public partial class MainWindow : Window
                 break;
 
             case CommandType.LoopForever:
+                AddNumberField("Loop interval (ms)", command.LoopIntervalMs, 0, 60000, value => command.LoopIntervalMs = value);
                 AddBlockInfo(command);
-                AddInfo($"Use Break Loop inside this block, or {_appSettings.StopMacroHotkey} at any time, to stop it.");
+                if (!_appSettings.CompactBlockLabels)
+                    AddInfo($"Use Break Loop inside this block, or {_appSettings.StopMacroHotkey} at any time, to stop it.");
                 break;
 
             case CommandType.Break:
             case CommandType.Return:
+            case CommandType.RestartCurrentTab:
             case CommandType.StopMacro:
                 break;
         }
+
+            if (command.Type is CommandType.IfKeyPressed
+                or CommandType.IfColor
+                or CommandType.IfImage
+                or CommandType.IfWindow
+                or CommandType.IfVariable)
+            {
+                AddConditionCooldownField(command);
+            }
 
             AddMoreOptions(command);
         }
@@ -2853,23 +3454,412 @@ public partial class MainWindow : Window
         }
     }
 
+    private void AddClickTargetFields(MacroCommand command)
+    {
+        AddLabel("Click at");
+        var combo = new ComboBox { Margin = new Thickness(0, 0, 0, 12) };
+        var currentMouse = new ComboBoxItem { Content = "Current mouse position", Tag = false };
+        var moveFirst = new ComboBoxItem { Content = "Move to a location first", Tag = true };
+        combo.Items.Add(currentMouse);
+        combo.Items.Add(moveFirst);
+
+        var shouldMove = command.MoveBeforeClick ?? true;
+        combo.SelectedItem = shouldMove ? moveFirst : currentMouse;
+        combo.SelectionChanged += (_, _) =>
+        {
+            if (combo.SelectedItem is not ComboBoxItem { Tag: bool next } || next == (command.MoveBeforeClick ?? true))
+                return;
+
+            command.MoveBeforeClick = next;
+            MarkDirty();
+            BuildProperties(command);
+            RefreshCommandList(command.Id);
+        };
+        PropertiesPanel.Children.Add(combo);
+
+        if (shouldMove)
+        {
+            AddLocationFields(command, "Move to");
+            AddMouseMovementFields(command);
+        }
+    }
+
     private void AddColorConditionFields(MacroCommand command)
     {
         AddComparePicker(command);
-        AddColorField(command);
-        AddLocationFields(command);
-        AddNumberField("Color tolerance", command.ColorTolerance, 0, 255, value => command.ColorTolerance = value);
+        AddColorTargetsFields(command);
+        AddColorConditionSearchFields(command);
 
-        var test = new Button { Content = "Test Pixel Now", Margin = new Thickness(0, 0, 0, 12) };
+        var test = new Button { Content = "Test Color Search Now", Margin = new Thickness(0, 0, 0, 12) };
         test.Click += (_, _) =>
         {
-            var current = ScreenTools.GetPixelHex(command.X, command.Y);
-            var match = ScreenTools.ColorMatches(command.X, command.Y, command.ColorHex, command.ColorTolerance);
-            MessageBox.Show(this,
-                $"Current color: {current}\nTarget: {command.ColorHex}\nWithin tolerance: {(match ? "YES" : "NO")}",
-                "Pixel Test", MessageBoxButton.OK, MessageBoxImage.Information);
+            try
+            {
+                var values = new RuntimeValues(_project);
+                var resolved = values.ResolveNumericExpressions(command);
+                var targets = EditorColorTargets(resolved, values).ToList();
+                var regions = ResolveEditorColorConditionRegions(resolved, values);
+                var matches = regions.Select(region => ScreenTools.FindColorInRegion(region.Region, targets)).ToList();
+                var useAll = resolved.ColorLocationGroupMode == LocationGroupMode.All && regions.Count > 1;
+                var perLocationConditions = resolved.CompareMode == CompareMode.Equals
+                    ? matches.Select(match => match.HasValue).ToList()
+                    : matches.Select(match => !match.HasValue).ToList();
+                var conditionPasses = useAll
+                    ? perLocationConditions.All(value => value)
+                    : perLocationConditions.Any(value => value);
+                var found = matches.FirstOrDefault(match => match.HasValue);
+                var join = useAll ? "AND" : "OR";
+                var details = found.HasValue
+                    ? $"Found {found.Value.Hex} at {found.Value.X}, {found.Value.Y}"
+                    : $"No target color found in the selected location{(regions.Count == 1 ? string.Empty : "s")}";
+                MessageBox.Show(this,
+                    $"{details}\nLocations: {regions.Count} ({join})\nCondition passes: {(conditionPasses ? "YES" : "NO")}",
+                    "Color Search Test", MessageBoxButton.OK, MessageBoxImage.Information);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, ex.Message, "Color Search Test", MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
         };
         PropertiesPanel.Children.Add(test);
+    }
+
+    private void AddColorConditionSearchFields(MacroCommand command)
+    {
+        command.ColorSearchTargets ??= new List<ColorSearchTarget>();
+
+        AddLabel("Search");
+        var combo = new ComboBox { Margin = new Thickness(0, 0, 0, 12) };
+        combo.Items.Add(new ComboBoxItem { Content = "Pixel", Tag = ColorConditionSearchMode.Pixel });
+        combo.Items.Add(new ComboBoxItem { Content = "Search Area", Tag = ColorConditionSearchMode.SearchArea });
+        combo.Items.Add(new ComboBoxItem { Content = "Full Screen", Tag = ColorConditionSearchMode.FullScreen });
+
+        var current = command.ColorSearchMode ?? ColorConditionSearchMode.Pixel;
+        combo.SelectedItem = combo.Items.Cast<ComboBoxItem>()
+            .FirstOrDefault(item => item.Tag is ColorConditionSearchMode mode && mode == current);
+        combo.SelectionChanged += (_, _) =>
+        {
+            if (combo.SelectedItem is not ComboBoxItem { Tag: ColorConditionSearchMode mode } || mode == (command.ColorSearchMode ?? ColorConditionSearchMode.Pixel))
+                return;
+
+            command.ColorSearchMode = mode;
+            command.ColorSearchRadius = 0;
+            if (mode == ColorConditionSearchMode.SearchArea && (command.SearchWidth <= 0 || command.SearchHeight <= 0))
+            {
+                command.SearchX = command.X;
+                command.SearchY = command.Y;
+                command.SearchWidth = 1;
+                command.SearchHeight = 1;
+            }
+            MarkDirty();
+            BuildProperties(command);
+            RefreshCommandList(command.Id);
+        };
+        PropertiesPanel.Children.Add(combo);
+
+        if (current == ColorConditionSearchMode.FullScreen)
+        {
+            PropertiesPanel.Children.Add(new TextBlock
+            {
+                Text = "Searches the entire screen.",
+                Foreground = (Brush)FindResource("MutedTextBrush"),
+                Margin = new Thickness(0, 0, 0, 10)
+            });
+            return;
+        }
+
+        AddLabel(current == ColorConditionSearchMode.Pixel ? "Match locations" : "Match search areas");
+        var groupMode = new ComboBox
+        {
+            ItemsSource = new[] { "Any / OR", "All / AND" },
+            SelectedIndex = command.ColorLocationGroupMode == LocationGroupMode.All ? 1 : 0,
+            Margin = new Thickness(0, 0, 0, 12)
+        };
+        groupMode.SelectionChanged += (_, _) =>
+        {
+            var next = groupMode.SelectedIndex == 1 ? LocationGroupMode.All : LocationGroupMode.Any;
+            if (next == command.ColorLocationGroupMode)
+                return;
+            command.ColorLocationGroupMode = next;
+            MarkDirty();
+            BuildProperties(command);
+            RefreshCommandList(command.Id);
+        };
+        PropertiesPanel.Children.Add(groupMode);
+
+        if (current == ColorConditionSearchMode.Pixel)
+            AddLocationFields(command, "Location 1");
+        else
+            AddSearchAreaFields(command, allowFullScreen: false, label: "Search area 1");
+
+        for (var i = 0; i < command.ColorSearchTargets.Count; i++)
+            PropertiesPanel.Children.Add(CreateExtraColorSearchTargetCard(command, command.ColorSearchTargets[i], i + 2, current));
+
+        var joinWord = command.ColorLocationGroupMode == LocationGroupMode.All ? "AND" : "OR";
+        var add = new Button
+        {
+            Content = current == ColorConditionSearchMode.Pixel ? $"+ Add {joinWord} Location" : $"+ Add {joinWord} Search Area",
+            Margin = new Thickness(0, 0, 0, 12)
+        };
+        add.Click += (_, _) =>
+        {
+            var extra = new ColorSearchTarget();
+            if (current == ColorConditionSearchMode.Pixel)
+            {
+                extra.X = command.X;
+                extra.Y = command.Y;
+            }
+            else
+            {
+                extra.SearchX = command.SearchX;
+                extra.SearchY = command.SearchY;
+                extra.SearchWidth = Math.Max(1, command.SearchWidth);
+                extra.SearchHeight = Math.Max(1, command.SearchHeight);
+            }
+            command.ColorSearchTargets.Add(extra);
+            MarkDirty();
+            BuildProperties(command);
+            RefreshCommandList(command.Id);
+        };
+        PropertiesPanel.Children.Add(add);
+    }
+
+    private Border CreateExtraColorSearchTargetCard(
+        MacroCommand command,
+        ColorSearchTarget target,
+        int number,
+        ColorConditionSearchMode mode)
+    {
+        var panel = new StackPanel();
+        var header = new DockPanel { LastChildFill = true, Margin = new Thickness(0, 0, 0, 8) };
+        var joinWord = command.ColorLocationGroupMode == LocationGroupMode.All ? "AND" : "OR";
+        header.Children.Add(new TextBlock
+        {
+            Text = $"{joinWord} {(mode == ColorConditionSearchMode.Pixel ? "Location" : "Search area")} {number}",
+            FontWeight = FontWeights.SemiBold,
+            Foreground = (Brush)FindResource("AccentBrush"),
+            VerticalAlignment = VerticalAlignment.Center
+        });
+
+        var remove = new Button
+        {
+            Content = "Remove",
+            MinWidth = 70,
+            Padding = new Thickness(8, 3, 8, 3),
+            Margin = new Thickness(8, 0, 0, 0),
+            HorizontalAlignment = HorizontalAlignment.Right
+        };
+        DockPanel.SetDock(remove, Dock.Right);
+        header.Children.Insert(0, remove);
+        remove.Click += (_, _) =>
+        {
+            command.ColorSearchTargets.Remove(target);
+            MarkDirty();
+            BuildProperties(command);
+            RefreshCommandList(command.Id);
+        };
+        panel.Children.Add(header);
+
+        if (mode == ColorConditionSearchMode.Pixel)
+        {
+            panel.Children.Add(CreateExtraTargetNumberRow("X", target.X, target.XExpression,
+                value => target.X = value, value => target.XExpression = value, command.Id));
+            panel.Children.Add(CreateExtraTargetNumberRow("Y", target.Y, target.YExpression,
+                value => target.Y = value, value => target.YExpression = value, command.Id));
+
+            var pick = new Button { Content = "Pick Location", Margin = new Thickness(0, 0, 0, 4) };
+            pick.Click += (_, _) =>
+            {
+                var picker = new PointPickerWindow(false);
+                Hide();
+                try
+                {
+                    if (picker.ShowDialog() == true)
+                    {
+                        target.X = picker.PickedX;
+                        target.Y = picker.PickedY;
+                        target.XExpression = string.Empty;
+                        target.YExpression = string.Empty;
+                        MarkDirty();
+                    }
+                }
+                finally
+                {
+                    Show();
+                    Activate();
+                }
+                BuildProperties(command);
+                RefreshCommandList(command.Id);
+            };
+            panel.Children.Add(pick);
+        }
+        else
+        {
+            panel.Children.Add(CreateExtraTargetNumberRow("X", target.SearchX, target.SearchXExpression,
+                value => target.SearchX = value, value => target.SearchXExpression = value, command.Id));
+            panel.Children.Add(CreateExtraTargetNumberRow("Y", target.SearchY, target.SearchYExpression,
+                value => target.SearchY = value, value => target.SearchYExpression = value, command.Id));
+            panel.Children.Add(CreateExtraTargetNumberRow("Width", target.SearchWidth, target.SearchWidthExpression,
+                value => target.SearchWidth = Math.Max(1, value), value => target.SearchWidthExpression = value, command.Id));
+            panel.Children.Add(CreateExtraTargetNumberRow("Height", target.SearchHeight, target.SearchHeightExpression,
+                value => target.SearchHeight = Math.Max(1, value), value => target.SearchHeightExpression = value, command.Id));
+
+            var pick = new Button { Content = "Set Search Area", Margin = new Thickness(0, 0, 0, 4) };
+            pick.Click += (_, _) =>
+            {
+                var picker = new RegionPickerWindow();
+                Hide();
+                try
+                {
+                    if (picker.ShowDialog() == true)
+                    {
+                        target.SearchX = picker.Region.X;
+                        target.SearchY = picker.Region.Y;
+                        target.SearchWidth = picker.Region.Width;
+                        target.SearchHeight = picker.Region.Height;
+                        target.SearchXExpression = string.Empty;
+                        target.SearchYExpression = string.Empty;
+                        target.SearchWidthExpression = string.Empty;
+                        target.SearchHeightExpression = string.Empty;
+                        MarkDirty();
+                    }
+                }
+                finally
+                {
+                    Show();
+                    WindowState = System.Windows.WindowState.Normal;
+                    Activate();
+                }
+                BuildProperties(command);
+                RefreshCommandList(command.Id);
+            };
+            panel.Children.Add(pick);
+        }
+
+        return new Border
+        {
+            Background = (Brush)FindResource("Panel2Brush"),
+            BorderBrush = (Brush)FindResource("AccentBrush"),
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(9),
+            Padding = new Thickness(10),
+            Margin = new Thickness(0, 0, 0, 8),
+            Child = panel
+        };
+    }
+
+    private FrameworkElement CreateExtraTargetNumberRow(
+        string label,
+        int fallback,
+        string expression,
+        Action<int> setFallback,
+        Action<string> setExpression,
+        Guid commandId)
+    {
+        var stack = new StackPanel { Margin = new Thickness(0, 0, 0, 7) };
+        stack.Children.Add(new TextBlock
+        {
+            Text = label,
+            FontWeight = FontWeights.SemiBold,
+            Margin = new Thickness(0, 0, 0, 4)
+        });
+
+        var box = new TextBox
+        {
+            Text = string.IsNullOrWhiteSpace(expression) ? fallback.ToString() : expression,
+            ToolTip = "Type a number, saved variable, or formula"
+        };
+        box.TextChanged += (_, _) =>
+        {
+            var raw = box.Text.Trim();
+            if (int.TryParse(raw, out var value))
+            {
+                setFallback(value);
+                setExpression(string.Empty);
+            }
+            else
+            {
+                setExpression(raw);
+            }
+            MarkDirtyAndRefreshCommandDisplay(commandId);
+        };
+        stack.Children.Add(CreateVariableInputRow(box, fallback.ToString()));
+        return stack;
+    }
+
+    private static List<(ScreenRegion Region, string Description)> ResolveEditorColorConditionRegions(MacroCommand command, RuntimeValues values)
+    {
+        var result = new List<(ScreenRegion, string)>();
+
+        if (command.ColorSearchMode is null && command.ColorSearchRadius > 0)
+        {
+            var center = CoordinateResolver.ResolvePoint(command, values);
+            var radius = Math.Clamp(command.ColorSearchRadius, 0, 5000);
+            result.Add((new ScreenRegion(center.X - radius, center.Y - radius, radius * 2 + 1, radius * 2 + 1),
+                $"within {radius}px of {center.X}, {center.Y}"));
+            return result;
+        }
+
+        var mode = command.ColorSearchMode ?? ColorConditionSearchMode.Pixel;
+        if (mode == ColorConditionSearchMode.FullScreen)
+        {
+            result.Add((ScreenTools.VirtualScreenRegion(), "full screen"));
+            return result;
+        }
+
+        if (mode == ColorConditionSearchMode.SearchArea)
+        {
+            var primary = ResolveEditorSearchArea(command, values);
+            result.Add((primary, $"area {primary.X}, {primary.Y}, {primary.Width}×{primary.Height}"));
+            foreach (var target in command.ColorSearchTargets ?? new List<ColorSearchTarget>())
+            {
+                var x = values.ResolveInt(target.SearchXExpression, target.SearchX);
+                var y = values.ResolveInt(target.SearchYExpression, target.SearchY);
+                var width = Math.Max(1, values.ResolveInt(target.SearchWidthExpression, target.SearchWidth));
+                var height = Math.Max(1, values.ResolveInt(target.SearchHeightExpression, target.SearchHeight));
+                var point = ResolveEditorCoordinatePair(x, y, command.CoordinateMode);
+                result.Add((new ScreenRegion(point.X, point.Y, width, height),
+                    $"area {point.X}, {point.Y}, {width}×{height}"));
+            }
+        }
+        else
+        {
+            var primary = ResolveEditorPixel(command, values);
+            result.Add((primary, $"pixel {primary.X}, {primary.Y}"));
+            foreach (var target in command.ColorSearchTargets ?? new List<ColorSearchTarget>())
+            {
+                var x = values.ResolveInt(target.XExpression, target.X);
+                var y = values.ResolveInt(target.YExpression, target.Y);
+                var point = ResolveEditorCoordinatePair(x, y, command.CoordinateMode);
+                result.Add((new ScreenRegion(point.X, point.Y, 1, 1), $"pixel {point.X}, {point.Y}"));
+            }
+        }
+
+        return result;
+    }
+
+    private static (int X, int Y) ResolveEditorCoordinatePair(int x, int y, CoordinateMode mode)
+    {
+        return mode switch
+        {
+            CoordinateMode.ActiveWindow when WindowTools.TryGetForegroundRect(out var region) => (region.X + x, region.Y + y),
+            CoordinateMode.RelativeToMouse when NativeMethods.GetCursorPos(out var mouse) => (mouse.X + x, mouse.Y + y),
+            _ => (x, y)
+        };
+    }
+
+    private static ScreenRegion ResolveEditorPixel(MacroCommand command, RuntimeValues values)
+    {
+        var point = CoordinateResolver.ResolvePoint(command, values);
+        return new ScreenRegion(point.X, point.Y, 1, 1);
+    }
+
+    private static ScreenRegion ResolveEditorSearchArea(MacroCommand command, RuntimeValues values)
+    {
+        var search = CoordinateResolver.ResolveImageSearch(command, values);
+        if (search.SearchWidth <= 0 || search.SearchHeight <= 0)
+            return new ScreenRegion(search.SearchX, search.SearchY, 1, 1);
+        return new ScreenRegion(search.SearchX, search.SearchY, search.SearchWidth, search.SearchHeight);
     }
 
     private void AddComparePicker(MacroCommand command)
@@ -2890,18 +3880,93 @@ public partial class MainWindow : Window
         PropertiesPanel.Children.Add(combo);
     }
 
-    private void AddColorField(MacroCommand command)
+    private void AddColorTargetsFields(MacroCommand command)
     {
-        AddLabel("Target color");
-        var row = new Grid { Margin = new Thickness(0, 0, 0, 12) };
-        row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        command.ColorAlternatives ??= new List<ColorMatchOption>();
+        AddLabel(command.ColorAlternatives.Count == 0 ? "Color" : "Colors");
+        PropertiesPanel.Children.Add(CreateColorTargetCard(command, null));
+
+        for (var i = 0; i < command.ColorAlternatives.Count; i++)
+        {
+            var option = command.ColorAlternatives[i];
+            PropertiesPanel.Children.Add(CreateColorTargetCard(command, option));
+        }
+
+        var add = new Button
+        {
+            Content = "+ Add OR Color",
+            Margin = new Thickness(0, 0, 0, 12),
+            HorizontalAlignment = HorizontalAlignment.Stretch
+        };
+        add.Click += (_, _) =>
+        {
+            command.ColorAlternatives.Add(new ColorMatchOption());
+            MarkDirty();
+            BuildProperties(command);
+            RefreshCommandList(command.Id);
+        };
+        PropertiesPanel.Children.Add(add);
+    }
+
+    private Border CreateColorTargetCard(MacroCommand command, ColorMatchOption? option)
+    {
+        var isPrimary = option is null;
+        var panel = new StackPanel();
+        var header = new DockPanel { LastChildFill = true, Margin = new Thickness(0, 0, 0, 8) };
+        header.Children.Add(new TextBlock
+        {
+            Text = isPrimary ? "Target color" : "OR",
+            FontWeight = FontWeights.SemiBold,
+            Foreground = isPrimary ? (Brush)FindResource("TextBrush") : (Brush)FindResource("AccentBrush"),
+            VerticalAlignment = VerticalAlignment.Center
+        });
+
+        if (!isPrimary)
+        {
+            var remove = new Button
+            {
+                Content = "Remove",
+                MinWidth = 70,
+                Padding = new Thickness(8, 3, 8, 3),
+                Margin = new Thickness(8, 0, 0, 0),
+                HorizontalAlignment = HorizontalAlignment.Right
+            };
+            DockPanel.SetDock(remove, Dock.Right);
+            header.Children.Insert(0, remove);
+            remove.Click += (_, _) =>
+            {
+                if (option is null)
+                    return;
+                command.ColorAlternatives.Remove(option);
+                MarkDirty();
+                BuildProperties(command);
+                RefreshCommandList(command.Id);
+            };
+        }
+        panel.Children.Add(header);
+
+        var colorRow = new Grid { Margin = new Thickness(0, 0, 0, 8) };
+        colorRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        colorRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        colorRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        colorRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+        var colorText = isPrimary ? command.ColorHex : option!.ColorHex;
+        var swatch = new Border
+        {
+            Width = 30,
+            Height = 30,
+            CornerRadius = new CornerRadius(6),
+            BorderBrush = (Brush)FindResource("BorderBrushSoft"),
+            BorderThickness = new Thickness(1),
+            Margin = new Thickness(0, 0, 7, 0)
+        };
+        UpdateColorSwatch(swatch, colorText);
 
         var box = new TextBox
         {
-            Text = command.ColorHex,
-            ToolTip = "Type a color like #FF8800 or choose a saved variable"
+            Text = colorText,
+            ToolTip = "Type a color or choose a saved variable"
         };
         box.TextChanged += (_, _) =>
         {
@@ -2909,9 +3974,10 @@ public partial class MainWindow : Window
             if (string.IsNullOrWhiteSpace(text))
                 return;
 
-            command.ColorHex = Regex.IsMatch(text, @"^(?:0x|#)?[0-9A-Fa-f]{6}$")
-                ? NormalizeColor(text)
-                : text;
+            var stored = Regex.IsMatch(text, @"^(?:0x|#)?[0-9A-Fa-f]{6}$") ? NormalizeColor(text) : text;
+            if (isPrimary) command.ColorHex = stored;
+            else option!.ColorHex = stored;
+            UpdateColorSwatch(swatch, stored);
             MarkDirtyAndRefreshCommandDisplay(command.Id);
         };
         box.LostFocus += (_, _) =>
@@ -2922,7 +3988,7 @@ public partial class MainWindow : Window
         };
 
         var variablePicker = CreateVariablePicker(box);
-        var pick = new Button { Content = "Pick Color + Location", MinWidth = 95, Margin = new Thickness(7, 0, 0, 0) };
+        var pick = new Button { Content = "Pick Color", MinWidth = 82, Margin = new Thickness(7, 0, 0, 0) };
         pick.Click += (_, _) =>
         {
             var picker = new PointPickerWindow(true);
@@ -2931,11 +3997,8 @@ public partial class MainWindow : Window
             {
                 if (picker.ShowDialog() == true)
                 {
-                    command.X = picker.PickedX;
-                    command.Y = picker.PickedY;
-                    command.XExpression = string.Empty;
-                    command.YExpression = string.Empty;
-                    command.ColorHex = picker.PickedColor;
+                    if (isPrimary) command.ColorHex = picker.PickedColor;
+                    else option!.ColorHex = picker.PickedColor;
                     MarkDirty();
                 }
             }
@@ -2948,13 +4011,118 @@ public partial class MainWindow : Window
             RefreshCommandList(command.Id);
         };
 
-        Grid.SetColumn(box, 0);
-        Grid.SetColumn(variablePicker, 1);
-        Grid.SetColumn(pick, 2);
-        row.Children.Add(box);
-        row.Children.Add(variablePicker);
-        row.Children.Add(pick);
-        PropertiesPanel.Children.Add(row);
+        Grid.SetColumn(swatch, 0);
+        Grid.SetColumn(box, 1);
+        Grid.SetColumn(variablePicker, 2);
+        Grid.SetColumn(pick, 3);
+        colorRow.Children.Add(swatch);
+        colorRow.Children.Add(box);
+        colorRow.Children.Add(variablePicker);
+        colorRow.Children.Add(pick);
+        panel.Children.Add(colorRow);
+
+        var toleranceGrid = new Grid();
+        toleranceGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        toleranceGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        toleranceGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        toleranceGrid.Children.Add(new TextBlock
+        {
+            Text = "Tolerance",
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(0, 0, 8, 0),
+            Foreground = (Brush)FindResource("MutedTextBrush")
+        });
+
+        string toleranceExpression;
+        int toleranceFallback;
+        if (isPrimary)
+        {
+            toleranceFallback = command.ColorTolerance;
+            toleranceExpression = command.ValueExpressions is not null
+                && command.ValueExpressions.TryGetValue(nameof(MacroCommand.ColorTolerance), out var saved)
+                ? saved
+                : string.Empty;
+        }
+        else
+        {
+            toleranceFallback = option!.Tolerance;
+            toleranceExpression = option.ToleranceExpression;
+        }
+
+        var toleranceBox = new TextBox
+        {
+            Text = string.IsNullOrWhiteSpace(toleranceExpression) ? toleranceFallback.ToString() : toleranceExpression,
+            ToolTip = "0-255, or use a saved variable/formula"
+        };
+        toleranceBox.TextChanged += (_, _) =>
+        {
+            var text = toleranceBox.Text.Trim();
+            if (int.TryParse(text, out var value))
+            {
+                value = Math.Clamp(value, 0, 255);
+                if (isPrimary)
+                {
+                    command.ColorTolerance = value;
+                    command.ValueExpressions?.Remove(nameof(MacroCommand.ColorTolerance));
+                }
+                else
+                {
+                    option!.Tolerance = value;
+                    option.ToleranceExpression = string.Empty;
+                }
+            }
+            else if (isPrimary)
+            {
+                command.ValueExpressions ??= new Dictionary<string, string>();
+                if (string.IsNullOrWhiteSpace(text)) command.ValueExpressions.Remove(nameof(MacroCommand.ColorTolerance));
+                else command.ValueExpressions[nameof(MacroCommand.ColorTolerance)] = text;
+            }
+            else
+            {
+                option!.ToleranceExpression = text;
+            }
+            MarkDirtyAndRefreshCommandDisplay(command.Id);
+        };
+
+        var toleranceVariable = CreateVariablePicker(toleranceBox, toleranceFallback.ToString());
+        Grid.SetColumn(toleranceBox, 1);
+        Grid.SetColumn(toleranceVariable, 2);
+        toleranceGrid.Children.Add(toleranceBox);
+        toleranceGrid.Children.Add(toleranceVariable);
+        panel.Children.Add(toleranceGrid);
+
+        return new Border
+        {
+            Background = (Brush)FindResource("Panel2Brush"),
+            BorderBrush = isPrimary ? (Brush)FindResource("BorderBrushSoft") : (Brush)FindResource("AccentBrush"),
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(9),
+            Padding = new Thickness(10),
+            Margin = new Thickness(0, 0, 0, 8),
+            Child = panel
+        };
+    }
+
+    private static IEnumerable<(string Hex, int Tolerance)> EditorColorTargets(MacroCommand command, RuntimeValues? values = null)
+    {
+        var primaryColor = values?.ResolveText(command.ColorHex) ?? command.ColorHex;
+        yield return (primaryColor, Math.Clamp(command.ColorTolerance, 0, 255));
+        foreach (var option in command.ColorAlternatives ?? new List<ColorMatchOption>())
+        {
+            var color = values?.ResolveText(option.ColorHex) ?? option.ColorHex;
+            var tolerance = values is not null
+                ? values.ResolveInt(option.ToleranceExpression, option.Tolerance)
+                : int.TryParse(option.ToleranceExpression, out var parsed) ? parsed : option.Tolerance;
+            yield return (color, Math.Clamp(tolerance, 0, 255));
+        }
+    }
+
+    private static void UpdateColorSwatch(Border swatch, string value)
+    {
+        if (ScreenTools.TryParseColor(value, out var r, out var g, out var b))
+            swatch.Background = new SolidColorBrush(Color.FromRgb((byte)r, (byte)g, (byte)b));
+        else
+            swatch.Background = Brushes.Transparent;
     }
 
     private void AddLocationFields(MacroCommand command, string label = "Location")
@@ -3131,11 +4299,11 @@ public partial class MainWindow : Window
         PropertiesPanel.Children.Add(set);
     }
 
-    private void AddSearchAreaFields(MacroCommand command)
+    private void AddSearchAreaFields(MacroCommand command, bool allowFullScreen = true, string label = "Search area")
     {
-        AddLabel("Search area");
+        AddLabel(label);
         var regionText = command.SearchWidth <= 0 || command.SearchHeight <= 0
-            ? "Full screen"
+            ? (allowFullScreen ? "Full screen" : "No area selected")
             : $"X {command.SearchX}, Y {command.SearchY}, W {command.SearchWidth}, H {command.SearchHeight}";
         PropertiesPanel.Children.Add(new TextBlock
         {
@@ -3145,10 +4313,19 @@ public partial class MainWindow : Window
             Foreground = (Brush)FindResource("TextBrush")
         });
 
+        if (!allowFullScreen || (command.SearchWidth > 0 && command.SearchHeight > 0))
+        {
+            AddNumberField("Search X", command.SearchX, -100000, 100000, value => command.SearchX = value);
+            AddNumberField("Search Y", command.SearchY, -100000, 100000, value => command.SearchY = value);
+            AddNumberField("Search width", command.SearchWidth, 1, 100000, value => command.SearchWidth = value);
+            AddNumberField("Search height", command.SearchHeight, 1, 100000, value => command.SearchHeight = value);
+        }
+
         var buttons = new Grid { Margin = new Thickness(0, 0, 0, 10) };
         buttons.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        buttons.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        var setRegion = new Button { Content = "Set Search Area", Margin = new Thickness(0, 0, 4, 0) };
+        if (allowFullScreen)
+            buttons.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        var setRegion = new Button { Content = "Set Search Area", Margin = allowFullScreen ? new Thickness(0, 0, 4, 0) : new Thickness(0) };
         var fullRegion = new Button { Content = "Use Full Screen", Margin = new Thickness(4, 0, 0, 0) };
         setRegion.Click += (_, _) =>
         {
@@ -3181,8 +4358,13 @@ public partial class MainWindow : Window
             BuildProperties(command);
             RefreshCommandList(command.Id);
         };
-        Grid.SetColumn(setRegion, 0); Grid.SetColumn(fullRegion, 1);
-        buttons.Children.Add(setRegion); buttons.Children.Add(fullRegion);
+        Grid.SetColumn(setRegion, 0);
+        buttons.Children.Add(setRegion);
+        if (allowFullScreen)
+        {
+            Grid.SetColumn(fullRegion, 1);
+            buttons.Children.Add(fullRegion);
+        }
         PropertiesPanel.Children.Add(buttons);
         AddCoordinateModeFields(command);
     }
@@ -3195,9 +4377,25 @@ public partial class MainWindow : Window
             Hide();
             await Task.Delay(120);
             (int X, int Y)? point = null;
+            Exception? error = null;
             try
             {
-                point = await ColorFinder.FindAsync(command, CancellationToken.None);
+                var values = new RuntimeValues(_project);
+                var resolved = values.ResolveNumericExpressions(command);
+                var search = CoordinateResolver.ResolveImageSearch(resolved, values);
+                search.ColorHex = values.ResolveText(resolved.ColorHex);
+                search.ColorAlternatives = (resolved.ColorAlternatives ?? new List<ColorMatchOption>())
+                    .Select(option => new ColorMatchOption
+                    {
+                        ColorHex = values.ResolveText(option.ColorHex),
+                        Tolerance = Math.Clamp(values.ResolveInt(option.ToleranceExpression, option.Tolerance), 0, 255)
+                    })
+                    .ToList();
+                point = await ColorFinder.FindAsync(search, CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                error = ex;
             }
             finally
             {
@@ -3205,10 +4403,12 @@ public partial class MainWindow : Window
                 Activate();
             }
 
-            MessageBox.Show(this, point is null
-                ? "Color not found in the search area."
-                : $"Found at {point.Value.X}, {point.Value.Y}.",
-                "Color Search", MessageBoxButton.OK, MessageBoxImage.Information);
+            MessageBox.Show(this, error is not null
+                ? error.Message
+                : point is null
+                    ? "Color not found in the search area."
+                    : $"Found at {point.Value.X}, {point.Value.Y}.",
+                "Color Search", MessageBoxButton.OK, error is null ? MessageBoxImage.Information : MessageBoxImage.Warning);
         };
         PropertiesPanel.Children.Add(test);
     }
@@ -3676,6 +4876,18 @@ public partial class MainWindow : Window
         PropertiesPanel.Children.Add(buttons);
     }
 
+    private void AddConditionCooldownField(MacroCommand command)
+    {
+        AddNumberField("Condition cooldown (ms)", command.CooldownMs, 0, 86_400_000, value => command.CooldownMs = value);
+    }
+
+    private static bool IsWaitStyleCommand(CommandType type) => type is
+        CommandType.WaitUntilKeyPressed or CommandType.WaitUntilKeyReleased
+        or CommandType.WaitUntilColor
+        or CommandType.WaitUntilImage or CommandType.WaitUntilImageGone
+        or CommandType.WaitForWindow or CommandType.WaitForWindowGone
+        or CommandType.WaitUntilVariable;
+
     private void AddPollingFields(MacroCommand command)
     {
         var panel = new StackPanel { Margin = new Thickness(2, 7, 2, 2) };
@@ -3689,8 +4901,70 @@ public partial class MainWindow : Window
         {
             Text = "0 = wait forever.",
             Foreground = (Brush)FindResource("MutedTextBrush"),
-            FontSize = 11
+            FontSize = 11,
+            Margin = new Thickness(0, 0, 0, 10)
         });
+
+        panel.Children.Add(new TextBlock
+        {
+            Text = "When the timeout is reached",
+            FontWeight = FontWeights.SemiBold,
+            Margin = new Thickness(0, 0, 0, 5)
+        });
+
+        var timeoutAction = new ComboBox { Margin = new Thickness(0, 0, 0, 8) };
+        var actions = new[]
+        {
+            (Action: FailureAction.Continue, Label: "Continue"),
+            (Action: FailureAction.StopMacro, Label: "Stop Macro"),
+            (Action: FailureAction.Retry, Label: "Retry"),
+            (Action: FailureAction.RunSequence, Label: "Run Another Tab")
+        };
+        foreach (var choice in actions)
+            timeoutAction.Items.Add(new ComboBoxItem { Content = choice.Label, Tag = choice.Action });
+        timeoutAction.SelectedItem = timeoutAction.Items.Cast<ComboBoxItem>()
+            .FirstOrDefault(item => item.Tag is FailureAction action && action == command.FailureAction);
+        timeoutAction.SelectionChanged += (_, _) =>
+        {
+            if (timeoutAction.SelectedItem is not ComboBoxItem { Tag: FailureAction action } || action == command.FailureAction)
+                return;
+            command.FailureAction = action;
+            MarkDirty();
+            _expandedTimingOptions.Add(command.Id);
+            BuildProperties(command);
+            RefreshCommandList(command.Id);
+        };
+        panel.Children.Add(timeoutAction);
+
+        if (command.FailureAction == FailureAction.Retry)
+        {
+            panel.Children.Add(new TextBlock { Text = "Retries", FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 0, 0, 5) });
+            panel.Children.Add(CreateInlineNumberInput(command, nameof(MacroCommand.FailureRetryCount), command.FailureRetryCount, 0, 100, value => command.FailureRetryCount = value));
+            panel.Children.Add(new TextBlock { Text = "Wait between retries (ms)", FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 0, 0, 5) });
+            panel.Children.Add(CreateInlineNumberInput(command, nameof(MacroCommand.FailureRetryDelayMs), command.FailureRetryDelayMs, 0, 60000, value => command.FailureRetryDelayMs = value));
+        }
+        else if (command.FailureAction == FailureAction.RunSequence)
+        {
+            panel.Children.Add(new TextBlock { Text = "Tab to run", FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 0, 0, 5) });
+            var names = new List<string> { "None" };
+            names.AddRange(_project.Sequences.Select(sequence => sequence.Name));
+            var sequencePicker = new ComboBox
+            {
+                ItemsSource = names,
+                SelectedItem = _project.Sequences.Any(sequence => sequence.Name.Equals(command.FailureSequence, StringComparison.OrdinalIgnoreCase))
+                    ? command.FailureSequence
+                    : "None",
+                Margin = new Thickness(0, 0, 0, 5)
+            };
+            sequencePicker.SelectionChanged += (_, _) =>
+            {
+                if (sequencePicker.SelectedItem is not string name)
+                    return;
+                command.FailureSequence = name == "None" ? string.Empty : name;
+                MarkDirtyAndRefresh(command.Id);
+            };
+            panel.Children.Add(sequencePicker);
+        }
 
         var expander = new Expander
         {
@@ -3716,6 +4990,9 @@ public partial class MainWindow : Window
 
     private void AddBlockInfo(MacroCommand command)
     {
+        if (_appSettings.CompactBlockLabels)
+            return;
+
         AddInfo(command.HasElse
             ? "Add to THEN for the true side. Add to ELSE for the other side."
             : "Add commands to this block to choose what repeats.");
@@ -3724,21 +5001,43 @@ public partial class MainWindow : Window
     private void AddSequencePicker(MacroCommand command)
     {
         AddLabel("Sequence to run");
+        var names = _project.Sequences.Select(s => s.Name).ToList();
+        var options = new List<string> { "None" };
+        options.AddRange(names);
         var combo = new ComboBox
         {
-            ItemsSource = _project.Sequences.Select(s => s.Name).ToList(),
-            SelectedItem = command.TargetSequence,
+            ItemsSource = options,
+            SelectedItem = names.Contains(command.TargetSequence, StringComparer.OrdinalIgnoreCase) ? command.TargetSequence : "None",
             Margin = new Thickness(0, 0, 0, 12)
         };
         combo.SelectionChanged += (_, _) =>
         {
             if (combo.SelectedItem is string name)
             {
-                command.TargetSequence = name;
+                command.TargetSequence = name == "None" ? string.Empty : name;
                 MarkDirtyAndRefresh(command.Id);
             }
         };
         PropertiesPanel.Children.Add(combo);
+
+        AddLabel("Run mode");
+        var mode = new ComboBox
+        {
+            ItemsSource = new[] { "Wait until finished", "Run simultaneously" },
+            SelectedIndex = command.RunSequenceMode == SequenceRunMode.RunSimultaneously ? 1 : 0,
+            Margin = new Thickness(0, 0, 0, 12)
+        };
+        mode.SelectionChanged += (_, _) =>
+        {
+            var newMode = mode.SelectedIndex == 1
+                ? SequenceRunMode.RunSimultaneously
+                : SequenceRunMode.WaitUntilFinished;
+            if (command.RunSequenceMode == newMode)
+                return;
+            command.RunSequenceMode = newMode;
+            MarkDirtyAndRefresh(command.Id);
+        };
+        PropertiesPanel.Children.Add(mode);
     }
 
     private void AdoptLegacyNumberExpression(MacroCommand command, string propertyName, string legacyExpression, Action clearLegacy)
@@ -3778,6 +5077,8 @@ public partial class MainWindow : Window
                 ? "Type a number, saved variable, or formula"
                 : null
         };
+
+        AutomationProperties.SetName(box, label);
 
         var lastNumber = currentValue;
         box.TextChanged += (_, _) =>
@@ -3853,6 +5154,7 @@ public partial class MainWindow : Window
             Margin = new Thickness(0, 0, 0, 12),
             ToolTip = "Type the name you want to save this value as"
         };
+        AutomationProperties.SetName(box, label);
         box.TextChanged += (_, _) =>
         {
             setter(box.Text.Trim());
@@ -3871,6 +5173,7 @@ public partial class MainWindow : Window
             ToolTip = "Choose a variable that has been saved in this macro"
         };
 
+        AutomationProperties.SetName(combo, label);
         combo.Items.Add("None");
         foreach (var name in variableNames)
             combo.Items.Add(name);
@@ -3903,8 +5206,8 @@ public partial class MainWindow : Window
 
         void AddName(string? value)
         {
-            var name = value?.Trim();
-            if (!string.IsNullOrWhiteSpace(name))
+            var name = RuntimeValues.NormalizeName(value);
+            if (RuntimeValues.IsValidVariableName(name) && !RuntimeValues.IsReservedVariableName(name))
                 names.Add(name);
         }
 
@@ -3923,6 +5226,7 @@ public partial class MainWindow : Window
                     case CommandType.ClipboardToVariable:
                     case CommandType.ReadTextFile:
                     case CommandType.PromptText:
+                    case CommandType.PromptSelect:
                     case CommandType.PromptYesNo:
                         AddName(command.VariableName);
                         break;
@@ -3960,6 +5264,9 @@ public partial class MainWindow : Window
             VerticalAlignment = VerticalAlignment.Top,
             ToolTip = "Use a saved variable in this field"
         };
+
+        var targetName = AutomationProperties.GetName(target);
+        AutomationProperties.SetName(combo, string.IsNullOrWhiteSpace(targetName) ? "Use saved variable" : $"Use saved variable for {targetName}");
 
         combo.Items.Add("None");
         foreach (var name in names)
@@ -4057,6 +5364,7 @@ public partial class MainWindow : Window
             Text = currentValue,
             ToolTip = "Type a value, saved variable name, or simple formula"
         };
+        AutomationProperties.SetName(box, label);
         box.TextChanged += (_, _) =>
         {
             setter(box.Text.Trim());
@@ -4078,6 +5386,7 @@ public partial class MainWindow : Window
             Text = currentValue,
             ToolTip = "Select a file, type a path, or use a saved variable"
         };
+        AutomationProperties.SetName(box, label);
         box.TextChanged += (_, _) =>
         {
             setter(box.Text.Trim());
@@ -4144,6 +5453,81 @@ public partial class MainWindow : Window
         });
     }
 
+    private void AddPromptOptionsFields(MacroCommand command)
+    {
+        command.PromptOptions ??= new List<string>();
+        if (command.PromptOptions.Count == 0)
+            command.PromptOptions.AddRange(new[] { "Option 1", "Option 2" });
+
+        AddLabel("Dropdown options");
+        var listPanel = new StackPanel { Margin = new Thickness(0, 0, 0, 8) };
+        PropertiesPanel.Children.Add(listPanel);
+
+        void BuildRows()
+        {
+            listPanel.Children.Clear();
+
+            for (var i = 0; i < command.PromptOptions.Count; i++)
+            {
+                var index = i;
+                var row = new Grid { Margin = new Thickness(0, 0, 0, 7) };
+                row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+                row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+                var box = new TextBox
+                {
+                    Text = command.PromptOptions[index],
+                    ToolTip = "This exact option is saved into the variable when selected"
+                };
+                AutomationProperties.SetName(box, $"Dropdown option {index + 1}");
+                box.TextChanged += (_, _) =>
+                {
+                    command.PromptOptions[index] = box.Text;
+                    MarkDirtyAndRefreshCommandDisplay(command.Id);
+                };
+
+                var remove = new Button
+                {
+                    Content = "Remove",
+                    MinWidth = 72,
+                    Margin = new Thickness(7, 0, 0, 0),
+                    IsEnabled = command.PromptOptions.Count > 1
+                };
+                remove.Click += (_, _) =>
+                {
+                    if (command.PromptOptions.Count <= 1)
+                        return;
+                    command.PromptOptions.RemoveAt(index);
+                    MarkDirtyAndRefreshCommandDisplay(command.Id);
+                    BuildRows();
+                };
+
+                Grid.SetColumn(box, 0);
+                Grid.SetColumn(remove, 1);
+                row.Children.Add(box);
+                row.Children.Add(remove);
+                listPanel.Children.Add(row);
+            }
+        }
+
+        BuildRows();
+
+        var add = new Button
+        {
+            Content = "+ Add Option",
+            HorizontalAlignment = HorizontalAlignment.Left,
+            MinWidth = 108,
+            Margin = new Thickness(0, 0, 0, 12)
+        };
+        add.Click += (_, _) =>
+        {
+            command.PromptOptions.Add($"Option {command.PromptOptions.Count + 1}");
+            MarkDirtyAndRefreshCommandDisplay(command.Id);
+            BuildRows();
+        };
+        PropertiesPanel.Children.Add(add);
+    }
+
     private void AddTextField(
         string label,
         string currentValue,
@@ -4159,6 +5543,7 @@ public partial class MainWindow : Window
             TextWrapping = multiline ? TextWrapping.Wrap : TextWrapping.NoWrap,
             MinHeight = multiline ? 80 : 0
         };
+        AutomationProperties.SetName(box, label);
         box.TextChanged += (_, _) =>
         {
             setter(box.Text);
@@ -4191,11 +5576,6 @@ public partial class MainWindow : Window
             FontSize = 12,
             Margin = new Thickness(0, 0, 0, 10)
         });
-    }
-
-    private void AddCommandHelp(CommandType type)
-    {
-        AddInfo(CommandHelp.Get(type));
     }
 
     private void AddLabel(string text)
@@ -4343,19 +5723,49 @@ public partial class MainWindow : Window
             errors.Add($"Sequence name '{duplicate}' is used more than once.");
 
         var sequenceNames = _project.Sequences.Select(x => x.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var knownVariables = GetSavedVariableNames().ToHashSet(StringComparer.OrdinalIgnoreCase);
+        foreach (var builtIn in RuntimeValues.BuiltInVariableNames)
+            knownVariables.Add(builtIn);
+
+        // These runtime values are created by successful finder/sample commands.
+        // Keep them out of the normal picker unless a command explicitly names them,
+        // but let Check Macro recognize them as legitimate references.
+        foreach (var command in EnumerateAllCommands())
+        {
+            if (command.Type is CommandType.ClickColor or CommandType.FindColorToVariables)
+            {
+                knownVariables.Add("LastColorX");
+                knownVariables.Add("LastColorY");
+            }
+            if (command.Type is CommandType.IfImage or CommandType.ClickImage or CommandType.DoubleClickImage
+                or CommandType.MoveToImage or CommandType.FindImageToVariables or CommandType.LoopUntilImage
+                or CommandType.LoopWhileImage or CommandType.WaitUntilImage or CommandType.WaitUntilImageGone)
+            {
+                knownVariables.Add("LastImageX");
+                knownVariables.Add("LastImageY");
+                knownVariables.Add("LastImageName");
+                knownVariables.Add("LastImagePath");
+            }
+            if (command.Type == CommandType.SampleColorToVariable && string.IsNullOrWhiteSpace(command.StoreTextVariable))
+                knownVariables.Add("PixelColor");
+        }
 
         var variableNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var variable in _project.Variables ?? new List<ProjectVariable>())
         {
             var name = RuntimeValues.NormalizeName(variable.Name);
-            if (!Regex.IsMatch(name, "^[A-Za-z_][A-Za-z0-9_]*$"))
+            if (!RuntimeValues.IsValidVariableName(name))
                 errors.Add($"Project variable '{variable.Name}' has an invalid name.");
+            else if (RuntimeValues.IsReservedVariableName(name))
+                errors.Add($"Project variable '{name}' uses a built-in MacroMaker name.");
             else if (!variableNames.Add(name))
                 errors.Add($"Project variable '{name}' is defined more than once.");
         }
 
-        foreach (var sequence in _project.Sequences)
-            ValidateCommands(sequence.Name, sequence.Commands, sequenceNames, errors, warnings);
+        foreach (var sequence in _project.Sequences.Where(sequence => sequence.Enabled || IsStartingSequence(sequence)))
+            ValidateCommands(sequence.Name, sequence.Commands, sequenceNames, knownVariables, errors, warnings, 0);
+
+        ValidateSequenceCycles(sequenceNames, errors);
 
         var hotkeys = new[]
         {
@@ -4367,41 +5777,166 @@ public partial class MainWindow : Window
         foreach (var group in hotkeys.GroupBy(x => x.Item2.Trim(), StringComparer.OrdinalIgnoreCase).Where(g => g.Count() > 1))
             warnings.Add($"Hotkey {group.Key} is used by: {string.Join(", ", group.Select(x => x.Item1))}.");
 
-        var dialog = new MacroCheckWindow(errors, warnings) { Owner = this };
+        var dialog = new MacroCheckWindow(errors.Distinct().ToList(), warnings.Distinct().ToList()) { Owner = this };
         dialog.ShowDialog();
         StatusText.Text = errors.Count > 0 ? "Macro check found problems" : warnings.Count > 0 ? "Macro check found warnings" : "Macro check passed";
     }
 
-    private void ValidateCommands(string sequenceName, IEnumerable<MacroCommand> commands, HashSet<string> sequenceNames, List<string> errors, List<string> warnings)
+    private void ValidateCommands(
+        string sequenceName,
+        IEnumerable<MacroCommand> commands,
+        HashSet<string> sequenceNames,
+        HashSet<string> knownVariables,
+        List<string> errors,
+        List<string> warnings,
+        int loopDepth)
     {
         foreach (var command in commands)
         {
             if (!command.Enabled)
                 continue;
 
-            if (CommandCatalog.UsesColor(command.Type)
-                && !GetSavedVariableNames().Any(name => name.Equals(command.ColorHex.Trim(), StringComparison.OrdinalIgnoreCase))
-                && !ScreenTools.TryParseColor(command.ColorHex, out _, out _, out _))
-                errors.Add($"{sequenceName}: invalid color or variable '{command.ColorHex}' in {FriendlyName(command.Type)}.");
+            void CheckDestination(string label, string? raw, bool required = true)
+            {
+                var name = RuntimeValues.NormalizeName(raw);
+                if (string.IsNullOrWhiteSpace(name))
+                {
+                    if (required)
+                        errors.Add($"{sequenceName}: {label} needs a variable name.");
+                    return;
+                }
+                if (!RuntimeValues.IsValidVariableName(name))
+                    errors.Add($"{sequenceName}: variable name '{name}' in {label} is invalid.");
+                else if (RuntimeValues.IsReservedVariableName(name))
+                    errors.Add($"{sequenceName}: '{name}' in {label} is a built-in MacroMaker value and cannot be overwritten.");
+            }
 
-            if (command.Type == CommandType.RunSequence
-                && !command.TargetSequence.Contains('{')
-                && !sequenceNames.Contains(command.TargetSequence))
-                errors.Add($"{sequenceName}: sequence '{command.TargetSequence}' does not exist.");
+            void CheckExistingVariable(string label, string? raw)
+            {
+                var name = RuntimeValues.NormalizeName(raw);
+                if (string.IsNullOrWhiteSpace(name))
+                {
+                    errors.Add($"{sequenceName}: {label} has no variable selected.");
+                    return;
+                }
+                if (!knownVariables.Contains(name))
+                    errors.Add($"{sequenceName}: variable '{name}' used by {label} is never created in this macro.");
+            }
 
-            if (command.FailureAction == FailureAction.RunSequence
-                && !string.IsNullOrWhiteSpace(command.FailureSequence)
-                && !command.FailureSequence.Contains('{')
-                && !sequenceNames.Contains(command.FailureSequence))
-                errors.Add($"{sequenceName}: failure sequence '{command.FailureSequence}' does not exist.");
+            void CheckNumber(string label, string? expression)
+            {
+                if (string.IsNullOrWhiteSpace(expression))
+                    return;
+                if (!RuntimeValues.TryValidateNumericExpression(expression, knownVariables, out var reason))
+                    errors.Add($"{sequenceName}: {label} '{expression}' has {reason}.");
+            }
+
+            switch (command.Type)
+            {
+                case CommandType.SetVariable:
+                case CommandType.RandomNumber:
+                case CommandType.ClipboardToVariable:
+                case CommandType.ReadTextFile:
+                case CommandType.PromptText:
+                case CommandType.PromptSelect:
+                case CommandType.PromptYesNo:
+                    CheckDestination(FriendlyName(command.Type), command.VariableName);
+                    break;
+                case CommandType.FindColorToVariables:
+                case CommandType.FindImageToVariables:
+                    CheckDestination($"{FriendlyName(command.Type)} X output", command.StoreXVariable, required: false);
+                    CheckDestination($"{FriendlyName(command.Type)} Y output", command.StoreYVariable, required: false);
+                    break;
+                case CommandType.SampleColorToVariable:
+                    CheckDestination(FriendlyName(command.Type), command.StoreTextVariable, required: false);
+                    break;
+                case CommandType.AddVariable:
+                    CheckExistingVariable(FriendlyName(command.Type), command.VariableName);
+                    break;
+                case CommandType.IfVariable:
+                case CommandType.WaitUntilVariable:
+                case CommandType.LoopWhileVariable:
+                case CommandType.LoopUntilVariable:
+                    CheckExistingVariable(FriendlyName(command.Type), command.VariableName);
+                    break;
+            }
+
+            CheckNumber("X", command.XExpression);
+            CheckNumber("Y", command.YExpression);
+            CheckNumber("End X", command.EndXExpression);
+            CheckNumber("End Y", command.EndYExpression);
+            CheckNumber("Wait", command.WaitExpression);
+            CheckNumber("Repeat count", command.RepeatExpression);
+            foreach (var pair in command.ValueExpressions ?? new Dictionary<string, string>())
+                CheckNumber(pair.Key, pair.Value);
+            foreach (var option in command.ColorAlternatives ?? new List<ColorMatchOption>())
+                CheckNumber("color tolerance", option.ToleranceExpression);
+            foreach (var target in command.ColorSearchTargets ?? new List<ColorSearchTarget>())
+            {
+                CheckNumber("extra location X", target.XExpression);
+                CheckNumber("extra location Y", target.YExpression);
+                CheckNumber("extra search area X", target.SearchXExpression);
+                CheckNumber("extra search area Y", target.SearchYExpression);
+                CheckNumber("extra search area width", target.SearchWidthExpression);
+                CheckNumber("extra search area height", target.SearchHeightExpression);
+            }
+            if (command.Type == CommandType.RandomNumber)
+            {
+                CheckNumber("Random Number minimum", command.VariableValue);
+                CheckNumber("Random Number maximum", command.VariableValue2);
+            }
+
+            if (CommandCatalog.UsesColor(command.Type))
+            {
+                var colors = new List<string> { command.ColorHex };
+                colors.AddRange((command.ColorAlternatives ?? new List<ColorMatchOption>()).Select(option => option.ColorHex));
+                foreach (var color in colors.Where(color => !string.IsNullOrWhiteSpace(color)))
+                {
+                    var text = color.Trim();
+                    if (!knownVariables.Contains(text) && !ScreenTools.TryParseColor(text, out _, out _, out _))
+                        errors.Add($"{sequenceName}: invalid color or variable '{color}' in {FriendlyName(command.Type)}.");
+                }
+            }
+
+            if (command.Type == CommandType.RunSequence)
+            {
+                var target = RuntimeValues.NormalizeName(command.TargetSequence);
+                if (string.IsNullOrWhiteSpace(target))
+                    errors.Add($"{sequenceName}: Run Another Tab has no target tab.");
+                else if (!sequenceNames.Contains(target))
+                    errors.Add($"{sequenceName}: sequence '{command.TargetSequence}' does not exist.");
+                else if (target.Equals(sequenceName, StringComparison.OrdinalIgnoreCase))
+                    errors.Add($"{sequenceName}: a tab cannot run itself.");
+                else
+                {
+                    var targetSequence = _project.Sequences.FirstOrDefault(sequence => sequence.Name.Equals(target, StringComparison.OrdinalIgnoreCase));
+                    if (targetSequence is { Enabled: false } && !IsStartingSequence(targetSequence))
+                        warnings.Add($"{sequenceName}: Run Another Tab targets disabled tab '{targetSequence.Name}', so it will be skipped.");
+                }
+            }
+
+            if (command.FailureAction == FailureAction.RunSequence)
+            {
+                var target = RuntimeValues.NormalizeName(command.FailureSequence);
+                if (string.IsNullOrWhiteSpace(target))
+                    errors.Add($"{sequenceName}: {FriendlyName(command.Type)} is set to run another tab on failure, but no tab is selected.");
+                else if (!sequenceNames.Contains(target))
+                    errors.Add($"{sequenceName}: failure sequence '{command.FailureSequence}' does not exist.");
+                else if (target.Equals(sequenceName, StringComparison.OrdinalIgnoreCase))
+                    errors.Add($"{sequenceName}: failure handling cannot run the same tab that is already active.");
+            }
 
             if (command.Type is CommandType.PressKey or CommandType.KeyDown or CommandType.KeyUp or CommandType.HoldKey
                 or CommandType.RepeatKey or CommandType.WaitUntilKeyPressed or CommandType.WaitUntilKeyReleased
                 or CommandType.IfKeyPressed or CommandType.LoopWhileKeyPressed)
             {
-                if (!string.IsNullOrWhiteSpace(command.Key) && !command.Key.Contains('{')
-                    && !InputController.TryGetVirtualKey(command.Key.Split('+', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries).LastOrDefault() ?? command.Key, out _))
-                    warnings.Add($"{sequenceName}: key '{command.Key}' may not be recognized in {FriendlyName(command.Type)}.");
+                var keyText = RuntimeValues.NormalizeName(command.Key);
+                if (!knownVariables.Contains(keyText) && !string.IsNullOrWhiteSpace(keyText))
+                {
+                    var keyParts = keyText.Split('+', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+                    if (keyParts.Length == 0 || keyParts.Any(part => !InputController.TryGetVirtualKey(part, out _)))
+                        warnings.Add($"{sequenceName}: key or combo '{command.Key}' may not be recognized in {FriendlyName(command.Type)}.");
+                }
             }
 
             if (command.Type is CommandType.IfImage or CommandType.WaitUntilImage or CommandType.WaitUntilImageGone
@@ -4412,10 +5947,36 @@ public partial class MainWindow : Window
                 var hasImage = !string.IsNullOrWhiteSpace(command.ImagePath);
                 if (!hasFolder && !hasImage)
                     errors.Add($"{sequenceName}: {FriendlyName(command.Type)} has no image or folder selected.");
-                else if (hasFolder && !command.ImageFolder.Contains('{') && !Directory.Exists(ProjectPaths.Resolve(command.ImageFolder)))
+                else if (hasFolder && !knownVariables.Contains(command.ImageFolder.Trim()) && !Directory.Exists(ProjectPaths.Resolve(command.ImageFolder)))
                     errors.Add($"{sequenceName}: image folder is missing: {command.ImageFolder}.");
-                else if (!hasFolder && hasImage && !command.ImagePath.Contains('{') && !File.Exists(ProjectPaths.Resolve(command.ImagePath)))
+                else if (!hasFolder && hasImage && !knownVariables.Contains(command.ImagePath.Trim()) && !File.Exists(ProjectPaths.Resolve(command.ImagePath)))
                     errors.Add($"{sequenceName}: image is missing: {command.ImagePath}.");
+            }
+
+            if ((command.Type is CommandType.IfColor or CommandType.WaitUntilColor or CommandType.LoopWhileColor or CommandType.LoopUntilColor)
+                && command.ColorSearchMode == ColorConditionSearchMode.SearchArea)
+            {
+                if (command.SearchWidth <= 0 || command.SearchHeight <= 0)
+                    errors.Add($"{sequenceName}: {FriendlyName(command.Type)} has Search Area selected but its first search area is not set.");
+
+                var extraIndex = 2;
+                foreach (var target in command.ColorSearchTargets ?? new List<ColorSearchTarget>())
+                {
+                    var widthMissing = target.SearchWidth <= 0 && string.IsNullOrWhiteSpace(target.SearchWidthExpression);
+                    var heightMissing = target.SearchHeight <= 0 && string.IsNullOrWhiteSpace(target.SearchHeightExpression);
+                    if (widthMissing || heightMissing)
+                        errors.Add($"{sequenceName}: {FriendlyName(command.Type)} search area {extraIndex} has no valid size.");
+                    extraIndex++;
+                }
+            }
+
+            if (command.Type == CommandType.PromptSelect)
+            {
+                var options = (command.PromptOptions ?? new List<string>())
+                    .Where(option => !string.IsNullOrWhiteSpace(option))
+                    .ToList();
+                if (options.Count == 0)
+                    errors.Add($"{sequenceName}: Ask User from Dropdown has no options.");
             }
 
             if ((command.Type is CommandType.ReadTextFile or CommandType.WriteTextFile) && string.IsNullOrWhiteSpace(command.FilePath))
@@ -4424,13 +5985,86 @@ public partial class MainWindow : Window
             if (command.Type == CommandType.RunProgram && string.IsNullOrWhiteSpace(command.ProgramPath))
                 errors.Add($"{sequenceName}: Open Program / File / URL is empty.");
 
+            if (command.Type == CommandType.Break && loopDepth <= 0)
+                errors.Add($"{sequenceName}: Break Loop is not inside a loop.");
+
             if (command.Type == CommandType.RecordedActions && command.Children.Count == 0)
                 warnings.Add($"{sequenceName}: Record Actions is empty.");
             else if (command.HasBody && command.Children.Count == 0)
                 warnings.Add($"{sequenceName}: {FriendlyName(command.Type)} has an empty {(command.HasElse ? "THEN" : "body")} block.");
 
-            ValidateCommands(sequenceName, command.Children, sequenceNames, errors, warnings);
-            ValidateCommands(sequenceName, command.ElseChildren, sequenceNames, errors, warnings);
+            var childLoopDepth = loopDepth + (command.IsLoop ? 1 : 0);
+            ValidateCommands(sequenceName, command.Children, sequenceNames, knownVariables, errors, warnings, childLoopDepth);
+            ValidateCommands(sequenceName, command.ElseChildren, sequenceNames, knownVariables, errors, warnings, childLoopDepth);
+        }
+    }
+
+    private void ValidateSequenceCycles(HashSet<string> sequenceNames, List<string> errors)
+    {
+        var activeSequences = _project.Sequences
+            .Where(sequence => sequence.Enabled || IsStartingSequence(sequence))
+            .ToList();
+        var activeNames = new HashSet<string>(activeSequences.Select(sequence => sequence.Name), StringComparer.OrdinalIgnoreCase);
+        var graph = activeSequences.ToDictionary(
+            sequence => sequence.Name,
+            sequence => new HashSet<string>(StringComparer.OrdinalIgnoreCase),
+            StringComparer.OrdinalIgnoreCase);
+
+        foreach (var sequence in activeSequences)
+        {
+            foreach (var command in EnumerateCommands(sequence.Commands).Where(command => command.Enabled))
+            {
+                // Only calls that WAIT for the target can form a blocking recursion
+                // cycle. Simultaneous launches are intentionally excluded: the runtime
+                // keeps only one active instance of a tab and treats repeated parallel
+                // launches of an already-running tab as a no-op.
+                if (command.Type == CommandType.RunSequence
+                    && command.RunSequenceMode == SequenceRunMode.WaitUntilFinished
+                    && activeNames.Contains(command.TargetSequence))
+                    graph[sequence.Name].Add(command.TargetSequence);
+
+                // Failure/timeout Run Sequence actions are awaited by the engine, so
+                // they remain blocking edges and must still participate in cycle checks.
+                if (command.FailureAction == FailureAction.RunSequence
+                    && activeNames.Contains(command.FailureSequence))
+                    graph[sequence.Name].Add(command.FailureSequence);
+            }
+        }
+
+        var state = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var stack = new List<string>();
+        var reported = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        void Visit(string node)
+        {
+            state[node] = 1;
+            stack.Add(node);
+            foreach (var next in graph[node])
+            {
+                if (!state.TryGetValue(next, out var nextState))
+                {
+                    Visit(next);
+                    continue;
+                }
+                if (nextState != 1)
+                    continue;
+
+                var index = stack.FindIndex(item => item.Equals(next, StringComparison.OrdinalIgnoreCase));
+                if (index < 0)
+                    continue;
+                var cycle = stack.Skip(index).Concat(new[] { next }).ToList();
+                var text = string.Join(" → ", cycle);
+                if (reported.Add(text))
+                    errors.Add($"Blocking sequence cycle detected: {text}. These tabs wait for each other and cannot finish.");
+            }
+            stack.RemoveAt(stack.Count - 1);
+            state[node] = 2;
+        }
+
+        foreach (var name in graph.Keys)
+        {
+            if (!state.ContainsKey(name))
+                Visit(name);
         }
     }
 
@@ -4611,10 +6245,12 @@ public partial class MainWindow : Window
         var win = (NativeMethods.GetAsyncKeyState(0x5B) & 0x8000) != 0
                   || (NativeMethods.GetAsyncKeyState(0x5C) & 0x8000) != 0;
 
-        return (!needCtrl || ctrl)
-               && (!needShift || shift)
-               && (!needAlt || alt)
-               && (!needWin || win);
+        // Match modifiers exactly. Without this, Ctrl+F8 also matched a plain F8
+        // hotkey and could trigger the wrong action first.
+        return needCtrl == ctrl
+               && needShift == shift
+               && needAlt == alt
+               && needWin == win;
     }
 
     private void UpdateMouseLockForEngineState()

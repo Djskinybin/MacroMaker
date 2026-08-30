@@ -28,7 +28,7 @@ public sealed class ProjectImageLibraryWindow : Window
         Title = "Project Image Library";
         Width = 790;
         Height = 590;
-        MinWidth = 680;
+        MinWidth = 560;
         MinHeight = 500;
         WindowStartupLocation = WindowStartupLocation.CenterOwner;
         Background = Brush("BgBrush");

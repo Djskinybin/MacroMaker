@@ -5,12 +5,14 @@
         Icon="/Assets/MacroMaker.ico"
         Width="1420"
         Height="880"
-        MinWidth="1080"
-        MinHeight="680"
+        MinWidth="760"
+        MinHeight="440"
         Background="{DynamicResource BgBrush}"
         Foreground="{DynamicResource TextBrush}"
         FontFamily="Segoe UI"
         WindowStartupLocation="CenterScreen"
+        UseLayoutRounding="True"
+        SnapsToDevicePixels="True"
         Closing="Window_Closing">
 
     <Grid>
@@ -36,16 +38,19 @@
                            Text="Untitled Macro"
                            Foreground="{DynamicResource MutedTextBrush}"
                            VerticalAlignment="Center"
+                           MaxWidth="180"
+                           TextTrimming="CharacterEllipsis"
+                           ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}"
                            Margin="20,0,4,0"/>
 
-                <StackPanel Orientation="Horizontal">
+                <WrapPanel>
                     <Button Content="New" Width="68" Click="NewProject_Click"/>
                     <Button Content="Open" Width="72" Margin="7,0,0,0" Click="OpenProject_Click"/>
                     <Button Content="Save" Width="68" Margin="7,0,0,0" Click="SaveProject_Click"/>
                     <Button Content="Save As" Width="82" Margin="7,0,0,0" Click="SaveProjectAs_Click"/>
                     <Button Content="Variables" Width="86" Margin="14,0,0,0" Click="VariablesButton_Click" ToolTip="View and edit saved values used by this macro"/>
                     <Button Content="⚙ Settings" Width="96" Margin="7,0,0,0" Click="SettingsButton_Click"/>
-                </StackPanel>
+                </WrapPanel>
             </DockPanel>
         </Border>
 
@@ -53,7 +58,8 @@
         <Border Grid.Row="1" Background="{DynamicResource TopBarBrush}" BorderBrush="{DynamicResource BorderBrushSoft}" BorderThickness="0,0,0,1" Padding="12,10">
             <DockPanel LastChildFill="True">
                 <StackPanel Orientation="Horizontal" DockPanel.Dock="Right" Margin="12,0,0,0">
-                    <Button x:Name="DeleteTabButton" Content="Delete Tab" Height="38" Click="DeleteTabButton_Click"/>
+                    <Button x:Name="TabOptionsButton" Content="Tab Options" Height="38" Click="TabOptionsButton_Click"/>
+                    <Button x:Name="DeleteTabButton" Content="Delete Tab" Height="38" Margin="8,0,0,0" Click="DeleteTabButton_Click"/>
                     <Button x:Name="AddTabButton"
                             Content="+"
                             Width="46"
@@ -68,7 +74,7 @@
                 </StackPanel>
 
                 <ScrollViewer HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Disabled">
-                    <StackPanel x:Name="TabPanel" Orientation="Horizontal"/>
+                    <StackPanel x:Name="TabPanel" Orientation="Horizontal" KeyboardNavigation.TabNavigation="Cycle"/>
                 </ScrollViewer>
             </DockPanel>
         </Border>
@@ -76,9 +82,9 @@
         <!-- MAIN -->
         <Grid Grid.Row="2" Margin="14">
             <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="*" MinWidth="650"/>
-                <ColumnDefinition Width="14"/>
-                <ColumnDefinition Width="400" MinWidth="350"/>
+                <ColumnDefinition Width="*" MinWidth="360"/>
+                <ColumnDefinition Width="10"/>
+                <ColumnDefinition Width="340" MinWidth="240"/>
             </Grid.ColumnDefinitions>
 
             <!-- COMMAND EDITOR -->
@@ -93,7 +99,7 @@
 
                     <DockPanel Grid.Row="0" Margin="0,0,0,12">
                         <Border DockPanel.Dock="Left" Width="5" Height="24" CornerRadius="3" Background="{DynamicResource AccentBrush}" Margin="0,0,10,0"/>
-                        <TextBlock x:Name="SequenceTitleText" Text="Starting Sequence" FontSize="22" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                        <TextBlock x:Name="SequenceTitleText" Text="Starting Sequence" FontSize="22" FontWeight="SemiBold" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}"/>
                     </DockPanel>
 
                     <Border Grid.Row="1" Background="{DynamicResource TopBarBrush}" BorderBrush="{DynamicResource BorderBrushSoft}" BorderThickness="1" CornerRadius="10" Padding="10" Margin="0,0,0,12">
@@ -111,12 +117,19 @@
                              BorderThickness="0"
                              SelectionMode="Extended"
                              AllowDrop="True"
+                             AutomationProperties.Name="Macro commands"
+                             VirtualizingPanel.IsVirtualizing="True"
+                             VirtualizingPanel.VirtualizationMode="Recycling"
+                             VirtualizingPanel.ScrollUnit="Pixel"
+                             ScrollViewer.CanContentScroll="True"
+                             KeyboardNavigation.DirectionalNavigation="Contained"
                              SelectionChanged="CommandList_SelectionChanged"
                              MouseDoubleClick="CommandList_MouseDoubleClick"
                              PreviewMouseLeftButtonDown="CommandList_PreviewMouseLeftButtonDown"
                              PreviewMouseMove="CommandList_PreviewMouseMove"
                              PreviewMouseRightButtonDown="CommandList_PreviewMouseRightButtonDown"
                              DragOver="CommandList_DragOver"
+                             DragLeave="CommandList_DragLeave"
                              Drop="CommandList_Drop"
                              ContextMenuOpening="CommandList_ContextMenuOpening">
                         <ListBox.ContextMenu>
@@ -134,7 +147,7 @@
                                             Visibility="{Binding NestingGuideVisibility}"/>
                                     <Grid Margin="{Binding Indent}">
                                         <Grid.ColumnDefinitions>
-                                            <ColumnDefinition Width="Auto"/>
+                                            <ColumnDefinition Width="32"/>
                                             <ColumnDefinition Width="*"/>
                                         </Grid.ColumnDefinitions>
                                         <Button x:Name="CollapseButton"
@@ -155,7 +168,9 @@
                                                    Grid.Column="1"
                                                    Text="{Binding Display}"
                                                    VerticalAlignment="Center"
-                                                   TextWrapping="Wrap"/>
+                                                   TextWrapping="NoWrap"
+                                                   TextTrimming="CharacterEllipsis"
+                                                   ToolTip="{Binding Display}"/>
                                     </Grid>
                                 </Grid>
                                 <DataTemplate.Triggers>
@@ -173,6 +188,7 @@
                             <Button Style="{StaticResource AccentButtonStyle}" Content="+ Add Command" Width="128" Click="AddCommandButton_Click"/>
                             <Button x:Name="AddBlockButton" Content="+ Add to Block" Width="122" Margin="7,0,0,0" Click="AddInsideButton_Click"/>
                             <Button x:Name="AddElseButton" Content="+ Add Else" Width="100" Margin="7,0,0,0" Click="AddElseButton_Click"/>
+                            <Button x:Name="AddElseIfButton" Content="+ Else If" Width="92" Margin="7,0,0,0" Click="AddElseIfButton_Click"/>
                             <Button Content="Duplicate" Width="92" Margin="7,0,0,0" Click="DuplicateCommandButton_Click"/>
                             <Button Content="Copy" Width="64" Margin="7,0,0,0" Click="CopyCommandButton_Click"/>
                             <Button Content="Paste" Width="64" Margin="7,0,0,0" Click="PasteCommandButton_Click"/>
@@ -185,6 +201,17 @@
                     </Border>
                 </Grid>
             </Border>
+
+            <GridSplitter Grid.Column="1"
+                          Width="6"
+                          HorizontalAlignment="Center"
+                          VerticalAlignment="Stretch"
+                          Background="{DynamicResource BorderBrushSoft}"
+                          ResizeDirection="Columns"
+                          ResizeBehavior="PreviousAndNext"
+                          ShowsPreview="True"
+                          Focusable="True"
+                          ToolTip="Drag to resize the command and Properties panes"/>
 
             <!-- PROPERTIES -->
             <Border Grid.Column="2" Style="{StaticResource CardBorderStyle}" Padding="16">
@@ -202,7 +229,7 @@
                         <TextBlock x:Name="PropertiesHintText" Text="Select a command to edit it." Foreground="{DynamicResource MutedTextBrush}" Margin="14,5,0,0"/>
                     </StackPanel>
 
-                    <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                    <ScrollViewer x:Name="PropertiesScrollViewer" Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" Focusable="True" AutomationProperties.Name="Command properties">
                         <StackPanel x:Name="PropertiesPanel" Margin="0,0,4,0"/>
                     </ScrollViewer>
                 </Grid>
@@ -216,7 +243,7 @@
                     <TextBlock x:Name="StatusText" Text="Ready" Foreground="{DynamicResource MutedTextBrush}" VerticalAlignment="Center" MinWidth="130" TextAlignment="Right"/>
                 </Border>
 
-                <StackPanel Orientation="Horizontal">
+                <WrapPanel>
                     <Button x:Name="RunStartButton" Style="{StaticResource AccentButtonStyle}" Content="▶ Run Macro" Width="138" Click="RunStartButton_Click" ToolTip="Runs the macro from its starting tab"/>
                     <Button x:Name="TestMenuButton" Content="Test ▾" Width="92" Margin="8,0,0,0" Click="TestMenuButton_Click" ToolTip="Testing tools"/>
                     <Button x:Name="PauseButton" Content="⏸ Pause" Width="96" Margin="14,0,0,0" Click="PauseButton_Click"/>
@@ -225,7 +252,7 @@
                     <Button x:Name="RunFromHereButton" Visibility="Collapsed" Click="RunFromHereButton_Click"/>
                     <Button x:Name="TestSelectedButton" Visibility="Collapsed" Click="TestSelectedButton_Click"/>
                     <Button x:Name="CheckMacroButton" Visibility="Collapsed" Click="CheckMacroButton_Click"/>
-                </StackPanel>
+                </WrapPanel>
             </DockPanel>
         </Border>
     </Grid>

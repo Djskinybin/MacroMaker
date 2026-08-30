@@ -32,8 +32,8 @@ public sealed class CommandDefaultsWindow : Window
         Title = "Command Defaults";
         Width = 1080;
         Height = 700;
-        MinWidth = 900;
-        MinHeight = 580;
+        MinWidth = 720;
+        MinHeight = 450;
         WindowStartupLocation = WindowStartupLocation.CenterOwner;
         Background = Brush("BgBrush");
         Foreground = Brush("TextBrush");
@@ -289,15 +289,17 @@ public sealed class CommandDefaultsWindow : Window
 
             case CommandType.Click:
             case CommandType.RightClick:
-                AddLocation(p);
-                AddMouseMovement(p);
+            {
+                AddClickMoveDefault(type, p);
                 break;
+            }
 
             case CommandType.DoubleClick:
-                AddLocation(p);
-                AddMouseMovement(p);
+            {
+                AddClickMoveDefault(type, p);
                 AddInt("Delay between clicks (ms)", p.ClickDelayMs, 20, 1000, v => p.ClickDelayMs = v);
                 break;
+            }
 
             case CommandType.Scroll:
                 AddLocation(p);
@@ -455,7 +457,7 @@ public sealed class CommandDefaultsWindow : Window
             case CommandType.SetVariable:
             case CommandType.AddVariable:
                 AddText("Variable name", p.VariableName, v => p.VariableName = v);
-                AddText(type == CommandType.SetVariable ? "Value" : "Amount / text to add", p.VariableValue, v => p.VariableValue = v);
+                AddText(type == CommandType.SetVariable ? "Set value to" : "Amount / text to add", p.VariableValue, v => p.VariableValue = v);
                 break;
 
             case CommandType.RandomNumber:
@@ -498,10 +500,18 @@ public sealed class CommandDefaultsWindow : Window
                 break;
 
             case CommandType.PromptText:
+            case CommandType.PromptSelect:
             case CommandType.PromptYesNo:
                 AddText("Question", p.PromptText, v => p.PromptText = v, true);
                 AddText("Variable name", p.VariableName, v => p.VariableName = v);
-                if (type == CommandType.PromptText) AddText("Default answer", p.VariableValue, v => p.VariableValue = v);
+                if (type == CommandType.PromptText)
+                    AddText("Default answer", p.VariableValue, v => p.VariableValue = v);
+                else if (type == CommandType.PromptSelect)
+                    AddText("Options (one per line)", string.Join(Environment.NewLine, p.PromptOptions ?? new List<string>()),
+                        v => p.PromptOptions = v.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None)
+                            .Select(option => option.Trim())
+                            .Where(option => option.Length > 0)
+                            .ToList(), true);
                 break;
 
             case CommandType.RunProgram:
@@ -512,6 +522,10 @@ public sealed class CommandDefaultsWindow : Window
 
             case CommandType.LoopTimes:
                 AddInt("Repeat count", p.RepeatCount, 0, 1_000_000, v => p.RepeatCount = v);
+                break;
+
+            case CommandType.LoopForever:
+                AddInt("Loop interval (ms)", p.LoopIntervalMs, 0, 60_000, v => p.LoopIntervalMs = v);
                 break;
 
             default:
@@ -606,15 +620,36 @@ public sealed class CommandDefaultsWindow : Window
     private void AddColorDefaults(CommandDefaultProfile p, bool includePollingLabel)
     {
         AddLabel("Check for");
-        var combo = new ComboBox { Margin = new Thickness(0, 0, 0, 10) };
-        combo.Items.Add(new ComboBoxItem { Content = "Color matches", Tag = CompareMode.Equals });
-        combo.Items.Add(new ComboBoxItem { Content = "Color does not match", Tag = CompareMode.NotEquals });
-        combo.SelectedItem = combo.Items.Cast<ComboBoxItem>().FirstOrDefault(x => x.Tag is CompareMode m && m == p.CompareMode);
-        combo.SelectionChanged += (_, _) => { if (combo.SelectedItem is ComboBoxItem { Tag: CompareMode mode }) p.CompareMode = mode; };
-        _propertiesPanel.Children.Add(combo);
+        var compare = new ComboBox { Margin = new Thickness(0, 0, 0, 10) };
+        compare.Items.Add(new ComboBoxItem { Content = "Color matches", Tag = CompareMode.Equals });
+        compare.Items.Add(new ComboBoxItem { Content = "Color does not match", Tag = CompareMode.NotEquals });
+        compare.SelectedItem = compare.Items.Cast<ComboBoxItem>().FirstOrDefault(x => x.Tag is CompareMode m && m == p.CompareMode);
+        compare.SelectionChanged += (_, _) => { if (compare.SelectedItem is ComboBoxItem { Tag: CompareMode mode }) p.CompareMode = mode; };
+        _propertiesPanel.Children.Add(compare);
+
         AddText("Target color", p.ColorHex, v => p.ColorHex = NormalizeColor(v));
-        AddLocation(p);
         AddInt("Color tolerance", p.ColorTolerance, 0, 255, v => p.ColorTolerance = v);
+
+        AddLabel("Search");
+        var search = new ComboBox { Margin = new Thickness(0, 0, 0, 10) };
+        search.Items.Add(new ComboBoxItem { Content = "Pixel", Tag = ColorConditionSearchMode.Pixel });
+        search.Items.Add(new ComboBoxItem { Content = "Search Area", Tag = ColorConditionSearchMode.SearchArea });
+        search.Items.Add(new ComboBoxItem { Content = "Full Screen", Tag = ColorConditionSearchMode.FullScreen });
+        search.SelectedItem = search.Items.Cast<ComboBoxItem>().FirstOrDefault(x => x.Tag is ColorConditionSearchMode m && m == p.ColorSearchMode);
+        search.SelectionChanged += (_, _) =>
+        {
+            if (search.SelectedItem is ComboBoxItem { Tag: ColorConditionSearchMode mode })
+            {
+                p.ColorSearchMode = mode;
+                ShowCommand(p.Type);
+            }
+        };
+        _propertiesPanel.Children.Add(search);
+
+        if (p.ColorSearchMode == ColorConditionSearchMode.Pixel)
+            AddLocation(p);
+        else if (p.ColorSearchMode == ColorConditionSearchMode.SearchArea)
+            AddSearchAreaDefaults(p);
     }
 
     private void AddImageDefaults(CommandDefaultProfile p)
@@ -648,6 +683,25 @@ public sealed class CommandDefaultsWindow : Window
         AddInt("Check every (ms)", p.PollMs, 10, 5000, v => p.PollMs = v);
         if (timeout)
             AddInt("Give up after (ms, 0 = never)", p.TimeoutMs, 0, 86_400_000, v => p.TimeoutMs = v);
+    }
+
+    private void AddClickMoveDefault(CommandType type, CommandDefaultProfile p)
+    {
+        var moveFirst = new CheckBox
+        {
+            Content = "Move to a location before clicking",
+            IsChecked = p.MoveBeforeClick,
+            Margin = new Thickness(0, 3, 0, 10)
+        };
+        moveFirst.Checked += (_, _) => { p.MoveBeforeClick = true; ShowCommand(type); };
+        moveFirst.Unchecked += (_, _) => { p.MoveBeforeClick = false; ShowCommand(type); };
+        _propertiesPanel.Children.Add(moveFirst);
+
+        if (p.MoveBeforeClick)
+        {
+            AddLocation(p);
+            AddMouseMovement(p);
+        }
     }
 
     private void AddLocation(CommandDefaultProfile p)

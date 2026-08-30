@@ -5,7 +5,7 @@ set "NOPAUSE="
 if /I "%~1"=="--no-pause" set "NOPAUSE=1"
 
 echo ========================================
-echo        MacroMaker - Build App 1.0.0
+echo        MacroMaker - Build App 1.1.0
 echo ========================================
 echo.
 

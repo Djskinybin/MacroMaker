@@ -22,8 +22,8 @@ public sealed class VariablesManagerWindow : Window
         Title = "Variables";
         Width = 760;
         Height = 540;
-        MinWidth = 660;
-        MinHeight = 460;
+        MinWidth = 540;
+        MinHeight = 400;
         WindowStartupLocation = WindowStartupLocation.CenterOwner;
         Background = (Brush)Application.Current.FindResource("BgBrush");
         Foreground = (Brush)Application.Current.FindResource("TextBrush");
@@ -236,11 +236,18 @@ public sealed class VariablesManagerWindow : Window
         foreach (var variable in _variables)
         {
             variable.Name = RuntimeValues.NormalizeName(variable.Name);
-            if (!Regex.IsMatch(variable.Name, "^[A-Za-z_][A-Za-z0-9_]*$"))
+            if (!RuntimeValues.IsValidVariableName(variable.Name))
             {
                 MessageBox.Show(this,
                     $"'{variable.Name}' is not a valid variable name.\n\nUse letters, numbers, and underscores. The first character must be a letter or underscore.",
                     "Fix Variable Name", MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+            if (RuntimeValues.IsReservedVariableName(variable.Name))
+            {
+                MessageBox.Show(this,
+                    $"'{variable.Name}' is built into MacroMaker and cannot be used as a saved variable name.",
+                    "Reserved Variable Name", MessageBoxButton.OK, MessageBoxImage.Information);
                 return;
             }
         }

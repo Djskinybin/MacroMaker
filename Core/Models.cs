@@ -77,6 +77,7 @@ public enum CommandType
     ReadTextFile,
     WriteTextFile,
     PromptText,
+    PromptSelect,
     PromptYesNo,
 
     Group,
@@ -85,6 +86,7 @@ public enum CommandType
     LoopForever,
     Break,
     Return,
+    RestartCurrentTab,
     StopMacro
 }
 
@@ -92,6 +94,25 @@ public enum CompareMode
 {
     Equals,
     NotEquals
+}
+
+public enum ColorConditionSearchMode
+{
+    Pixel,
+    SearchArea,
+    FullScreen
+}
+
+public enum LocationGroupMode
+{
+    Any,
+    All
+}
+
+public enum SequenceRunMode
+{
+    WaitUntilFinished,
+    RunSimultaneously
 }
 
 public enum VariableCompareMode
@@ -144,6 +165,52 @@ public sealed class RecorderSettings
     public int MouseSampleMs { get; set; } = 45;
 }
 
+public sealed class ColorMatchOption
+{
+    public string ColorHex { get; set; } = "0x000000";
+    public int Tolerance { get; set; }
+    public string ToleranceExpression { get; set; } = string.Empty;
+
+    public ColorMatchOption DeepClone() => new()
+    {
+        ColorHex = ColorHex,
+        Tolerance = Tolerance,
+        ToleranceExpression = ToleranceExpression
+    };
+}
+
+public sealed class ColorSearchTarget
+{
+    public int X { get; set; }
+    public int Y { get; set; }
+    public string XExpression { get; set; } = string.Empty;
+    public string YExpression { get; set; } = string.Empty;
+    public int SearchX { get; set; }
+    public int SearchY { get; set; }
+    public int SearchWidth { get; set; } = 1;
+    public int SearchHeight { get; set; } = 1;
+    public string SearchXExpression { get; set; } = string.Empty;
+    public string SearchYExpression { get; set; } = string.Empty;
+    public string SearchWidthExpression { get; set; } = string.Empty;
+    public string SearchHeightExpression { get; set; } = string.Empty;
+
+    public ColorSearchTarget DeepClone() => new()
+    {
+        X = X,
+        Y = Y,
+        XExpression = XExpression,
+        YExpression = YExpression,
+        SearchX = SearchX,
+        SearchY = SearchY,
+        SearchWidth = SearchWidth,
+        SearchHeight = SearchHeight,
+        SearchXExpression = SearchXExpression,
+        SearchYExpression = SearchYExpression,
+        SearchWidthExpression = SearchWidthExpression,
+        SearchHeightExpression = SearchHeightExpression
+    };
+}
+
 public sealed class ProjectVariable
 {
     public string Name { get; set; } = "Variable";
@@ -193,7 +260,15 @@ public sealed class MacroSequence
     }
 
     public string Name { get; set; } = "Sequence";
+    public bool Enabled { get; set; } = true;
     public List<MacroCommand> Commands { get; set; } = new();
+
+    public MacroSequence DeepClone(string? newName = null) => new()
+    {
+        Name = newName ?? Name,
+        Enabled = Enabled,
+        Commands = (Commands ?? new List<MacroCommand>()).Select(command => command.DeepClone()).ToList()
+    };
 }
 
 public sealed class MacroCommand
@@ -206,6 +281,8 @@ public sealed class MacroCommand
     public string Text { get; set; } = string.Empty;
     public string Key { get; set; } = "E";
     public string TargetSequence { get; set; } = "Starting Sequence";
+    public SequenceRunMode RunSequenceMode { get; set; } = SequenceRunMode.WaitUntilFinished;
+    public bool IsElseIf { get; set; }
 
     public int X { get; set; }
     public int Y { get; set; }
@@ -219,6 +296,10 @@ public sealed class MacroCommand
     public MouseMoveMode MouseMoveMode { get; set; } = MouseMoveMode.Legacy;
     public int MoveDurationMs { get; set; }
     public int ClickDelayMs { get; set; } = 100;
+    // null means an older macro that used the legacy click-at-X/Y behavior.
+    // New click commands explicitly default this to false so they click wherever
+    // the mouse already is unless the user enables Move to location first.
+    public bool? MoveBeforeClick { get; set; }
     public int ScrollAmount { get; set; } = -120;
     public int DragDurationMs { get; set; } = 500;
     public int HoldMs { get; set; } = 500;
@@ -235,9 +316,19 @@ public sealed class MacroCommand
 
     public int PollMs { get; set; } = 50;
     public int TimeoutMs { get; set; }
+    public int CooldownMs { get; set; }
 
     public string ColorHex { get; set; } = "0x000000";
     public int ColorTolerance { get; set; }
+    // Explicit search mode for color conditions. Null is only kept for compatibility
+    // with older projects that used ColorSearchRadius around X/Y.
+    public ColorConditionSearchMode? ColorSearchMode { get; set; }
+    public int ColorSearchRadius { get; set; }
+    // Extra colors are OR alternatives to ColorHex/ColorTolerance. Keeping the
+    // original fields as the first target preserves compatibility with old macros.
+    public List<ColorMatchOption> ColorAlternatives { get; set; } = new();
+    public List<ColorSearchTarget> ColorSearchTargets { get; set; } = new();
+    public LocationGroupMode ColorLocationGroupMode { get; set; } = LocationGroupMode.Any;
     public CompareMode CompareMode { get; set; } = CompareMode.Equals;
 
     public string ImagePath { get; set; } = string.Empty;
@@ -258,6 +349,8 @@ public sealed class MacroCommand
 
     public int RepeatCount { get; set; } = 3;
     public string RepeatExpression { get; set; } = string.Empty;
+    // Delay between Loop Forever iterations. 0 means no added delay.
+    public int LoopIntervalMs { get; set; }
 
     // Variables / data.
     public string VariableName { get; set; } = string.Empty;
@@ -277,6 +370,7 @@ public sealed class MacroCommand
     public string FilePath { get; set; } = string.Empty;
     public bool AppendFile { get; set; }
     public string PromptText { get; set; } = "Enter a value:";
+    public List<string> PromptOptions { get; set; } = new() { "Option 1", "Option 2" };
 
     // Failure / retry behavior for commands that can fail or time out.
     public FailureAction FailureAction { get; set; } = FailureAction.Continue;
@@ -306,6 +400,17 @@ public sealed class MacroCommand
         or CommandType.LoopForever;
 
     [JsonIgnore]
+    public bool IsLoop => Type is CommandType.LoopWhileKeyPressed
+        or CommandType.LoopWhileColor
+        or CommandType.LoopUntilColor
+        or CommandType.LoopUntilImage
+        or CommandType.LoopWhileImage
+        or CommandType.LoopWhileVariable
+        or CommandType.LoopUntilVariable
+        or CommandType.LoopTimes
+        or CommandType.LoopForever;
+
+    [JsonIgnore]
     public bool HasElse => Type is CommandType.IfKeyPressed
         or CommandType.IfColor
         or CommandType.IfImage
@@ -323,6 +428,8 @@ public sealed class MacroCommand
             Text = Text,
             Key = Key,
             TargetSequence = TargetSequence,
+            RunSequenceMode = RunSequenceMode,
+            IsElseIf = IsElseIf,
             X = X,
             Y = Y,
             EndX = EndX,
@@ -335,6 +442,7 @@ public sealed class MacroCommand
             MouseMoveMode = MouseMoveMode,
             MoveDurationMs = MoveDurationMs,
             ClickDelayMs = ClickDelayMs,
+            MoveBeforeClick = MoveBeforeClick,
             ScrollAmount = ScrollAmount,
             DragDurationMs = DragDurationMs,
             HoldMs = HoldMs,
@@ -347,8 +455,14 @@ public sealed class MacroCommand
             RecordMouseSampleMs = RecordMouseSampleMs,
             PollMs = PollMs,
             TimeoutMs = TimeoutMs,
+            CooldownMs = CooldownMs,
             ColorHex = ColorHex,
             ColorTolerance = ColorTolerance,
+            ColorSearchMode = ColorSearchMode,
+            ColorSearchRadius = ColorSearchRadius,
+            ColorAlternatives = (ColorAlternatives ?? new List<ColorMatchOption>()).Select(option => option.DeepClone()).ToList(),
+            ColorSearchTargets = (ColorSearchTargets ?? new List<ColorSearchTarget>()).Select(target => target.DeepClone()).ToList(),
+            ColorLocationGroupMode = ColorLocationGroupMode,
             CompareMode = CompareMode,
             ImagePath = ImagePath,
             ImageFolder = ImageFolder,
@@ -367,6 +481,7 @@ public sealed class MacroCommand
             ImageOffsetY = ImageOffsetY,
             RepeatCount = RepeatCount,
             RepeatExpression = RepeatExpression,
+            LoopIntervalMs = LoopIntervalMs,
             VariableName = VariableName,
             VariableValue = VariableValue,
             VariableValue2 = VariableValue2,
@@ -380,6 +495,7 @@ public sealed class MacroCommand
             FilePath = FilePath,
             AppendFile = AppendFile,
             PromptText = PromptText,
+            PromptOptions = (PromptOptions ?? new List<string>()).ToList(),
             FailureAction = FailureAction,
             FailureRetryCount = FailureRetryCount,
             FailureRetryDelayMs = FailureRetryDelayMs,
@@ -414,9 +530,9 @@ public sealed class MacroCommand
             CommandType.MoveMouse => EffectiveMoveMode() == MouseMoveMode.Teleport
                 ? $"Move mouse to {x}, {y} (teleport){CoordinateSuffix()}"
                 : $"Move mouse to {x}, {y} smoothly over {NumberDisplay(nameof(MoveDurationMs), MoveDurationMs)} ms{CoordinateSuffix()}",
-            CommandType.Click => $"Click {x}, {y}" + MoveSuffix() + CoordinateSuffix(),
-            CommandType.DoubleClick => $"Double click {x}, {y}" + MoveSuffix() + CoordinateSuffix(),
-            CommandType.RightClick => $"Right click {x}, {y}" + MoveSuffix() + CoordinateSuffix(),
+            CommandType.Click => ClickDisplay("Click", x, y),
+            CommandType.DoubleClick => ClickDisplay("Double click", x, y),
+            CommandType.RightClick => ClickDisplay("Right click", x, y),
             CommandType.Scroll => $"Scroll {NumberDisplay(nameof(ScrollAmount), ScrollAmount)} at {x}, {y}" + MoveSuffix() + CoordinateSuffix(),
             CommandType.DragMouse => $"Drag {x}, {y} → {ex}, {ey} over {NumberDisplay(nameof(DragDurationMs), DragDurationMs)} ms{CoordinateSuffix()}",
             CommandType.LeftMouseDown => "Left mouse down",
@@ -436,12 +552,12 @@ public sealed class MacroCommand
             CommandType.Wait => $"Wait {WaitDisplay()} ms",
             CommandType.RandomWait => $"Wait random {NumberDisplay(nameof(MinWaitMs), MinWaitMs)}-{NumberDisplay(nameof(MaxWaitMs), MaxWaitMs)} ms",
             CommandType.RecordedActions => $"Recorded actions ({Children.Count} commands, stop {RecordingStopHotkey})",
-            CommandType.IfColor => $"If color at {x}, {y} {FriendlyColorCompare()} {ColorHex} ±{NumberDisplay(nameof(ColorTolerance), ColorTolerance)}{CoordinateSuffix()}",
-            CommandType.WaitUntilColor => $"Wait until color at {x}, {y} {FriendlyColorCompare()} {ColorHex} ±{NumberDisplay(nameof(ColorTolerance), ColorTolerance)}{CoordinateSuffix()}",
-            CommandType.LoopWhileColor => $"Repeat while color at {x}, {y} {FriendlyColorCompare()} {ColorHex} ±{NumberDisplay(nameof(ColorTolerance), ColorTolerance)}{CoordinateSuffix()}",
-            CommandType.LoopUntilColor => $"Repeat until color at {x}, {y} {FriendlyColorCompare()} {ColorHex} ±{NumberDisplay(nameof(ColorTolerance), ColorTolerance)}{CoordinateSuffix()}",
-            CommandType.ClickColor => $"Find + click color {ColorHex} ±{NumberDisplay(nameof(ColorTolerance), ColorTolerance)}",
-            CommandType.FindColorToVariables => $"Find color {ColorHex} → {StoreXVariable}, {StoreYVariable}",
+            CommandType.IfColor => $"If color {ColorConditionSearchDisplay(x, y)}{ColorLocationSuffix()} {FriendlyColorCompare()} {ColorHex} ±{NumberDisplay(nameof(ColorTolerance), ColorTolerance)}{ColorOrSuffix()}",
+            CommandType.WaitUntilColor => $"Wait until color {ColorConditionSearchDisplay(x, y)}{ColorLocationSuffix()} {FriendlyColorCompare()} {ColorHex} ±{NumberDisplay(nameof(ColorTolerance), ColorTolerance)}{ColorOrSuffix()}",
+            CommandType.LoopWhileColor => $"Repeat while color {ColorConditionSearchDisplay(x, y)}{ColorLocationSuffix()} {FriendlyColorCompare()} {ColorHex} ±{NumberDisplay(nameof(ColorTolerance), ColorTolerance)}{ColorOrSuffix()}",
+            CommandType.LoopUntilColor => $"Repeat until color {ColorConditionSearchDisplay(x, y)}{ColorLocationSuffix()} {FriendlyColorCompare()} {ColorHex} ±{NumberDisplay(nameof(ColorTolerance), ColorTolerance)}{ColorOrSuffix()}",
+            CommandType.ClickColor => $"Find + click color {ColorHex} ±{NumberDisplay(nameof(ColorTolerance), ColorTolerance)}{ColorOrSuffix()}",
+            CommandType.FindColorToVariables => $"Find color {ColorHex}{ColorOrSuffix()} → {StoreXVariable}, {StoreYVariable}",
             CommandType.SampleColorToVariable => $"Read color at {x}, {y} → {StoreTextVariable}{CoordinateSuffix()}",
             CommandType.IfImage => $"If image is found: {ImageName()}",
             CommandType.WaitUntilImage => $"Wait until image appears: {ImageName()}",
@@ -461,7 +577,7 @@ public sealed class MacroCommand
             CommandType.RestoreWindow => $"Restore window \"{TrimForDisplay(WindowTitle, 36)}\"",
             CommandType.CloseWindow => $"Close window \"{TrimForDisplay(WindowTitle, 36)}\"",
             CommandType.RunProgram => $"Open \"{TrimForDisplay(ProgramPath, 42)}\"",
-            CommandType.SetVariable => $"Save {VariableName} = {TrimForDisplay(VariableValue, 40)}",
+            CommandType.SetVariable => $"Set {VariableName} = {TrimForDisplay(VariableValue, 40)}",
             CommandType.AddVariable => $"Change {VariableName} by {TrimForDisplay(VariableValue, 28)}",
             CommandType.RandomNumber => $"Random {VariableName} = {TrimForDisplay(VariableValue, 18)}..{TrimForDisplay(VariableValue2, 18)}",
             CommandType.IfVariable => $"If {VariableName} {FriendlyVariableCompare()} {TrimForDisplay(VariableValue, 30)}",
@@ -473,13 +589,19 @@ public sealed class MacroCommand
             CommandType.ReadTextFile => $"Read file → {VariableName}",
             CommandType.WriteTextFile => $"{(AppendFile ? "Append" : "Write")} text file",
             CommandType.PromptText => $"Ask user → {VariableName}",
+            CommandType.PromptSelect => $"Ask user to choose → {VariableName}",
             CommandType.PromptYesNo => $"Ask Yes/No → {VariableName}",
             CommandType.Group => string.IsNullOrWhiteSpace(CustomName) ? "Command group" : "Group",
-            CommandType.RunSequence => $"Run tab \"{TargetSequence}\"",
+            CommandType.RunSequence => RunSequenceMode == SequenceRunMode.RunSimultaneously
+                ? $"Run tab \"{TargetSequence}\" simultaneously"
+                : $"Run tab \"{TargetSequence}\"",
             CommandType.LoopTimes => $"Repeat {RepeatDisplay()} times",
-            CommandType.LoopForever => "Repeat forever",
+            CommandType.LoopForever => LoopIntervalMs > 0 || (ValueExpressions?.ContainsKey(nameof(LoopIntervalMs)) ?? false)
+                ? $"Repeat forever every {NumberDisplay(nameof(LoopIntervalMs), LoopIntervalMs)} ms"
+                : "Repeat forever",
             CommandType.Break => "Exit current repeat",
             CommandType.Return => "Return to previous tab",
+            CommandType.RestartCurrentTab => "Restart current tab",
             CommandType.StopMacro => "Stop macro",
             _ => Type.ToString()
         };
@@ -488,6 +610,45 @@ public sealed class MacroCommand
     private string CompareSymbol() => CompareMode == CompareMode.Equals ? "==" : "!=";
 
     private string FriendlyColorCompare() => CompareMode == CompareMode.Equals ? "matches" : "does not match";
+
+    private string ClickDisplay(string action, string x, string y)
+    {
+        // Old commands (null) keep their legacy behavior and display. New commands
+        // with false are intentionally location-free.
+        if (MoveBeforeClick == false)
+            return action;
+        return $"{action} {x}, {y}" + MoveSuffix() + CoordinateSuffix();
+    }
+
+    private string ColorOrSuffix()
+    {
+        var count = ColorAlternatives?.Count ?? 0;
+        return count <= 0 ? string.Empty : $" + {count} OR";
+    }
+
+    private string ColorLocationSuffix()
+    {
+        var count = ColorSearchTargets?.Count ?? 0;
+        if (count <= 0 || (ColorSearchMode ?? ColorConditionSearchMode.Pixel) == ColorConditionSearchMode.FullScreen)
+            return string.Empty;
+        var join = ColorLocationGroupMode == LocationGroupMode.All ? "AND" : "OR";
+        return $" + {count} {join} location{(count == 1 ? string.Empty : "s")}";
+    }
+
+    private string ColorConditionSearchDisplay(string x, string y)
+    {
+        if (ColorSearchMode is null && ColorSearchRadius > 0)
+            return $"near {x}, {y} within {NumberDisplay(nameof(ColorSearchRadius), ColorSearchRadius)}px{CoordinateSuffix()}";
+
+        return (ColorSearchMode ?? ColorConditionSearchMode.Pixel) switch
+        {
+            ColorConditionSearchMode.FullScreen => "on full screen",
+            ColorConditionSearchMode.SearchArea when SearchWidth > 0 && SearchHeight > 0
+                => $"in area {SearchX}, {SearchY}, {SearchWidth}×{SearchHeight}{CoordinateSuffix()}",
+            ColorConditionSearchMode.SearchArea => "in a search area",
+            _ => $"at {x}, {y}{CoordinateSuffix()}"
+        };
+    }
 
     private string FriendlyVariableCompare() => VariableCompareMode switch
     {
@@ -603,7 +764,9 @@ public sealed class CommandRow : INotifyPropertyChanged
     public MacroCommand? ParentCommand { get; init; }
     public int Depth { get; init; }
     public string Label { get; init; } = string.Empty;
+    public string DisplayOverride { get; init; } = string.Empty;
     public bool IsHeader { get; init; }
+    public bool CompactLabels { get; init; }
     public CommandBranch Branch { get; init; }
     public bool IsCollapsed { get; init; }
 
@@ -616,22 +779,26 @@ public sealed class CommandRow : INotifyPropertyChanged
     public string Display => IsHeader
         ? Label switch
         {
-            "THEN" => "Then — run these when true",
-            "ELSE" => "Else — run these when false",
-            "DO" => "Repeat these commands",
-            "GROUP" => "Commands in this group",
+            "THEN" => CompactLabels ? "Then" : "Then — run these when true",
+            "ELSE" => CompactLabels ? "Else" : "Else — run these when false",
+            "DO" => CompactLabels ? string.Empty : "Repeat these commands",
+            "GROUP" => CompactLabels ? "Group" : "Commands in this group",
+            "END LOOP" => "End Loop",
             "EMPTY" => "No commands yet — use Quick Add or + Add Command",
             _ => Label
         }
-        : Command?.DisplayText() ?? string.Empty;
+        : !string.IsNullOrWhiteSpace(DisplayOverride)
+            ? DisplayOverride
+            : Command?.DisplayText() ?? string.Empty;
 
     public event PropertyChangedEventHandler? PropertyChanged;
 
     public void RefreshDisplay()
         => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Display)));
 
-    public Thickness Indent => new(Math.Max(0, Depth) * 22, 0, 0, 0);
-    public Thickness NestingGuideMargin => new(Math.Max(0, Depth - 1) * 22 + 8, 2, 0, 2);
+    private const int IndentStep = 30;
+    public Thickness Indent => new(Math.Max(0, Depth) * IndentStep, 0, 0, 0);
+    public Thickness NestingGuideMargin => new(Math.Max(0, Depth) * IndentStep + 10, 2, 0, 2);
 }
 
 public readonly record struct ScreenRegion(int X, int Y, int Width, int Height)

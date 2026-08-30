@@ -1,6 +1,7 @@
 using System.IO;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
 using System.Windows.Media;
 
 namespace MacroMaker;
@@ -8,6 +9,7 @@ namespace MacroMaker;
 public partial class MainWindow
 {
     private readonly List<MacroCommand> _copiedCommands = new();
+    private MacroCommand? _copiedProperties;
 
     private bool EffectiveLockMouse => _appSettings.LockMouseMovementWhileRunning;
     private bool EffectiveShowHud => _appSettings.ShowRunStatusHud;
@@ -16,6 +18,82 @@ public partial class MainWindow
     private int EffectiveHudOpacity => Math.Clamp(_appSettings.RunHudOpacityPercent, 35, 100);
     private string EffectiveStartupSequence => "Starting Sequence";
 
+
+    private void SelectRelativeSequence(int direction)
+    {
+        if (_project.Sequences.Count == 0)
+            return;
+
+        var currentIndex = _currentSequence is null ? -1 : _project.Sequences.IndexOf(_currentSequence);
+        if (currentIndex < 0)
+            currentIndex = 0;
+
+        var nextIndex = (currentIndex + direction) % _project.Sequences.Count;
+        if (nextIndex < 0)
+            nextIndex += _project.Sequences.Count;
+
+        SelectSequence(_project.Sequences[nextIndex]);
+        FocusCurrentSequenceTab();
+    }
+
+    private void FocusCurrentSequenceTab()
+    {
+        var currentButton = TabPanel.Children
+            .OfType<Button>()
+            .FirstOrDefault(button => ReferenceEquals(button.Tag, _currentSequence));
+        currentButton?.Focus();
+    }
+
+    private void FocusNextMajorPane(int direction)
+    {
+        var focused = Keyboard.FocusedElement as DependencyObject;
+        var current = IsDescendantOf(focused, TabPanel) ? 0
+            : IsDescendantOf(focused, CommandList) ? 1
+            : IsDescendantOf(focused, PropertiesScrollViewer) ? 2
+            : IsDescendantOf(focused, RunStartButton) || IsDescendantOf(focused, PauseButton) || IsDescendantOf(focused, StopButton) ? 3
+            : -1;
+
+        var next = current < 0
+            ? (direction >= 0 ? 0 : 3)
+            : (current + direction + 4) % 4;
+
+        switch (next)
+        {
+            case 0:
+                FocusCurrentSequenceTab();
+                break;
+            case 1:
+                CommandList.Focus();
+                if (CommandList.SelectedItem is not null)
+                    CommandList.ScrollIntoView(CommandList.SelectedItem);
+                break;
+            case 2:
+                PropertiesScrollViewer.Focus();
+                break;
+            default:
+                RunStartButton.Focus();
+                break;
+        }
+    }
+
+    private static bool IsDescendantOf(DependencyObject? child, DependencyObject parent)
+    {
+        var current = child;
+        while (current is not null)
+        {
+            if (ReferenceEquals(current, parent))
+                return true;
+            try
+            {
+                current = VisualTreeHelper.GetParent(current);
+            }
+            catch (InvalidOperationException)
+            {
+                current = null;
+            }
+        }
+        return false;
+    }
 
     private bool TryPrepareRunOverrides(out IReadOnlyDictionary<string, string>? values)
     {
@@ -131,6 +209,75 @@ public partial class MainWindow
         var ids = clones.Select(command => command.Id).ToList();
         RefreshCommandList(ids.FirstOrDefault(), ids);
         StatusText.Text = clones.Count == 1 ? "Command pasted" : $"{clones.Count} commands pasted";
+    }
+
+    private void RenameSelectedCommandDisplayName()
+    {
+        var rows = GetSelectedCommandRows();
+        if (rows.Count != 1 || rows[0].Command is not { } command)
+            return;
+
+        var dialog = new TextPromptWindow("Command Display Name", "Custom name (leave blank to use the normal name):", command.CustomName)
+        {
+            Owner = this
+        };
+        if (dialog.ShowDialog() != true)
+            return;
+
+        command.CustomName = dialog.Value.Trim();
+        MarkDirty();
+        RefreshCommandList(command.Id);
+        BuildProperties(command);
+    }
+
+    private void CopySelectedProperties()
+    {
+        var rows = GetSelectedCommandRows();
+        if (rows.Count != 1 || rows[0].Command is not { } source)
+            return;
+        _copiedProperties = source.DeepClone();
+        StatusText.Text = $"Copied {FriendlyName(_copiedProperties.Type)} properties";
+    }
+
+    private void PasteSelectedProperties()
+    {
+        var rows = GetSelectedCommandRows();
+        if (rows.Count != 1 || rows[0].Command is not { } target || _copiedProperties is null)
+            return;
+
+        if (target.Type != _copiedProperties.Type)
+        {
+            StatusText.Text = "Properties can only be pasted onto the same command type";
+            return;
+        }
+
+        CopyCommandProperties(target, _copiedProperties);
+        MarkDirty();
+        RefreshCommandList(target.Id);
+        BuildProperties(target);
+        StatusText.Text = "Properties pasted";
+    }
+
+    private static void CopyCommandProperties(MacroCommand target, MacroCommand source)
+    {
+        // Clone first so lists/dictionaries such as OR colors and search targets
+        // are independent from the copied command.
+        var clone = source.DeepClone();
+        var excluded = new HashSet<string>(StringComparer.Ordinal)
+        {
+            nameof(MacroCommand.Id),
+            nameof(MacroCommand.Type),
+            nameof(MacroCommand.Children),
+            nameof(MacroCommand.ElseChildren),
+            nameof(MacroCommand.IsElseIf)
+        };
+
+        foreach (var property in typeof(MacroCommand).GetProperties())
+        {
+            if (!property.CanRead || !property.CanWrite || excluded.Contains(property.Name))
+                continue;
+            property.SetValue(target, property.GetValue(clone));
+        }
     }
 
     private async void RunFromHereButton_Click(object sender, RoutedEventArgs e)
@@ -406,18 +553,20 @@ public partial class MainWindow
         else if (command.FailureAction == FailureAction.RunSequence)
         {
             AddLabel("Tab to run");
+            var failureNames = _project.Sequences.Select(s => s.Name).ToList();
+            var failureOptions = new List<string> { "None" };
+            failureOptions.AddRange(failureNames);
             var sequence = new ComboBox
             {
-                ItemsSource = _project.Sequences.Select(s => s.Name).ToList(),
-                SelectedItem = command.FailureSequence,
+                ItemsSource = failureOptions,
+                SelectedItem = failureNames.Contains(command.FailureSequence, StringComparer.OrdinalIgnoreCase) ? command.FailureSequence : "None",
                 Margin = new Thickness(0, 0, 0, 10)
             };
-            if (sequence.SelectedItem is null && _project.Sequences.Count > 0) sequence.SelectedIndex = 0;
             sequence.SelectionChanged += (_, _) =>
             {
                 if (sequence.SelectedItem is string name)
                 {
-                    command.FailureSequence = name;
+                    command.FailureSequence = name == "None" ? string.Empty : name;
                     MarkDirtyAndRefresh(command.Id);
                 }
             };
@@ -517,7 +666,7 @@ public partial class MainWindow
         };
         panel.Children.Add(customName);
 
-        if (CommandCatalog.CanFail(command.Type))
+        if (CommandCatalog.CanFail(command.Type) && !IsWaitStyleCommand(command.Type))
         {
             panel.Children.Add(new TextBlock
             {
@@ -560,19 +709,23 @@ public partial class MainWindow
             else if (command.FailureAction == FailureAction.RunSequence)
             {
                 panel.Children.Add(new TextBlock { Text = "Tab to run", FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 0, 0, 5) });
+                var failureNames = _project.Sequences.Select(sequenceItem => sequenceItem.Name).ToList();
+                var failureOptions = new List<string> { "None" };
+                failureOptions.AddRange(failureNames);
                 var sequence = new ComboBox
                 {
-                    ItemsSource = _project.Sequences.Select(sequenceItem => sequenceItem.Name).ToList(),
-                    SelectedItem = command.FailureSequence,
+                    ItemsSource = failureOptions,
+                    SelectedItem = failureNames.Contains(command.FailureSequence, StringComparer.OrdinalIgnoreCase) ? command.FailureSequence : "None",
                     Margin = new Thickness(0, 0, 0, 10)
                 };
-                if (sequence.SelectedItem is null && _project.Sequences.Count > 0)
-                    sequence.SelectedIndex = 0;
                 sequence.SelectionChanged += (_, _) =>
                 {
-                    if (sequence.SelectedItem is string name && name != command.FailureSequence)
+                    if (sequence.SelectedItem is string name)
                     {
-                        command.FailureSequence = name;
+                        var next = name == "None" ? string.Empty : name;
+                        if (next == command.FailureSequence)
+                            return;
+                        command.FailureSequence = next;
                         MarkDirtyAndRefresh(command.Id);
                     }
                 };
