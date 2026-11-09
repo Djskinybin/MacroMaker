@@ -3285,7 +3285,7 @@ public partial class MainWindow : Window
             command.MouseMoveMode = selected;
             if (selected == MouseMoveMode.Smooth && command.MoveDurationMs <= 0)
                 command.MoveDurationMs = 50;
-            MarkDirtyAndRefresh(command.Id);
+            CommitPropertySelection(command, mode);
             BuildProperties(command);
         };
         PropertiesPanel.Children.Add(mode);
@@ -3471,9 +3471,7 @@ public partial class MainWindow : Window
                 return;
 
             command.MoveBeforeClick = next;
-            MarkDirty();
-            BuildProperties(command);
-            RefreshCommandList(command.Id);
+            CommitPropertySelection(command, combo);
         };
         PropertiesPanel.Children.Add(combo);
 
@@ -3551,9 +3549,7 @@ public partial class MainWindow : Window
                 command.SearchWidth = 1;
                 command.SearchHeight = 1;
             }
-            MarkDirty();
-            BuildProperties(command);
-            RefreshCommandList(command.Id);
+            CommitPropertySelection(command, combo);
         };
         PropertiesPanel.Children.Add(combo);
 
@@ -3581,9 +3577,7 @@ public partial class MainWindow : Window
             if (next == command.ColorLocationGroupMode)
                 return;
             command.ColorLocationGroupMode = next;
-            MarkDirty();
-            BuildProperties(command);
-            RefreshCommandList(command.Id);
+            CommitPropertySelection(command, groupMode);
         };
         PropertiesPanel.Children.Add(groupMode);
 
@@ -3874,7 +3868,7 @@ public partial class MainWindow : Window
             if (combo.SelectedItem is ComboBoxItem { Tag: CompareMode mode })
             {
                 command.CompareMode = mode;
-                MarkDirtyAndRefresh(command.Id);
+                CommitPropertySelection(command, combo);
             }
         };
         PropertiesPanel.Children.Add(combo);
@@ -3949,7 +3943,6 @@ public partial class MainWindow : Window
         colorRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         colorRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         colorRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        colorRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
 
         var colorText = isPrimary ? command.ColorHex : option!.ColorHex;
         var swatch = new Border
@@ -3968,6 +3961,7 @@ public partial class MainWindow : Window
             Text = colorText,
             ToolTip = "Type a color or choose a saved variable"
         };
+        AutomationProperties.SetName(box, "Color");
         box.TextChanged += (_, _) =>
         {
             var text = box.Text.Trim();
@@ -3987,7 +3981,6 @@ public partial class MainWindow : Window
                 box.Text = NormalizeColor(text);
         };
 
-        var variablePicker = CreateVariablePicker(box);
         var pick = new Button { Content = "Pick Color", MinWidth = 82, Margin = new Thickness(7, 0, 0, 0) };
         pick.Click += (_, _) =>
         {
@@ -4013,18 +4006,16 @@ public partial class MainWindow : Window
 
         Grid.SetColumn(swatch, 0);
         Grid.SetColumn(box, 1);
-        Grid.SetColumn(variablePicker, 2);
-        Grid.SetColumn(pick, 3);
+        Grid.SetColumn(pick, 2);
         colorRow.Children.Add(swatch);
         colorRow.Children.Add(box);
-        colorRow.Children.Add(variablePicker);
         colorRow.Children.Add(pick);
+        AddVariableChoices(colorRow, box);
         panel.Children.Add(colorRow);
 
         var toleranceGrid = new Grid();
         toleranceGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         toleranceGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        toleranceGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         toleranceGrid.Children.Add(new TextBlock
         {
             Text = "Tolerance",
@@ -4084,11 +4075,10 @@ public partial class MainWindow : Window
             MarkDirtyAndRefreshCommandDisplay(command.Id);
         };
 
-        var toleranceVariable = CreateVariablePicker(toleranceBox, toleranceFallback.ToString());
+        AutomationProperties.SetName(toleranceBox, "Tolerance");
         Grid.SetColumn(toleranceBox, 1);
-        Grid.SetColumn(toleranceVariable, 2);
         toleranceGrid.Children.Add(toleranceBox);
-        toleranceGrid.Children.Add(toleranceVariable);
+        AddVariableChoices(toleranceGrid, toleranceBox, toleranceFallback.ToString());
         panel.Children.Add(toleranceGrid);
 
         return new Border
@@ -4205,7 +4195,6 @@ public partial class MainWindow : Window
         var row = new Grid { Margin = new Thickness(0, 0, 0, 7) };
         row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
 
         var label = new TextBlock
         {
@@ -4215,13 +4204,12 @@ public partial class MainWindow : Window
             Margin = new Thickness(0, 0, 5, 0)
         };
 
-        var variablePicker = CreateVariablePicker(box, fallbackValue);
+        AutomationProperties.SetName(box, axis);
         Grid.SetColumn(label, 0);
         Grid.SetColumn(box, 1);
-        Grid.SetColumn(variablePicker, 2);
         row.Children.Add(label);
         row.Children.Add(box);
-        row.Children.Add(variablePicker);
+        AddVariableChoices(row, box, fallbackValue);
         return row;
     }
 
@@ -4419,16 +4407,15 @@ public partial class MainWindow : Window
         var grid = new Grid { Margin = new Thickness(0, 0, 0, 12) };
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
 
         var box = new TextBox { Text = command.ProgramPath };
+        AutomationProperties.SetName(box, "Program, file, folder, or URL");
         box.TextChanged += (_, _) =>
         {
             command.ProgramPath = box.Text.Trim();
             MarkDirtyAndRefreshCommandDisplay(command.Id);
         };
 
-        var variablePicker = CreateVariablePicker(box);
         var browse = new Button { Content = "Browse…", MinWidth = 76, Margin = new Thickness(7, 0, 0, 0) };
         browse.Click += (_, _) =>
         {
@@ -4445,11 +4432,10 @@ public partial class MainWindow : Window
         };
 
         Grid.SetColumn(box, 0);
-        Grid.SetColumn(variablePicker, 1);
-        Grid.SetColumn(browse, 2);
+        Grid.SetColumn(browse, 1);
         grid.Children.Add(box);
-        grid.Children.Add(variablePicker);
         grid.Children.Add(browse);
+        AddVariableChoices(grid, box);
         PropertiesPanel.Children.Add(grid);
         AddTextField("Arguments (optional)", command.ProgramArguments, value => command.ProgramArguments = value);
         AddTextField("Working directory (optional)", command.WorkingDirectory, value => command.WorkingDirectory = value);
@@ -4929,10 +4915,7 @@ public partial class MainWindow : Window
             if (timeoutAction.SelectedItem is not ComboBoxItem { Tag: FailureAction action } || action == command.FailureAction)
                 return;
             command.FailureAction = action;
-            MarkDirty();
-            _expandedTimingOptions.Add(command.Id);
-            BuildProperties(command);
-            RefreshCommandList(command.Id);
+            CommitPropertySelection(command, timeoutAction);
         };
         panel.Children.Add(timeoutAction);
 
@@ -4961,7 +4944,7 @@ public partial class MainWindow : Window
                 if (sequencePicker.SelectedItem is not string name)
                     return;
                 command.FailureSequence = name == "None" ? string.Empty : name;
-                MarkDirtyAndRefresh(command.Id);
+                CommitPropertySelection(command, sequencePicker);
             };
             panel.Children.Add(sequencePicker);
         }
@@ -5015,7 +4998,7 @@ public partial class MainWindow : Window
             if (combo.SelectedItem is string name)
             {
                 command.TargetSequence = name == "None" ? string.Empty : name;
-                MarkDirtyAndRefresh(command.Id);
+                CommitPropertySelection(command, combo);
             }
         };
         PropertiesPanel.Children.Add(combo);
@@ -5035,7 +5018,7 @@ public partial class MainWindow : Window
             if (command.RunSequenceMode == newMode)
                 return;
             command.RunSequenceMode = newMode;
-            MarkDirtyAndRefresh(command.Id);
+            CommitPropertySelection(command, mode);
         };
         PropertiesPanel.Children.Add(mode);
     }
@@ -5166,38 +5149,43 @@ public partial class MainWindow : Window
     private void AddExistingVariableField(string label, string currentValue, Action<string> setter)
     {
         AddLabel(label);
-        var variableNames = GetSavedVariableNames();
-        var combo = new ComboBox
+        var names = GetSavedVariableNames();
+        var currentName = RuntimeValues.NormalizeName(currentValue);
+        var selectedIndex = names.FindIndex(name => string.Equals(name, currentName, StringComparison.OrdinalIgnoreCase));
+        var unavailable = !string.IsNullOrEmpty(currentName) && selectedIndex < 0;
+        if (names.Count == 0 && !unavailable)
         {
-            Margin = new Thickness(0, 0, 0, 12),
-            ToolTip = "Choose a variable that has been saved in this macro"
+            AddInfo("Save a variable in this macro to choose it here.");
+            return;
+        }
+
+        var choices = CreateVariableChoices(label, "(none)", names);
+        choices.Margin = new Thickness(0, 0, 0, 12);
+        choices.SelectedIndex = unavailable ? -1 : selectedIndex + 1;
+
+        var unavailableName = new TextBlock
+        {
+            Text = $"Saved selection: {currentName} (unavailable)",
+            TextWrapping = TextWrapping.Wrap,
+            Margin = new Thickness(0, 0, 0, 5),
+            Visibility = unavailable ? Visibility.Visible : Visibility.Collapsed
         };
+        unavailableName.SetResourceReference(TextBlock.ForegroundProperty, "MutedTextBrush");
+        PropertiesPanel.Children.Add(unavailableName);
 
-        AutomationProperties.SetName(combo, label);
-        combo.Items.Add("None");
-        foreach (var name in variableNames)
-            combo.Items.Add(name);
-
-        var selectedName = variableNames.FirstOrDefault(name =>
-            string.Equals(name, currentValue?.Trim(), StringComparison.OrdinalIgnoreCase));
-        combo.SelectedItem = selectedName ?? "None";
-        combo.IsEnabled = variableNames.Count > 0;
-
-        combo.SelectionChanged += (_, _) =>
+        var commandId = _selectedRow?.Command?.Id;
+        choices.SelectionChanged += (_, _) =>
         {
-            if (combo.SelectedItem is not string value)
+            if (choices.SelectedIndex < 0)
                 return;
 
-            var nextValue = value == "None" ? string.Empty : value;
-            if (string.Equals(nextValue, currentValue, StringComparison.OrdinalIgnoreCase))
-                return;
-
-            setter(nextValue);
-            currentValue = nextValue;
-            MarkDirtyAndRefreshCommandDisplay(_selectedRow?.Command?.Id);
+            var name = choices.SelectedIndex == 0 ? string.Empty : names[choices.SelectedIndex - 1];
+            setter(name);
+            unavailableName.Visibility = Visibility.Collapsed;
+            MarkDirtyAndRefreshCommandDisplay(commandId);
         };
 
-        PropertiesPanel.Children.Add(combo);
+        PropertiesPanel.Children.Add(choices);
     }
 
     private List<string> GetSavedVariableNames()
@@ -5253,79 +5241,76 @@ public partial class MainWindow : Window
         return names.OrderBy(name => name, StringComparer.OrdinalIgnoreCase).ToList();
     }
 
-    private ComboBox CreateVariablePicker(TextBox target, string? fallbackValue = null)
+    private ListBox CreateVariableChoices(string label, string firstOption, List<string> names)
+    {
+        var choices = new ListBox
+        {
+            Style = (Style)FindResource("VariableChoicesStyle"),
+            ItemsSource = names.Prepend(firstOption).ToList()
+        };
+        AutomationProperties.SetName(choices, label);
+        choices.Loaded += (_, _) =>
+        {
+            if (choices.SelectedIndex > 0 && choices.SelectedItem is { } item)
+                choices.ScrollIntoView(item);
+        };
+        return choices;
+    }
+
+    private void AddVariableChoices(Grid row, TextBox target, string? fallbackValue = null)
     {
         var names = GetSavedVariableNames();
-        var combo = new ComboBox
-        {
-            MinWidth = 112,
-            MaxWidth = 142,
-            Margin = new Thickness(7, 0, 0, 0),
-            VerticalAlignment = VerticalAlignment.Top,
-            ToolTip = "Use a saved variable in this field"
-        };
+        if (names.Count == 0)
+            return;
 
         var targetName = AutomationProperties.GetName(target);
-        AutomationProperties.SetName(combo, string.IsNullOrWhiteSpace(targetName) ? "Use saved variable" : $"Use saved variable for {targetName}");
+        var label = string.IsNullOrWhiteSpace(targetName) ? "Use saved variable" : $"Use saved variable for {targetName}";
+        var choices = CreateVariableChoices(label, "Typed value", names);
+        choices.Margin = new Thickness(0, 5, 0, 0);
 
-        combo.Items.Add("None");
-        foreach (var name in names)
-            combo.Items.Add(name);
-
-        var initialMatch = names.FirstOrDefault(name =>
+        int FindVariableIndex() => names.FindIndex(name =>
             string.Equals(name, target.Text.Trim(), StringComparison.OrdinalIgnoreCase));
-        var previousLiteralValue = initialMatch is null ? target.Text : fallbackValue ?? string.Empty;
+
+        var initialIndex = FindVariableIndex();
+        var previousLiteralValue = initialIndex < 0 ? target.Text : fallbackValue ?? string.Empty;
         var updating = false;
 
-        void MatchPickerToText()
+        choices.SelectedIndex = initialIndex + 1;
+        target.TextChanged += (_, _) =>
         {
             if (updating)
                 return;
 
-            var text = target.Text.Trim();
-            var match = names.FirstOrDefault(name =>
-                string.Equals(name, text, StringComparison.OrdinalIgnoreCase));
-
-            if (match is null)
+            var matchIndex = FindVariableIndex();
+            if (matchIndex < 0)
                 previousLiteralValue = target.Text;
 
-            updating = true;
-            try
-            {
-                combo.SelectedItem = match ?? "None";
-            }
-            finally
-            {
-                updating = false;
-            }
-        }
-
-        combo.SelectedItem = initialMatch ?? "None";
-        combo.IsEnabled = names.Count > 0;
-        target.TextChanged += (_, _) => MatchPickerToText();
-        combo.SelectionChanged += (_, _) =>
-        {
-            if (updating || combo.SelectedItem is not string selected)
+            if (choices.SelectedIndex == matchIndex + 1)
                 return;
 
             updating = true;
             try
             {
-                if (selected == "None")
-                {
-                    target.Text = previousLiteralValue;
-                }
-                else
-                {
-                    var currentMatch = names.Any(name =>
-                        string.Equals(name, target.Text.Trim(), StringComparison.OrdinalIgnoreCase));
-                    if (!currentMatch)
-                        previousLiteralValue = target.Text;
-                    target.Text = selected;
-                }
+                choices.SelectedIndex = matchIndex + 1;
+            }
+            finally
+            {
+                updating = false;
+            }
+        };
+        choices.SelectionChanged += (_, _) =>
+        {
+            if (updating || choices.SelectedIndex < 0)
+                return;
 
+            updating = true;
+            try
+            {
+                if (FindVariableIndex() < 0)
+                    previousLiteralValue = target.Text;
+
+                target.Text = choices.SelectedIndex == 0 ? previousLiteralValue : names[choices.SelectedIndex - 1];
                 target.CaretIndex = target.Text.Length;
-                target.Focus();
             }
             finally
             {
@@ -5333,20 +5318,19 @@ public partial class MainWindow : Window
             }
         };
 
-        return combo;
+        row.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        row.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        Grid.SetRow(choices, 1);
+        Grid.SetColumnSpan(choices, Math.Max(1, row.ColumnDefinitions.Count));
+        row.Children.Add(choices);
     }
 
     private FrameworkElement CreateVariableInputRow(TextBox box, string? fallbackValue = null)
     {
         var row = new Grid { Margin = new Thickness(0, 0, 0, 12) };
-        row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         box.Margin = new Thickness(0);
-        var picker = CreateVariablePicker(box, fallbackValue);
-        Grid.SetColumn(box, 0);
-        Grid.SetColumn(picker, 1);
         row.Children.Add(box);
-        row.Children.Add(picker);
+        AddVariableChoices(row, box, fallbackValue);
         return row;
     }
 
@@ -5379,7 +5363,6 @@ public partial class MainWindow : Window
         var row = new Grid { Margin = new Thickness(0, 0, 0, 12) };
         row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
 
         var box = new TextBox
         {
@@ -5393,7 +5376,6 @@ public partial class MainWindow : Window
             MarkDirtyAndRefreshCommandDisplay(_selectedRow?.Command?.Id);
         };
 
-        var variablePicker = CreateVariablePicker(box);
         var browse = new Button { Content = "Browse…", MinWidth = 76, Margin = new Thickness(7, 0, 0, 0) };
         browse.Click += (_, _) =>
         {
@@ -5422,11 +5404,10 @@ public partial class MainWindow : Window
         };
 
         Grid.SetColumn(box, 0);
-        Grid.SetColumn(variablePicker, 1);
-        Grid.SetColumn(browse, 2);
+        Grid.SetColumn(browse, 1);
         row.Children.Add(box);
-        row.Children.Add(variablePicker);
         row.Children.Add(browse);
+        AddVariableChoices(row, box);
         PropertiesPanel.Children.Add(row);
     }
 
@@ -5592,6 +5573,34 @@ public partial class MainWindow : Window
     {
         PropertiesPanel.Children.Clear();
         PropertiesHintText.Text = hint;
+    }
+
+    private void CommitPropertySelection(MacroCommand command, ComboBox combo)
+    {
+        MarkDirtyAndRefreshCommandDisplay(command.Id);
+
+        void RefreshWhenInputFinishes()
+        {
+            Dispatcher.BeginInvoke(DispatcherPriority.Background, () =>
+            {
+                if (_selectedRow?.Command == command && PropertiesPanel.IsAncestorOf(combo))
+                    RefreshCommandList(command.Id);
+            });
+        }
+
+        if (!combo.IsDropDownOpen)
+        {
+            RefreshWhenInputFinishes();
+            return;
+        }
+
+        void OnDropDownClosed(object? sender, EventArgs args)
+        {
+            combo.DropDownClosed -= OnDropDownClosed;
+            RefreshWhenInputFinishes();
+        }
+
+        combo.DropDownClosed += OnDropDownClosed;
     }
 
     private void MarkDirtyAndRefresh(Guid? selectedId)

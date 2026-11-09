@@ -384,7 +384,7 @@ public partial class MainWindow
             if (combo.SelectedItem is ComboBoxItem { Tag: CoordinateMode mode } && mode != command.CoordinateMode)
             {
                 command.CoordinateMode = mode;
-                MarkDirtyAndRefresh(command.Id);
+                CommitPropertySelection(command, combo);
             }
         };
         panel.Children.Add(combo);
@@ -435,7 +435,7 @@ public partial class MainWindow
             if (combo.SelectedItem is ComboBoxItem { Tag: CoordinateMode mode } && mode != command.CoordinateMode)
             {
                 command.CoordinateMode = mode;
-                MarkDirtyAndRefresh(command.Id);
+                CommitPropertySelection(command, combo);
             }
         };
         PropertiesPanel.Children.Add(combo);
@@ -509,7 +509,7 @@ public partial class MainWindow
             if (compare.SelectedItem is ComboBoxItem { Tag: VariableCompareMode mode })
             {
                 command.VariableCompareMode = mode;
-                MarkDirtyAndRefresh(command.Id);
+                CommitPropertySelection(command, compare);
             }
         };
         PropertiesPanel.Children.Add(compare);
@@ -538,9 +538,7 @@ public partial class MainWindow
             if (combo.SelectedItem is ComboBoxItem { Tag: FailureAction action } && action != command.FailureAction)
             {
                 command.FailureAction = action;
-                MarkDirtyAndRefresh(command.Id);
-                _expandedMoreOptions.Add(command.Id);
-                BuildProperties(command);
+                CommitPropertySelection(command, combo);
             }
         };
         PropertiesPanel.Children.Add(combo);
@@ -567,7 +565,7 @@ public partial class MainWindow
                 if (sequence.SelectedItem is string name)
                 {
                     command.FailureSequence = name == "None" ? string.Empty : name;
-                    MarkDirtyAndRefresh(command.Id);
+                    CommitPropertySelection(command, sequence);
                 }
             };
             PropertiesPanel.Children.Add(sequence);
@@ -692,9 +690,7 @@ public partial class MainWindow
                 if (failure.SelectedItem is not ComboBoxItem { Tag: FailureAction action } || action == command.FailureAction)
                     return;
                 command.FailureAction = action;
-                MarkDirtyAndRefresh(command.Id);
-                _expandedMoreOptions.Add(command.Id);
-                BuildProperties(command);
+                CommitPropertySelection(command, failure);
             };
             panel.Children.Add(failure);
 
@@ -726,7 +722,7 @@ public partial class MainWindow
                         if (next == command.FailureSequence)
                             return;
                         command.FailureSequence = next;
-                        MarkDirtyAndRefresh(command.Id);
+                        CommitPropertySelection(command, sequence);
                     }
                 };
                 panel.Children.Add(sequence);
@@ -759,8 +755,16 @@ public partial class MainWindow
             },
             Margin = new Thickness(0, 12, 0, 4)
         };
-        expander.Expanded += (_, _) => _expandedMoreOptions.Add(command.Id);
-        expander.Collapsed += (_, _) => { if (!_rebuildingProperties) _expandedMoreOptions.Remove(command.Id); };
+        expander.Expanded += (_, e) =>
+        {
+            if (e.OriginalSource == expander)
+                _expandedMoreOptions.Add(command.Id);
+        };
+        expander.Collapsed += (_, e) =>
+        {
+            if (e.OriginalSource == expander && !_rebuildingProperties)
+                _expandedMoreOptions.Remove(command.Id);
+        };
         PropertiesPanel.Children.Add(expander);
     }
 
