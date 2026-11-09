@@ -174,8 +174,7 @@ public sealed class AppSettings
     {
         CommandType.MoveMouse,
         CommandType.Click,
-        CommandType.Wait,
-        CommandType.RecordedActions
+        CommandType.Wait
     };
 
     public List<CommandDefaultProfile> CommandDefaults { get; set; } = CommandDefaultsFactory.CreateAll();
@@ -269,7 +268,7 @@ internal static class AppSettingsStore
     {
         settings.QuickAddCommands ??= new List<CommandType>();
         settings.QuickAddCommands = settings.QuickAddCommands
-            .Where(CommandCatalog.CanQuickAdd)
+            .Where(CommandCatalog.CanPinQuickAdd)
             .Distinct()
             .ToList();
 
@@ -545,6 +544,7 @@ internal static class CommandCatalog
 
     public static IReadOnlyList<Option> AllOptions => Categories.SelectMany(x => x.Commands).ToArray();
     public static bool CanQuickAdd(CommandType type) => AllOptions.Any(x => x.Type == type);
+    public static bool CanPinQuickAdd(CommandType type) => type != CommandType.RecordedActions && CanQuickAdd(type);
     public static string QuickLabel(CommandType type) => AllOptions.FirstOrDefault(x => x.Type == type)?.Label ?? type.ToString();
     public static string CategoryFor(CommandType type) => AllOptions.FirstOrDefault(x => x.Type == type)?.Category ?? "Other";
 

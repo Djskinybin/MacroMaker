@@ -14,6 +14,7 @@ public sealed class RunStatusWindow : Window
     private const int WsExNoActivate = 0x08000000;
 
     private readonly TextBlock _statusText;
+    private readonly TextBlock _detailText;
     private readonly HudCorner _corner;
 
     public RunStatusWindow(string stopHotkey, string pauseHotkey, HudCorner corner = HudCorner.TopLeft, int opacityPercent = 92)
@@ -45,7 +46,7 @@ public sealed class RunStatusWindow : Window
         var panel = new StackPanel();
         panel.Children.Add(new TextBlock
         {
-            Text = "MACRO RUNNING",
+            Text = "CURRENT STEP",
             FontWeight = FontWeights.Bold,
             FontSize = 13,
             Foreground = new SolidColorBrush(Color.FromRgb(126, 166, 255))
@@ -57,10 +58,19 @@ public sealed class RunStatusWindow : Window
             FontSize = 14,
             FontWeight = FontWeights.SemiBold,
             Foreground = Brushes.White,
-            TextWrapping = TextWrapping.Wrap,
+            TextTrimming = TextTrimming.CharacterEllipsis,
             Margin = new Thickness(0, 6, 0, 6)
         };
         panel.Children.Add(_statusText);
+        _detailText = new TextBlock
+        {
+            FontSize = 12,
+            Foreground = new SolidColorBrush(Color.FromRgb(205, 215, 230)),
+            TextTrimming = TextTrimming.CharacterEllipsis,
+            Margin = new Thickness(0, 0, 0, 6),
+            Visibility = Visibility.Collapsed
+        };
+        panel.Children.Add(_detailText);
 
         var controls = $"{stopHotkey} Stop";
         if (!string.IsNullOrWhiteSpace(pauseHotkey))
@@ -80,14 +90,16 @@ public sealed class RunStatusWindow : Window
         SourceInitialized += (_, _) => MakeClickThrough();
     }
 
-    public void UpdateStatus(string text)
+    public void UpdateStatus(string text, string detail = "")
     {
         if (!Dispatcher.CheckAccess())
         {
-            _ = Dispatcher.BeginInvoke(() => UpdateStatus(text));
+            _ = Dispatcher.BeginInvoke(() => UpdateStatus(text, detail));
             return;
         }
         _statusText.Text = string.IsNullOrWhiteSpace(text) ? "Running…" : text;
+        _detailText.Text = detail;
+        _detailText.Visibility = string.IsNullOrWhiteSpace(detail) ? Visibility.Collapsed : Visibility.Visible;
     }
 
     private void PositionWindow()

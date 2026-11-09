@@ -1,3 +1,4 @@
+using System.Windows.Automation;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
@@ -511,6 +512,7 @@ public sealed class CommandPickerWindow : Window
             Padding = new Thickness(10, 7, 10, 7),
             ToolTip = "Search commands, e.g. image, wait, variable, window"
         };
+        AutomationProperties.SetName(_searchBox, "Search commands");
         _searchBox.TextChanged += (_, _) =>
         {
             var query = _searchBox.Text.Trim();
@@ -593,6 +595,21 @@ public sealed class CommandPickerWindow : Window
 
         BuildCategories();
         ShowCategory(0);
+        Loaded += (_, _) => _searchBox.Focus();
+        _searchBox.PreviewKeyDown += (_, e) =>
+        {
+            if (e.Key == Key.Enter && !string.IsNullOrWhiteSpace(_searchBox.Text)
+                && _commandPanel.Children.OfType<Button>().FirstOrDefault() is { } result)
+            {
+                result.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+                e.Handled = true;
+            }
+            else if (e.Key == Key.Down && _commandPanel.Children.OfType<Button>().FirstOrDefault() is { } firstResult)
+            {
+                firstResult.Focus();
+                e.Handled = true;
+            }
+        };
 
         PreviewKeyDown += (_, e) =>
         {

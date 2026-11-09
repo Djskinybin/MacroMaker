@@ -8,6 +8,7 @@ public sealed class MacroEngine
 {
     private readonly MacroProject _project;
     private readonly RuntimeValues _values;
+    private readonly AsyncLocal<RunStep?> _activeStep = new();
     private readonly object _parallelLock = new();
     private readonly Dictionary<string, Task> _parallelSequences = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _activeSequences = new(StringComparer.OrdinalIgnoreCase);
@@ -32,6 +33,7 @@ public sealed class MacroEngine
 
     public bool IsRunning { get; private set; }
     public bool IsPaused => _paused;
+    internal RunTrace? LastRunTrace { get; private set; }
     public int PlaybackSpeedPercent { get; set; } = 100;
     public IReadOnlyDictionary<string, string> RuntimeSnapshot => _values.Snapshot();
 
@@ -57,22 +59,24 @@ public sealed class MacroEngine
             await RunSequenceAsync(sequenceName, _cts!.Token, 0);
             await WaitForParallelSequencesAsync(_cts.Token);
             if (!_cts.IsCancellationRequested)
-                StatusChanged?.Invoke("Finished");
+                ReportRunStatus("Finished");
         }
         catch (OperationCanceledException)
         {
             var parallelFailure = GetParallelFailure();
             if (parallelFailure is not null)
             {
-                StatusChanged?.Invoke("Error");
+                LastRunTrace?.RecordError(null, parallelFailure);
+                ReportRunStatus("Error");
                 throw new InvalidOperationException($"A simultaneously running tab failed: {parallelFailure.Message}", parallelFailure);
             }
-            StatusChanged?.Invoke("Stopped");
+            ReportRunStatus("Stopped");
         }
         catch (Exception ex)
         {
             _cts?.Cancel();
-            StatusChanged?.Invoke("Error");
+            LastRunTrace?.RecordError(null, ex);
+            ReportRunStatus("Error");
             throw new InvalidOperationException($"Macro stopped: {ex.Message}", ex);
         }
         finally
@@ -81,12 +85,12 @@ public sealed class MacroEngine
         }
     }
 
-    public async Task StartCommandAsync(MacroCommand command, string label = "Selected Command")
+    public async Task StartCommandAsync(MacroCommand command, string label = "Selected Command", string? tab = null)
     {
-        await StartCommandsAsync(new[] { command }, label, "Test finished");
+        await StartCommandsAsync(new[] { command }, label, "Test finished", tab);
     }
 
-    public async Task StartCommandsAsync(IReadOnlyList<MacroCommand> commands, string label = "Commands", string finishedText = "Finished")
+    public async Task StartCommandsAsync(IReadOnlyList<MacroCommand> commands, string label = "Commands", string finishedText = "Finished", string? tab = null)
     {
         if (IsRunning)
             return;
@@ -94,25 +98,27 @@ public sealed class MacroEngine
         BeginRun($"Running: {label}");
         try
         {
-            await ExecuteCommandsAsync(label, commands, _cts!.Token, 0);
+            await ExecuteCommandsAsync(tab ?? label, commands, _cts!.Token, 0);
             await WaitForParallelSequencesAsync(_cts.Token);
             if (!_cts.IsCancellationRequested)
-                StatusChanged?.Invoke(finishedText);
+                ReportRunStatus(finishedText);
         }
         catch (OperationCanceledException)
         {
             var parallelFailure = GetParallelFailure();
             if (parallelFailure is not null)
             {
-                StatusChanged?.Invoke("Error");
+                LastRunTrace?.RecordError(null, parallelFailure);
+                ReportRunStatus("Error");
                 throw new InvalidOperationException($"A simultaneously running tab failed: {parallelFailure.Message}", parallelFailure);
             }
-            StatusChanged?.Invoke("Stopped");
+            ReportRunStatus("Stopped");
         }
         catch (Exception ex)
         {
             _cts?.Cancel();
-            StatusChanged?.Invoke("Error");
+            LastRunTrace?.RecordError(null, ex);
+            ReportRunStatus("Error");
             throw new InvalidOperationException($"Macro stopped: {ex.Message}", ex);
         }
         finally
@@ -123,6 +129,7 @@ public sealed class MacroEngine
 
     private void BeginRun(string status)
     {
+        LastRunTrace = new RunTrace();
         _values.Reset(_project);
         if (_runOverrides is not null)
         {
@@ -149,7 +156,7 @@ public sealed class MacroEngine
         IsRunning = true;
         PlaybackSpeedPercent = Math.Clamp(PlaybackSpeedPercent, 10, 400);
         StateChanged?.Invoke();
-        StatusChanged?.Invoke(status);
+        ReportRunStatus(status);
     }
 
     private async Task ShutdownRunAsync()
@@ -189,7 +196,7 @@ public sealed class MacroEngine
             return;
 
         _paused = !_paused;
-        StatusChanged?.Invoke(_paused ? "Paused" : "Resumed");
+        ReportRunStatus(_paused ? "Paused" : "Resumed");
         StateChanged?.Invoke();
     }
 
@@ -207,7 +214,7 @@ public sealed class MacroEngine
 
         if (!sequence.Enabled && !sequence.Name.Equals("Starting Sequence", StringComparison.OrdinalIgnoreCase))
         {
-            StatusChanged?.Invoke($"Skipped disabled tab: {sequence.Name}");
+            ReportRunStatus($"Skipped disabled tab: {sequence.Name}");
             return;
         }
 
@@ -251,6 +258,33 @@ public sealed class MacroEngine
             if (!sourceCommand.Enabled)
                 continue;
 
+            var signal = await ExecuteCommandAsync(sequenceName, sourceCommand, token, depth);
+            if (signal != ExecutionSignal.None)
+                return signal;
+        }
+
+        return ExecutionSignal.None;
+    }
+
+    private async Task<ExecutionSignal> ExecuteCommandAsync(
+        string sequenceName, MacroCommand sourceCommand, CancellationToken token, int depth)
+    {
+        var trace = LastRunTrace!;
+        var stepTitle = sourceCommand.Type switch
+        {
+            CommandType.TypeText or CommandType.SetClipboard or CommandType.SetVariable or CommandType.AddVariable
+                or CommandType.IfVariable or CommandType.WaitUntilVariable or CommandType.LoopWhileVariable
+                or CommandType.LoopUntilVariable or CommandType.Comment => string.IsNullOrWhiteSpace(sourceCommand.CustomName)
+                    ? CommandCatalog.QuickLabel(sourceCommand.Type)
+                    : sourceCommand.CustomName,
+            _ => sourceCommand.DisplayText()
+        };
+        var previousStep = _activeStep.Value;
+        var step = new RunStep(sequenceName, sourceCommand.Id, stepTitle);
+        _activeStep.Value = step;
+        trace.StartStep(step);
+        try
+        {
             var command = _values.ResolveNumericExpressions(sourceCommand);
             CommandStarted?.Invoke(sequenceName, command.Id);
 
@@ -472,7 +506,7 @@ public sealed class MacroEngine
                 case CommandType.Wait:
                 {
                     var wait = Math.Max(0, _values.ResolveInt(command.WaitExpression, command.WaitMs));
-                    StatusChanged?.Invoke($"Waiting {wait} ms");
+                    ReportProgress($"Waiting {wait} ms");
                     await DelayPausableAsync(wait, token);
                     break;
                 }
@@ -482,7 +516,7 @@ public sealed class MacroEngine
                     var min = Math.Max(0, Math.Min(command.MinWaitMs, command.MaxWaitMs));
                     var max = Math.Max(min, Math.Max(command.MinWaitMs, command.MaxWaitMs));
                     var delay = NextInclusive(min, max);
-                    StatusChanged?.Invoke($"Waiting {delay} ms (random)");
+                    ReportProgress($"Waiting {delay} ms (random)");
                     await DelayPausableAsync(delay, token);
                     break;
                 }
@@ -498,7 +532,7 @@ public sealed class MacroEngine
                 case CommandType.IfColor:
                 {
                     var (matched, current, point, target) = await ColorConditionAsync(command, token);
-                    StatusChanged?.Invoke($"Checking {target}  •  Current {current}");
+                    ReportResult($"Color check {(matched ? "matched" : "did not match")}. Target {target}, found {current}.");
                     if (matched && !TryConsumeConditionCooldown(command))
                         break;
                     var branch = matched ? command.Children : command.ElseChildren;
@@ -522,7 +556,7 @@ public sealed class MacroEngine
                         token.ThrowIfCancellationRequested();
                         await WaitWhilePausedAsync(token);
                         var (matched, current, point, target) = await ColorConditionAsync(command, token);
-                        StatusChanged?.Invoke($"Looping while {point.X}, {point.Y} matches condition {target}  •  Current {current}");
+                        ReportProgress($"Looping while {point.X}, {point.Y} matches condition {target}  •  Current {current}");
                         if (!matched)
                             break;
                         var signal = await ExecuteCommandsAsync(sequenceName, command.Children, token, depth);
@@ -540,7 +574,7 @@ public sealed class MacroEngine
                         token.ThrowIfCancellationRequested();
                         await WaitWhilePausedAsync(token);
                         var (matched, current, point, target) = await ColorConditionAsync(command, token);
-                        StatusChanged?.Invoke($"Waiting until {point.X}, {point.Y} matches condition {target}  •  Current {current}");
+                        ReportProgress($"Waiting until {point.X}, {point.Y} matches condition {target}  •  Current {current}");
                         if (matched)
                             break;
                         var signal = await ExecuteCommandsAsync(sequenceName, command.Children, token, depth);
@@ -559,6 +593,7 @@ public sealed class MacroEngine
                     if (point is null)
                         break;
 
+                    ReportResult($"Color found at {point.Value.X}, {point.Value.Y}.");
                     StoreFoundPoint(point.Value.X, point.Value.Y, command, "LastColorX", "LastColorY");
                     if (command.Type == CommandType.ClickColor)
                     {
@@ -577,18 +612,19 @@ public sealed class MacroEngine
                     var color = ScreenTools.GetPixelHex(point.X, point.Y);
                     var variable = string.IsNullOrWhiteSpace(command.StoreTextVariable) ? "PixelColor" : command.StoreTextVariable;
                     _values.Set(variable, color);
-                    StatusChanged?.Invoke($"{variable} = {color} at {point.X}, {point.Y}");
+                    ReportProgress($"{variable} = {color} at {point.X}, {point.Y}");
                     break;
                 }
 
                 case CommandType.IfImage:
                 {
                     var resolved = CoordinateResolver.ResolveImageSearch(command, _values);
-                    StatusChanged?.Invoke($"Checking image: {DescribeImageSource(resolved)}");
-                    var match = await ImageMatcher.FindAsync(resolved, token, text => StatusChanged?.Invoke(text));
+                    ReportProgress($"Checking image: {DescribeImageSource(resolved)}");
+                    var match = await ImageMatcher.FindAsync(resolved, token, ReportProgress);
                     if (match.HasValue)
                         StoreImageMatch(match.Value);
                     var matched = match.HasValue;
+                    ReportResult(match is { } hit ? $"Image found at {hit.CenterX}, {hit.CenterY}." : "Image not found.");
                     if (matched && !TryConsumeConditionCooldown(command))
                         break;
                     var branch = matched ? command.Children : command.ElseChildren;
@@ -614,6 +650,7 @@ public sealed class MacroEngine
                     if (match is null)
                         break;
 
+                    ReportResult($"Image found at {match.Value.CenterX}, {match.Value.CenterY}.");
                     StoreImageMatch(match.Value);
                     StoreFoundPoint(match.Value.CenterX, match.Value.CenterY, command, "LastImageX", "LastImageY");
                     if (command.Type == CommandType.FindImageToVariables)
@@ -645,8 +682,8 @@ public sealed class MacroEngine
                         token.ThrowIfCancellationRequested();
                         await WaitWhilePausedAsync(token);
                         var resolved = CoordinateResolver.ResolveImageSearch(command, _values);
-                        StatusChanged?.Invoke($"Waiting for image: {DescribeImageSource(resolved)}");
-                        var match = await ImageMatcher.FindAsync(resolved, token, text => StatusChanged?.Invoke(text));
+                        ReportProgress($"Waiting for image: {DescribeImageSource(resolved)}");
+                        var match = await ImageMatcher.FindAsync(resolved, token, ReportProgress);
                         if (match.HasValue)
                         {
                             StoreImageMatch(match.Value);
@@ -667,8 +704,8 @@ public sealed class MacroEngine
                         token.ThrowIfCancellationRequested();
                         await WaitWhilePausedAsync(token);
                         var resolved = CoordinateResolver.ResolveImageSearch(command, _values);
-                        StatusChanged?.Invoke($"Looping while image exists: {DescribeImageSource(resolved)}");
-                        var match = await ImageMatcher.FindAsync(resolved, token, text => StatusChanged?.Invoke(text));
+                        ReportProgress($"Looping while image exists: {DescribeImageSource(resolved)}");
+                        var match = await ImageMatcher.FindAsync(resolved, token, ReportProgress);
                         if (!match.HasValue)
                             break;
                         StoreImageMatch(match.Value);
@@ -684,6 +721,7 @@ public sealed class MacroEngine
                 {
                     var title = _values.ResolveText(command.WindowTitle);
                     var matched = WindowTools.Exists(title);
+                    ReportResult(matched ? $"Window found: {title}" : $"Window not found: {title}");
                     if (matched && !TryConsumeConditionCooldown(command))
                         break;
                     var branch = matched ? command.Children : command.ElseChildren;
@@ -748,12 +786,12 @@ public sealed class MacroEngine
 
                 case CommandType.SetVariable:
                     _values.Set(command.VariableName, _values.ResolveValue(command.VariableValue));
-                    StatusChanged?.Invoke($"{RuntimeValues.NormalizeName(command.VariableName)} = {_values.Get(command.VariableName)}");
+                    ReportProgress($"{RuntimeValues.NormalizeName(command.VariableName)} = {_values.Get(command.VariableName)}");
                     break;
 
                 case CommandType.AddVariable:
                     _values.Add(command.VariableName, command.VariableValue);
-                    StatusChanged?.Invoke($"{RuntimeValues.NormalizeName(command.VariableName)} = {_values.Get(command.VariableName)}");
+                    ReportProgress($"{RuntimeValues.NormalizeName(command.VariableName)} = {_values.Get(command.VariableName)}");
                     break;
 
                 case CommandType.RandomNumber:
@@ -769,6 +807,7 @@ public sealed class MacroEngine
                 case CommandType.IfVariable:
                 {
                     var matched = _values.Compare(command.VariableName, command.VariableCompareMode, command.VariableValue);
+                    ReportResult($"Variable {command.VariableName}: condition {(matched ? "matched" : "did not match")}.");
                     if (matched && !TryConsumeConditionCooldown(command))
                         break;
                     var branch = matched ? command.Children : command.ElseChildren;
@@ -1002,8 +1041,36 @@ public sealed class MacroEngine
                     break;
             }
         }
+        catch (Exception error) when (error is not OperationCanceledException || !token.IsCancellationRequested)
+        {
+            trace.RecordError(step, error);
+            throw;
+        }
+        finally
+        {
+            trace.EndStep(step);
+            _activeStep.Value = previousStep;
+        }
 
         return ExecutionSignal.None;
+    }
+
+    private void ReportRunStatus(string message)
+    {
+        LastRunTrace?.SetRunStatus(message);
+        StatusChanged?.Invoke(message);
+    }
+
+    private void ReportProgress(string message)
+    {
+        LastRunTrace?.UpdateProgress(_activeStep.Value, message);
+        StatusChanged?.Invoke(message);
+    }
+
+    private void ReportResult(string message, RunLogLevel level = RunLogLevel.Result)
+    {
+        LastRunTrace?.AddResult(_activeStep.Value, message, level);
+        StatusChanged?.Invoke(message);
     }
 
     private Task<(bool Matched, string Current, (int X, int Y) Point, string Target)> ColorConditionAsync(MacroCommand command, CancellationToken token)
@@ -1230,17 +1297,20 @@ public sealed class MacroEngine
         var stopwatch = Stopwatch.StartNew();
         var timeout = Math.Max(0, command.TimeoutMs);
         var poll = Math.Clamp(command.PollMs, 10, 5000);
-        StatusChanged?.Invoke($"Waiting for {description}");
+        ReportProgress($"Waiting for {description}");
 
         while (true)
         {
             token.ThrowIfCancellationRequested();
             await WaitWhilePausedAsync(token);
             if (await predicate())
+            {
+                ReportResult($"Ready: {description}");
                 return true;
+            }
             if (timeout > 0 && stopwatch.ElapsedMilliseconds >= timeout)
             {
-                StatusChanged?.Invoke($"Timed out waiting for {description}");
+                ReportResult($"Timed out waiting for {description}", RunLogLevel.Warning);
                 return false;
             }
             await DelayPausableAsync(poll, token);
@@ -1259,12 +1329,15 @@ public sealed class MacroEngine
             token.ThrowIfCancellationRequested();
             await WaitWhilePausedAsync(token);
             var (matched, current, point, target) = await ColorConditionAsync(command, token);
-            StatusChanged?.Invoke($"Waiting until {point.X}, {point.Y} {relation} {target}  •  Current {current}");
+            ReportProgress($"Waiting until {point.X}, {point.Y} {relation} {target}  •  Current {current}");
             if (matched)
+            {
+                ReportResult($"Color condition matched at {point.X}, {point.Y}.");
                 return true;
+            }
             if (timeout > 0 && stopwatch.ElapsedMilliseconds >= timeout)
             {
-                StatusChanged?.Invoke($"Timed out waiting for {target} at {point.X}, {point.Y}");
+                ReportResult($"Timed out waiting for {target} at {point.X}, {point.Y}. Found {current}.", RunLogLevel.Warning);
                 return false;
             }
             await DelayPausableAsync(poll, token);
@@ -1283,15 +1356,20 @@ public sealed class MacroEngine
             await WaitWhilePausedAsync(token);
             var resolved = CoordinateResolver.ResolveImageSearch(command, _values);
             var source = DescribeImageSource(resolved);
-            StatusChanged?.Invoke(shouldExist ? $"Waiting for image: {source}" : $"Waiting for image to disappear: {source}");
-            var match = await ImageMatcher.FindAsync(resolved, token, text => StatusChanged?.Invoke(text));
+            ReportProgress(shouldExist ? $"Waiting for image: {source}" : $"Waiting for image to disappear: {source}");
+            var match = await ImageMatcher.FindAsync(resolved, token, ReportProgress);
             var found = match.HasValue;
             if (match.HasValue) StoreImageMatch(match.Value);
             if (found == shouldExist)
+            {
+                ReportResult(match is { } hit
+                    ? $"Image found at {hit.CenterX}, {hit.CenterY}."
+                    : $"Image disappeared: {source}");
                 return true;
+            }
             if (timeout > 0 && stopwatch.ElapsedMilliseconds >= timeout)
             {
-                StatusChanged?.Invoke($"Timed out waiting for image: {source}");
+                ReportResult($"Timed out waiting for image: {source}", RunLogLevel.Warning);
                 return false;
             }
             await DelayPausableAsync(poll, token);
@@ -1304,8 +1382,8 @@ public sealed class MacroEngine
         await RunFailureAwareAsync(command, "image search", async () =>
         {
             var resolved = CoordinateResolver.ResolveImageSearch(command, _values);
-            StatusChanged?.Invoke($"Looking for image: {DescribeImageSource(resolved)}");
-            found = await ImageMatcher.FindAsync(resolved, token, text => StatusChanged?.Invoke(text));
+            ReportProgress($"Looking for image: {DescribeImageSource(resolved)}");
+            found = await ImageMatcher.FindAsync(resolved, token, ReportProgress);
             return found.HasValue;
         }, token, depth);
         return found;
@@ -1324,7 +1402,7 @@ public sealed class MacroEngine
         (int X, int Y)? point = null;
         await RunFailureAwareAsync(command, "color search", async () =>
         {
-            StatusChanged?.Invoke($"Searching for {DescribeColorTargets(resolved)} in the selected area");
+            ReportProgress($"Searching for {DescribeColorTargets(resolved)} in the selected area");
             point = await ColorFinder.FindAsync(resolved, token);
             return point.HasValue;
         }, token, depth);
@@ -1349,19 +1427,21 @@ public sealed class MacroEngine
                 return true;
             if (i + 1 < attempts)
             {
-                StatusChanged?.Invoke($"Retry {i + 1}/{attempts - 1}: {description}");
+                ReportResult($"Retry {i + 1}/{attempts - 1}: {description}", RunLogLevel.Warning);
                 await DelayPausableAsync(Math.Clamp(command.FailureRetryDelayMs, 0, 60000), token);
             }
         }
 
-        StatusChanged?.Invoke($"Failed: {description}");
         switch (command.FailureAction)
         {
             case FailureAction.StopMacro:
                 throw new InvalidOperationException($"Command failed: {description}");
-            case FailureAction.RunSequence:
-                if (!string.IsNullOrWhiteSpace(command.FailureSequence))
-                    await RunSequenceAsync(command.FailureSequence, token, depth + 1);
+            case FailureAction.RunSequence when !string.IsNullOrWhiteSpace(command.FailureSequence):
+                ReportResult($"Failed: {description}. Running {command.FailureSequence}.", RunLogLevel.Warning);
+                await RunSequenceAsync(command.FailureSequence, token, depth + 1);
+                break;
+            default:
+                ReportResult($"Failed: {description}. Continuing.", RunLogLevel.Warning);
                 break;
         }
         return false;

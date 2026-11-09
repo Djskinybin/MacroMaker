@@ -50,7 +50,7 @@ public partial class MainWindow
         var current = IsDescendantOf(focused, TabPanel) ? 0
             : IsDescendantOf(focused, CommandList) ? 1
             : IsDescendantOf(focused, PropertiesScrollViewer) ? 2
-            : IsDescendantOf(focused, RunStartButton) || IsDescendantOf(focused, PauseButton) || IsDescendantOf(focused, StopButton) ? 3
+            : IsDescendantOf(focused, RunControls) ? 3
             : -1;
 
         var next = current < 0
@@ -292,54 +292,9 @@ public partial class MainWindow
         if (index < 0)
             return;
         var commands = _selectedRow.Owner.Skip(index).ToList();
-        await RunCommandsFromUi(commands, $"{_currentSequence?.Name ?? "Sequence"} from here");
-    }
-
-    private async Task RunCommandsFromUi(IReadOnlyList<MacroCommand> commands, string label)
-    {
-        if (_engine is null || _engine.IsRunning || _isRecording)
-            return;
-
-        if (!TryPrepareRunOverrides(out var runValues))
-            return;
-        _engine.SetRunOverrides(runValues);
-
-        Exception? error = null;
-        Hide();
-        FocusLastExternalWindow();
-
-        _engine.PlaybackSpeedPercent = EffectivePlaybackSpeed;
-        if (EffectiveShowHud)
-        {
-            _runStatusWindow = new RunStatusWindow(_appSettings.StopMacroHotkey, _appSettings.PauseMacroHotkey, EffectiveHudCorner, EffectiveHudOpacity);
-            _runStatusWindow.Show();
-            _runStatusWindow.UpdateStatus($"Starting: {label}");
-        }
-
-        if (EffectiveLockMouse)
-            EnableMouseMovementLock();
-
-        try
-        {
-            await Task.Delay(120);
-            await _engine.StartCommandsAsync(commands, label);
-        }
-        catch (Exception ex)
-        {
-            error = ex;
-        }
-        finally
-        {
-            DisableMouseMovementLock();
-            _runStatusWindow?.Close();
-            _runStatusWindow = null;
-            Show();
-            WindowState = WindowState.Normal;
-            Activate();
-        }
-
-        if (error is not null)
-            MessageBox.Show(this, FriendlyErrorMessage(error, $"running {label}"), "Macro stopped", MessageBoxButton.OK, MessageBoxImage.Error);
+        var tab = _currentSequence?.Name ?? "Sequence";
+        var label = $"{tab} from here";
+        await RunFromUi(label, engine => engine.StartCommandsAsync(commands, label, tab: tab));
     }
 
     private void AddCommonCommandProperties(MacroCommand command)
@@ -574,8 +529,9 @@ public partial class MainWindow
 
     private FrameworkElement CreateInlineNumberInput(MacroCommand command, string propertyName, int currentValue, int min, int max, Action<int> setter)
     {
-        command.ValueExpressions ??= new Dictionary<string, string>();
-        var expression = command.ValueExpressions.TryGetValue(propertyName, out var saved) ? saved : string.Empty;
+        var expression = command.ValueExpressions?.TryGetValue(propertyName, out var saved) == true
+            ? saved
+            : string.Empty;
         var box = new TextBox
         {
             Text = string.IsNullOrWhiteSpace(expression) ? currentValue.ToString() : expression,
@@ -590,14 +546,15 @@ public partial class MainWindow
                 value = Math.Clamp(value, min, max);
                 lastNumber = value;
                 setter(value);
-                command.ValueExpressions.Remove(propertyName);
+                command.ValueExpressions?.Remove(propertyName);
             }
             else if (string.IsNullOrWhiteSpace(text))
             {
-                command.ValueExpressions.Remove(propertyName);
+                command.ValueExpressions?.Remove(propertyName);
             }
             else
             {
+                command.ValueExpressions ??= new Dictionary<string, string>();
                 command.ValueExpressions[propertyName] = text;
             }
             MarkDirtyAndRefreshCommandDisplay(command.Id);
@@ -664,7 +621,28 @@ public partial class MainWindow
         };
         panel.Children.Add(customName);
 
-        if (CommandCatalog.CanFail(command.Type) && !IsWaitStyleCommand(command.Type))
+        if (command.HasElse)
+        {
+            panel.Children.Add(new TextBlock { Text = "Condition cooldown (ms)", FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 0, 0, 5) });
+            panel.Children.Add(CreateInlineNumberInput(command, nameof(MacroCommand.CooldownMs), command.CooldownMs, 0, 86_400_000, value => command.CooldownMs = value));
+        }
+        else if (command.Type == CommandType.LoopForever)
+        {
+            panel.Children.Add(new TextBlock { Text = "Loop interval (ms)", FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 0, 0, 5) });
+            panel.Children.Add(CreateInlineNumberInput(command, nameof(MacroCommand.LoopIntervalMs), command.LoopIntervalMs, 0, 60000, value => command.LoopIntervalMs = value));
+        }
+        else if (command.Type is CommandType.LoopWhileKeyPressed or CommandType.LoopWhileColor or CommandType.LoopUntilColor
+            or CommandType.LoopWhileImage or CommandType.LoopUntilImage or CommandType.LoopWhileVariable or CommandType.LoopUntilVariable)
+        {
+            panel.Children.Add(new TextBlock { Text = "Check every (ms)", FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 0, 0, 5) });
+            panel.Children.Add(CreateInlineNumberInput(command, nameof(MacroCommand.PollMs), command.PollMs, 10, 5000, value => command.PollMs = value));
+        }
+
+        if (IsWaitStyleCommand(command.Type))
+        {
+            AddPollingFields(command, panel);
+        }
+        else if (CommandCatalog.CanFail(command.Type))
         {
             panel.Children.Add(new TextBlock
             {
