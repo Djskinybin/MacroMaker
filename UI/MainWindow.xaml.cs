@@ -56,7 +56,6 @@ public partial class MainWindow : Window
     private readonly HashSet<Guid> _collapsedBlocks = new();
     private readonly HashSet<Guid> _expandedMoreOptions = new();
     private readonly HashSet<Guid> _expandedLocationOptions = new();
-    private readonly HashSet<Guid> _expandedTimingOptions = new();
     private bool _rebuildingProperties;
     private bool _refreshingCommandSelection;
     private Point _commandDragStartPoint;
@@ -169,6 +168,7 @@ public partial class MainWindow : Window
 
     private void NewProjectCore()
     {
+        _lastRunTrace = null;
         _project = new MacroProject
         {
             Name = "Untitled Macro",
@@ -257,6 +257,7 @@ public partial class MainWindow : Window
                 RepairCommandLists(sequence.Commands);
             }
 
+            _lastRunTrace = null;
             _project = project;
             _projectPath = folder;
             ProjectPaths.CurrentFolder = folder;
@@ -873,8 +874,24 @@ public partial class MainWindow : Window
             return;
         }
 
-        if (Keyboard.FocusedElement is TextBox or ComboBox)
+        if (control && e.Key == Key.K)
+        {
+            AddCommandButton_Click(this, new RoutedEventArgs());
+            e.Handled = true;
             return;
+        }
+
+        if (Keyboard.FocusedElement is TextBox or ComboBox
+            || IsDescendantOf(Keyboard.FocusedElement as DependencyObject, PropertiesScrollViewer))
+            return;
+
+        var key = e.Key == Key.System ? e.SystemKey : e.Key;
+        if (CommandList.IsKeyboardFocusWithin && modifiers == ModifierKeys.Alt && (key is Key.Up or Key.Down))
+        {
+            MoveSelected(key == Key.Up ? -1 : 1);
+            e.Handled = true;
+            return;
+        }
 
         if (CommandList.IsKeyboardFocusWithin && _selectedRow is { IsCollapsible: true, Command: { } selectedBlock })
         {
@@ -960,6 +977,7 @@ public partial class MainWindow : Window
                 sequence.Commands ??= new List<MacroCommand>();
                 RepairCommandLists(sequence.Commands);
             }
+            _lastRunTrace = null;
             _project = recovered;
             _projectPath = null;
             ProjectPaths.CurrentFolder = null;
@@ -1037,7 +1055,6 @@ public partial class MainWindow : Window
             TabPanel.Children.Add(button);
         }
 
-        DeleteTabButton.IsEnabled = _currentSequence is not null && !IsStartingSequence(_currentSequence);
         if (TabOptionsButton is not null)
             TabOptionsButton.IsEnabled = _currentSequence is not null;
     }
@@ -1070,6 +1087,9 @@ public partial class MainWindow : Window
                 StatusText.Text = sequence.Enabled ? $"Enabled tab '{sequence.Name}'" : $"Disabled tab '{sequence.Name}'";
             };
             menu.Items.Add(toggle);
+            var delete = new MenuItem { Header = "Delete Tab…" };
+            delete.Click += DeleteTabButton_Click;
+            menu.Items.Add(delete);
         }
 
         menu.IsOpen = true;
@@ -1319,8 +1339,10 @@ public partial class MainWindow : Window
         if (QuickAddPanel is null)
             return;
 
-        QuickAddPanel.Children.Clear();
-        foreach (var type in _appSettings.QuickAddCommands.Where(CommandCatalog.CanQuickAdd))
+        var shortcuts = QuickAddPanel.Children.OfType<Button>().Where(button => button.Tag is CommandType).ToList();
+        foreach (var shortcut in shortcuts)
+            QuickAddPanel.Children.Remove(shortcut);
+        foreach (var type in _appSettings.QuickAddCommands.Where(CommandCatalog.CanPinQuickAdd))
         {
             var button = new Button
             {
@@ -1330,18 +1352,6 @@ public partial class MainWindow : Window
                 Margin = new Thickness(0, 0, 7, 6)
             };
             button.Click += QuickAdd_Click;
-            QuickAddPanel.Children.Add(button);
-        }
-
-        if (QuickAddPanel.Children.Count == 0)
-        {
-            var button = new Button
-            {
-                Content = "Choose Quick Add shortcuts",
-                Style = (Style)FindResource("QuickAddButtonStyle"),
-                Margin = new Thickness(0, 0, 7, 6)
-            };
-            button.Click += SettingsButton_Click;
             QuickAddPanel.Children.Add(button);
         }
     }
@@ -1589,6 +1599,31 @@ public partial class MainWindow : Window
         return null;
     }
 
+    private void FileMenuButton_Click(object sender, RoutedEventArgs e)
+    {
+        var menu = new ContextMenu { PlacementTarget = (Button)sender, Placement = PlacementMode.Bottom };
+        var create = new MenuItem { Header = "New Project" };
+        create.Click += NewProject_Click;
+        var open = new MenuItem { Header = "Open Project…" };
+        open.Click += OpenProject_Click;
+        var saveAs = new MenuItem { Header = "Save As…", InputGestureText = "Ctrl+Shift+S" };
+        saveAs.Click += SaveProjectAs_Click;
+        menu.Items.Add(create);
+        menu.Items.Add(open);
+        menu.Items.Add(saveAs);
+        menu.IsOpen = true;
+    }
+
+    private async void RecordButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_currentSequence is null || _runInProgress || _engine?.IsRunning == true || _isRecording)
+            return;
+
+        var block = CreateCommand(CommandType.RecordedActions);
+        InsertCommandAfterSelection(block);
+        await StartRecordingIntoBlockAsync(block);
+    }
+
     private void AddCommandButton_Click(object sender, RoutedEventArgs e)
     {
         OpenCommandMenu(sender as FrameworkElement, type =>
@@ -1766,10 +1801,14 @@ public partial class MainWindow : Window
 
     private void UpdateBlockButtonState()
     {
-        if (AddBlockButton is null || AddElseButton is null || AddElseIfButton is null)
+        if (CommandList.SelectedItems.Count != 1)
+        {
+            BlockActionsPanel.Visibility = Visibility.Collapsed;
             return;
+        }
 
-        if (TryResolveBlockTarget(out _, out _, out var label))
+        var canAddToBlock = TryResolveBlockTarget(out _, out _, out var label);
+        if (canAddToBlock)
         {
             AddBlockButton.Visibility = Visibility.Visible;
             AddBlockButton.IsEnabled = true;
@@ -1792,6 +1831,7 @@ public partial class MainWindow : Window
         AddElseButton.IsEnabled = ifParent is not null;
         AddElseIfButton.Visibility = ifParent is null ? Visibility.Collapsed : Visibility.Visible;
         AddElseIfButton.IsEnabled = ifParent is not null;
+        BlockActionsPanel.Visibility = canAddToBlock || ifParent is not null ? Visibility.Visible : Visibility.Collapsed;
     }
 
     private void OpenCommandMenu(FrameworkElement? target, Action<CommandType> onSelected)
@@ -2030,6 +2070,13 @@ public partial class MainWindow : Window
         var duplicate = new MenuItem { Header = selected.Count == 1 ? "Duplicate Command" : $"Duplicate {selected.Count} Commands", InputGestureText = "Ctrl+D" };
         duplicate.Click += DuplicateCommandButton_Click;
         menu.Items.Add(duplicate);
+
+        var moveUp = new MenuItem { Header = "Move Up", InputGestureText = "Alt+Up" };
+        moveUp.Click += MoveUpButton_Click;
+        menu.Items.Add(moveUp);
+        var moveDown = new MenuItem { Header = "Move Down", InputGestureText = "Alt+Down" };
+        moveDown.Click += MoveDownButton_Click;
+        menu.Items.Add(moveDown);
 
         if (selected.Count == 1)
         {
@@ -3054,7 +3101,6 @@ public partial class MainWindow : Window
             case CommandType.WaitUntilKeyPressed:
             case CommandType.WaitUntilKeyReleased:
                 AddTextField("Key", command.Key, value => command.Key = value);
-                AddPollingFields(command);
                 break;
 
             case CommandType.IfKeyPressed:
@@ -3064,7 +3110,6 @@ public partial class MainWindow : Window
 
             case CommandType.LoopWhileKeyPressed:
                 AddTextField("Key", command.Key, value => command.Key = value);
-                AddNumberField("Check every (ms)", command.PollMs, 10, 5000, value => command.PollMs = value);
                 AddBlockInfo(command);
                 break;
 
@@ -3087,10 +3132,6 @@ public partial class MainWindow : Window
             case CommandType.LoopWhileColor:
             case CommandType.LoopUntilColor:
                 AddColorConditionFields(command);
-                if (command.Type == CommandType.WaitUntilColor)
-                    AddPollingFields(command);
-                else if (command.Type is CommandType.LoopWhileColor or CommandType.LoopUntilColor)
-                    AddNumberField("Check every (ms)", command.PollMs, 10, 5000, value => command.PollMs = value);
                 if (command.HasBody)
                     AddBlockInfo(command);
                 break;
@@ -3121,8 +3162,6 @@ public partial class MainWindow : Window
             case CommandType.LoopWhileImage:
             case CommandType.FindImageToVariables:
                 AddImageFields(command);
-                if (command.Type is CommandType.WaitUntilImage or CommandType.WaitUntilImageGone)
-                    AddPollingFields(command);
                 if (command.Type is CommandType.ClickImage or CommandType.DoubleClickImage or CommandType.MoveToImage)
                 {
                     AddNumberField("Offset X from image center", command.ImageOffsetX, -10000, 10000, value => command.ImageOffsetX = value);
@@ -3131,8 +3170,6 @@ public partial class MainWindow : Window
                     if (command.Type == CommandType.DoubleClickImage)
                         AddNumberField("Delay between clicks (ms)", command.ClickDelayMs, 20, 1000, value => command.ClickDelayMs = value);
                 }
-                if (command.Type is CommandType.LoopUntilImage or CommandType.LoopWhileImage)
-                    AddNumberField("Check every (ms)", command.PollMs, 10, 5000, value => command.PollMs = value);
                 if (command.Type == CommandType.FindImageToVariables)
                     AddStorePointVariableFields(command);
                 if (command.HasBody)
@@ -3155,7 +3192,6 @@ public partial class MainWindow : Window
             case CommandType.WaitForWindow:
             case CommandType.WaitForWindowGone:
                 AddTextField("Window title contains", command.WindowTitle, value => command.WindowTitle = value);
-                AddPollingFields(command);
                 break;
 
             case CommandType.RunProgram:
@@ -3183,9 +3219,6 @@ public partial class MainWindow : Window
             case CommandType.LoopWhileVariable:
             case CommandType.LoopUntilVariable:
                 AddVariableConditionFields(command);
-                if (command.Type == CommandType.WaitUntilVariable) AddPollingFields(command);
-                else if (command.Type is CommandType.LoopWhileVariable or CommandType.LoopUntilVariable)
-                    AddNumberField("Check every (ms)", command.PollMs, 10, 5000, value => command.PollMs = value);
                 if (command.HasBody) AddBlockInfo(command);
                 break;
 
@@ -3237,7 +3270,6 @@ public partial class MainWindow : Window
                 break;
 
             case CommandType.LoopForever:
-                AddNumberField("Loop interval (ms)", command.LoopIntervalMs, 0, 60000, value => command.LoopIntervalMs = value);
                 AddBlockInfo(command);
                 if (!_appSettings.CompactBlockLabels)
                     AddInfo($"Use Break Loop inside this block, or {_appSettings.StopMacroHotkey} at any time, to stop it.");
@@ -3249,15 +3281,6 @@ public partial class MainWindow : Window
             case CommandType.StopMacro:
                 break;
         }
-
-            if (command.Type is CommandType.IfKeyPressed
-                or CommandType.IfColor
-                or CommandType.IfImage
-                or CommandType.IfWindow
-                or CommandType.IfVariable)
-            {
-                AddConditionCooldownField(command);
-            }
 
             AddMoreOptions(command);
         }
@@ -4862,11 +4885,6 @@ public partial class MainWindow : Window
         PropertiesPanel.Children.Add(buttons);
     }
 
-    private void AddConditionCooldownField(MacroCommand command)
-    {
-        AddNumberField("Condition cooldown (ms)", command.CooldownMs, 0, 86_400_000, value => command.CooldownMs = value);
-    }
-
     private static bool IsWaitStyleCommand(CommandType type) => type is
         CommandType.WaitUntilKeyPressed or CommandType.WaitUntilKeyReleased
         or CommandType.WaitUntilColor
@@ -4874,10 +4892,8 @@ public partial class MainWindow : Window
         or CommandType.WaitForWindow or CommandType.WaitForWindowGone
         or CommandType.WaitUntilVariable;
 
-    private void AddPollingFields(MacroCommand command)
+    private void AddPollingFields(MacroCommand command, StackPanel panel)
     {
-        var panel = new StackPanel { Margin = new Thickness(2, 7, 2, 2) };
-
         panel.Children.Add(new TextBlock { Text = "Check every (ms)", FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 0, 0, 5) });
         panel.Children.Add(CreateInlineNumberInput(command, nameof(MacroCommand.PollMs), command.PollMs, 10, 5000, value => command.PollMs = value));
 
@@ -4949,26 +4965,6 @@ public partial class MainWindow : Window
             panel.Children.Add(sequencePicker);
         }
 
-        var expander = new Expander
-        {
-            Header = "Timing Options",
-            IsExpanded = _expandedTimingOptions.Contains(command.Id),
-            Foreground = (Brush)FindResource("TextBrush"),
-            Content = new Border
-            {
-                Background = (Brush)FindResource("Panel2Brush"),
-                BorderBrush = (Brush)FindResource("BorderBrushSoft"),
-                BorderThickness = new Thickness(1),
-                CornerRadius = new CornerRadius(9),
-                Padding = new Thickness(11),
-                Margin = new Thickness(0, 7, 0, 0),
-                Child = panel
-            },
-            Margin = new Thickness(0, 0, 0, 10)
-        };
-        expander.Expanded += (_, _) => _expandedTimingOptions.Add(command.Id);
-        expander.Collapsed += (_, _) => { if (!_rebuildingProperties) _expandedTimingOptions.Remove(command.Id); };
-        PropertiesPanel.Children.Add(expander);
     }
 
     private void AddBlockInfo(MacroCommand command)
@@ -5267,6 +5263,26 @@ public partial class MainWindow : Window
         var label = string.IsNullOrWhiteSpace(targetName) ? "Use saved variable" : $"Use saved variable for {targetName}";
         var choices = CreateVariableChoices(label, "Typed value", names);
         choices.Margin = new Thickness(0, 5, 0, 0);
+        choices.Visibility = Visibility.Collapsed;
+        var showVariables = new Button
+        {
+            Content = "ƒx",
+            Padding = new Thickness(7, 2, 7, 2),
+            MinWidth = 34,
+            Margin = new Thickness(5, 0, 0, 0),
+            ToolTip = label
+        };
+        AutomationProperties.SetName(showVariables, label);
+        showVariables.Click += (_, _) =>
+        {
+            var reveal = choices.Visibility != Visibility.Visible;
+            choices.Visibility = reveal ? Visibility.Visible : Visibility.Collapsed;
+            if (reveal)
+            {
+                choices.Focus();
+                choices.ScrollIntoView(choices.SelectedItem);
+            }
+        };
 
         int FindVariableIndex() => names.FindIndex(name =>
             string.Equals(name, target.Text.Trim(), StringComparison.OrdinalIgnoreCase));
@@ -5318,10 +5334,16 @@ public partial class MainWindow : Window
             }
         };
 
+        if (row.ColumnDefinitions.Count == 0)
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        Grid.SetColumn(showVariables, row.ColumnDefinitions.Count);
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        row.Children.Add(showVariables);
+
         row.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         row.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         Grid.SetRow(choices, 1);
-        Grid.SetColumnSpan(choices, Math.Max(1, row.ColumnDefinitions.Count));
+        Grid.SetColumnSpan(choices, row.ColumnDefinitions.Count);
         row.Children.Add(choices);
     }
 
@@ -5638,23 +5660,14 @@ public partial class MainWindow : Window
     private void RebuildEngine()
     {
         _engine?.Stop();
-        _engine = new MacroEngine(_project) { PlaybackSpeedPercent = EffectivePlaybackSpeed };
-        _engine.StatusChanged += text => Dispatcher.InvokeAsync(() =>
+        var engine = new MacroEngine(_project) { PlaybackSpeedPercent = EffectivePlaybackSpeed };
+        _engine = engine;
+        engine.StateChanged += () => Dispatcher.InvokeAsync(() =>
         {
-            StatusText.Text = text;
-            _runStatusWindow?.UpdateStatus(text);
-        });
-        _engine.StateChanged += () => Dispatcher.InvokeAsync(() =>
-        {
+            if (_engine != engine)
+                return;
             UpdateRunButtons();
             UpdateMouseLockForEngineState();
-        });
-        _engine.CommandStarted += (sequence, id) => Dispatcher.InvokeAsync(() =>
-        {
-            var command = EnumerateAllCommands().FirstOrDefault(c => c.Id == id);
-            var text = command is null ? $"Running: {sequence}" : $"{sequence}: {command.DisplayText()}";
-            StatusText.Text = text;
-            _runStatusWindow?.UpdateStatus(text);
         });
         UpdateRunButtons();
     }
@@ -5672,51 +5685,15 @@ public partial class MainWindow : Window
 
     private async void TestSelectedButton_Click(object sender, RoutedEventArgs e)
     {
-        if (_selectedRow?.Command is not { } command || _engine is null || _engine.IsRunning || _isRecording)
+        if (_selectedRow?.Command is not { } command)
         {
             StatusText.Text = "Select a command to test";
             return;
         }
 
-        Exception? error = null;
-        Hide();
-        FocusLastExternalWindow();
-
-        _engine.PlaybackSpeedPercent = EffectivePlaybackSpeed;
-        if (EffectiveShowHud)
-        {
-            _runStatusWindow = new RunStatusWindow(_appSettings.StopMacroHotkey, _appSettings.PauseMacroHotkey, EffectiveHudCorner, EffectiveHudOpacity);
-            _runStatusWindow.Show();
-            _runStatusWindow.UpdateStatus($"Testing: {command.DisplayText()}");
-        }
-
-        if (EffectiveLockMouse)
-            EnableMouseMovementLock();
-
-        try
-        {
-            await Task.Delay(120);
-            await _engine.StartCommandAsync(command, "Selected Command");
-        }
-        catch (Exception ex)
-        {
-            error = ex;
-        }
-        finally
-        {
-            DisableMouseMovementLock();
-            if (_runStatusWindow is not null)
-            {
-                _runStatusWindow.Close();
-                _runStatusWindow = null;
-            }
-            Show();
-            WindowState = System.Windows.WindowState.Normal;
-            Activate();
-        }
-
-        if (error is not null)
-            MessageBox.Show(this, FriendlyErrorMessage(error, $"testing {command.DisplayText()}"), "Command test stopped", MessageBoxButton.OK, MessageBoxImage.Error);
+        var tab = _currentSequence?.Name;
+        await RunFromUi("Selected command", engine => engine.StartCommandAsync(command, "Selected command", tab),
+            testing: true);
     }
 
     private void CheckMacroButton_Click(object sender, RoutedEventArgs e)
@@ -6077,61 +6054,7 @@ public partial class MainWindow : Window
         }
     }
 
-    private async Task RunSequenceFromUi(string name)
-    {
-        if (_engine is null || _engine.IsRunning || _isRecording)
-            return;
-
-        if (!TryPrepareRunOverrides(out var runValues))
-            return;
-        _engine.SetRunOverrides(runValues);
-
-        Exception? error = null;
-        Hide();
-        FocusLastExternalWindow();
-
-        _engine.PlaybackSpeedPercent = EffectivePlaybackSpeed;
-        if (EffectiveShowHud)
-        {
-            _runStatusWindow = new RunStatusWindow(
-                _appSettings.StopMacroHotkey,
-                _appSettings.PauseMacroHotkey,
-                EffectiveHudCorner,
-                EffectiveHudOpacity);
-            _runStatusWindow.Show();
-            _runStatusWindow.UpdateStatus($"Starting: {name}");
-        }
-
-        if (EffectiveLockMouse)
-            EnableMouseMovementLock();
-
-        try
-        {
-            await Task.Delay(120);
-            await _engine.StartAsync(name);
-        }
-        catch (Exception ex)
-        {
-            error = ex;
-        }
-        finally
-        {
-            DisableMouseMovementLock();
-
-            if (_runStatusWindow is not null)
-            {
-                _runStatusWindow.Close();
-                _runStatusWindow = null;
-            }
-
-            Show();
-            WindowState = System.Windows.WindowState.Normal;
-            Activate();
-        }
-
-        if (error is not null)
-            MessageBox.Show(this, FriendlyErrorMessage(error, $"running {name}"), "Macro stopped", MessageBoxButton.OK, MessageBoxImage.Error);
-    }
+    private Task RunSequenceFromUi(string name) => RunFromUi(name, engine => engine.StartAsync(name));
 
     private void PauseButton_Click(object sender, RoutedEventArgs e)
     {
@@ -6146,13 +6069,18 @@ public partial class MainWindow : Window
     private void UpdateRunButtons()
     {
         var running = _engine?.IsRunning == true;
-        RunStartButton.IsEnabled = !running && !_isRecording;
-        RunCurrentButton.IsEnabled = !running && !_isRecording;
-        RunFromHereButton.IsEnabled = !running && !_isRecording && _selectedRow?.Command is not null;
-        TestSelectedButton.IsEnabled = !running && !_isRecording && _selectedRow?.Command is not null;
-        CheckMacroButton.IsEnabled = !running && !_isRecording;
+        var canStart = !running && !_runInProgress && !_isRecording;
+        RunStartButton.IsEnabled = canStart;
+        RecordButton.IsEnabled = canStart;
+        TestMenuButton.IsEnabled = canStart;
+        RunLogButton.IsEnabled = canStart && _lastRunTrace is not null;
+        RunCurrentButton.IsEnabled = canStart;
+        RunFromHereButton.IsEnabled = canStart && _selectedRow?.Command is not null;
+        TestSelectedButton.IsEnabled = canStart && _selectedRow?.Command is not null;
+        CheckMacroButton.IsEnabled = canStart;
         StopButton.IsEnabled = running;
         PauseButton.IsEnabled = running;
+        PauseButton.Visibility = StopButton.Visibility = running ? Visibility.Visible : Visibility.Collapsed;
         PauseButton.Content = _engine?.IsPaused == true ? "▶ Resume" : "⏸ Pause";
         UpdateUndoButtons();
     }

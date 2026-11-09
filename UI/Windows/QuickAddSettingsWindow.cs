@@ -17,7 +17,7 @@ public sealed class QuickAddSettingsWindow : Window
     public QuickAddSettingsWindow(IEnumerable<CommandType> current)
     {
         WindowTheme.Attach(this);
-        _selected = current.Where(CommandCatalog.CanQuickAdd).ToHashSet();
+        _selected = current.Where(CommandCatalog.CanPinQuickAdd).ToHashSet();
 
         Title = "Quick Add Editor";
         Width = 720;
@@ -110,7 +110,7 @@ public sealed class QuickAddSettingsWindow : Window
         var footer = new DockPanel { Margin = new Thickness(0, 14, 0, 0) };
         var reset = new Button
         {
-            Content = "Reset to Mouse Move · Click · Wait · Record",
+            Content = "Reset to Mouse Move · Click · Wait",
             MinWidth = 250,
             HorizontalAlignment = HorizontalAlignment.Left
         };
@@ -120,7 +120,6 @@ public sealed class QuickAddSettingsWindow : Window
             _selected.Add(CommandType.MoveMouse);
             _selected.Add(CommandType.Click);
             _selected.Add(CommandType.Wait);
-            _selected.Add(CommandType.RecordedActions);
             ShowCategory(_currentCategory);
         };
         DockPanel.SetDock(reset, Dock.Left);
@@ -198,6 +197,16 @@ public sealed class QuickAddSettingsWindow : Window
 
         foreach (var option in category.Commands)
         {
+            if (!CommandCatalog.CanPinQuickAdd(option.Type))
+            {
+                _commandPanel.Children.Add(new TextBlock
+                {
+                    Text = "Record is always available above the macro steps.",
+                    Foreground = Brush("MutedTextBrush"),
+                    TextWrapping = TextWrapping.Wrap
+                });
+                continue;
+            }
             var button = MakeToggleButton(option);
             _commandPanel.Children.Add(button);
         }
