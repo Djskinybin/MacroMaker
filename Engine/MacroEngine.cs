@@ -9,6 +9,8 @@ public sealed class MacroEngine
     private readonly MacroProject _project;
     private readonly RuntimeValues _values;
     private readonly AsyncLocal<RunStep?> _activeStep = new();
+    private readonly AsyncLocal<int> _executionLane = new();
+    private int _nextParallelLane;
     private readonly object _parallelLock = new();
     private readonly Dictionary<string, Task> _parallelSequences = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _activeSequences = new(StringComparer.OrdinalIgnoreCase);
@@ -130,6 +132,7 @@ public sealed class MacroEngine
     private void BeginRun(string status)
     {
         LastRunTrace = new RunTrace();
+        _nextParallelLane = 0;
         _values.Reset(_project);
         if (_runOverrides is not null)
         {
@@ -280,7 +283,7 @@ public sealed class MacroEngine
             _ => sourceCommand.DisplayText()
         };
         var previousStep = _activeStep.Value;
-        var step = new RunStep(sequenceName, sourceCommand.Id, stepTitle);
+        var step = new RunStep(_executionLane.Value, sequenceName, sourceCommand.Id, stepTitle);
         _activeStep.Value = step;
         trace.StartStep(step);
         try
@@ -1622,8 +1625,11 @@ public sealed class MacroEngine
                 throw new InvalidOperationException(
                     "Too many tabs are running simultaneously. Stop the macro or reduce parallel Run Sequence commands.");
 
+            var lane = ++_nextParallelLane;
             var task = Task.Run(async () =>
             {
+                _executionLane.Value = lane;
+                _activeStep.Value = null;
                 try
                 {
                     await RunSequenceAsync(sequenceName, token, depth).ConfigureAwait(false);

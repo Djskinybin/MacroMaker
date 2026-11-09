@@ -7,8 +7,11 @@ internal sealed record RunLogEntry(DateTimeOffset Time, RunLogLevel Level, RunSt
     public string StepLabel => Step is { } step ? $"{step.Tab} · {step.Title}" : string.Empty;
 }
 
-internal sealed class RunStep(string tab, Guid commandId, string title)
+internal readonly record struct RunActivity(string Heading, string Detail);
+
+internal sealed class RunStep(int lane, string tab, Guid commandId, string title)
 {
+    public int Lane { get; } = lane;
     public string Tab { get; } = tab;
     public Guid CommandId { get; } = commandId;
     public string Title { get; } = title;
@@ -79,15 +82,19 @@ internal sealed class RunTrace
         }
     }
 
-    public (string Heading, string Detail) GetProgress()
+    public (string Status, RunActivity[] Activities) GetProgress()
     {
         lock (_gate)
         {
-            if (_activeSteps.Count == 0)
-                return (_runStatus, string.Empty);
-
-            var step = _activeSteps[^1];
-            return ($"{step.Tab} · {step.Title}", step.Status);
+            // Show only the innermost step on each parallel path. Preserve the
+            // order in which paths began as their individual steps change.
+            var activities = _activeSteps
+                .GroupBy(step => step.Lane)
+                .OrderBy(lane => lane.Key)
+                .Select(lane => lane.Last())
+                .Select(step => new RunActivity($"{step.Tab} · {step.Title}", step.Status))
+                .ToArray();
+            return (_runStatus, activities);
         }
     }
 

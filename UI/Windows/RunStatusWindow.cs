@@ -13,8 +13,13 @@ public sealed class RunStatusWindow : Window
     private const int WsExToolWindow = 0x00000080;
     private const int WsExNoActivate = 0x08000000;
 
+    private const int VisibleActivityLimit = 5;
+
+    private readonly TextBlock _heading;
     private readonly TextBlock _statusText;
-    private readonly TextBlock _detailText;
+    private readonly TextBlock _overflowText;
+    private readonly (StackPanel Panel, TextBlock Title, TextBlock Detail)[] _rows =
+        new (StackPanel, TextBlock, TextBlock)[VisibleActivityLimit];
     private readonly HudCorner _corner;
 
     public RunStatusWindow(string stopHotkey, string pauseHotkey, HudCorner corner = HudCorner.TopLeft, int opacityPercent = 92)
@@ -44,13 +49,14 @@ public sealed class RunStatusWindow : Window
         };
 
         var panel = new StackPanel();
-        panel.Children.Add(new TextBlock
+        _heading = new TextBlock
         {
-            Text = "CURRENT STEP",
+            Text = "ACTIVE STEPS",
             FontWeight = FontWeights.Bold,
             FontSize = 13,
             Foreground = new SolidColorBrush(Color.FromRgb(126, 166, 255))
-        });
+        };
+        panel.Children.Add(_heading);
 
         _statusText = new TextBlock
         {
@@ -62,15 +68,37 @@ public sealed class RunStatusWindow : Window
             Margin = new Thickness(0, 6, 0, 6)
         };
         panel.Children.Add(_statusText);
-        _detailText = new TextBlock
+        var detailBrush = new SolidColorBrush(Color.FromRgb(205, 215, 230));
+        for (var i = 0; i < _rows.Length; i++)
+        {
+            var row = new StackPanel { Margin = new Thickness(0, 6, 0, 0), Visibility = Visibility.Collapsed };
+            var title = new TextBlock
+            {
+                FontSize = 14,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = Brushes.White,
+                TextTrimming = TextTrimming.CharacterEllipsis
+            };
+            var detail = new TextBlock
+            {
+                FontSize = 12,
+                Foreground = detailBrush,
+                TextTrimming = TextTrimming.CharacterEllipsis
+            };
+            row.Children.Add(title);
+            row.Children.Add(detail);
+            panel.Children.Add(row);
+            _rows[i] = (row, title, detail);
+        }
+
+        _overflowText = new TextBlock
         {
             FontSize = 12,
-            Foreground = new SolidColorBrush(Color.FromRgb(205, 215, 230)),
-            TextTrimming = TextTrimming.CharacterEllipsis,
-            Margin = new Thickness(0, 0, 0, 6),
+            Foreground = detailBrush,
+            Margin = new Thickness(0, 4, 0, 0),
             Visibility = Visibility.Collapsed
         };
-        panel.Children.Add(_detailText);
+        panel.Children.Add(_overflowText);
 
         var controls = $"{stopHotkey} Stop";
         if (!string.IsNullOrWhiteSpace(pauseHotkey))
@@ -79,6 +107,7 @@ public sealed class RunStatusWindow : Window
         panel.Children.Add(new TextBlock
         {
             Text = controls,
+            Margin = new Thickness(0, 6, 0, 0),
             FontSize = 12,
             Foreground = new SolidColorBrush(Color.FromRgb(160, 169, 186))
         });
@@ -90,16 +119,32 @@ public sealed class RunStatusWindow : Window
         SourceInitialized += (_, _) => MakeClickThrough();
     }
 
-    public void UpdateStatus(string text, string detail = "")
+    internal void UpdateStatus(string status, IReadOnlyList<RunActivity>? activities = null, bool paused = false)
     {
-        if (!Dispatcher.CheckAccess())
+        var count = activities?.Count ?? 0;
+        _heading.Text = paused ? "PAUSED" : "ACTIVE STEPS";
+        _statusText.Text = string.IsNullOrWhiteSpace(status) ? "Running…" : status;
+        _statusText.Visibility = count == 0 ? Visibility.Visible : Visibility.Collapsed;
+
+        for (var i = 0; i < _rows.Length; i++)
         {
-            _ = Dispatcher.BeginInvoke(() => UpdateStatus(text, detail));
-            return;
+            var (panel, title, detail) = _rows[i];
+            if (i >= count)
+            {
+                panel.Visibility = Visibility.Collapsed;
+                continue;
+            }
+
+            var activity = activities![i];
+            title.Text = activity.Heading;
+            detail.Text = activity.Detail;
+            detail.Visibility = string.IsNullOrWhiteSpace(activity.Detail) ? Visibility.Collapsed : Visibility.Visible;
+            panel.Visibility = Visibility.Visible;
         }
-        _statusText.Text = string.IsNullOrWhiteSpace(text) ? "Running…" : text;
-        _detailText.Text = detail;
-        _detailText.Visibility = string.IsNullOrWhiteSpace(detail) ? Visibility.Collapsed : Visibility.Visible;
+
+        var remaining = count - _rows.Length;
+        _overflowText.Text = remaining > 0 ? $"+{remaining} more active" : string.Empty;
+        _overflowText.Visibility = remaining > 0 ? Visibility.Visible : Visibility.Collapsed;
     }
 
     private void PositionWindow()

@@ -82,9 +82,14 @@ public partial class MainWindow
         if (engine.LastRunTrace is not { } trace)
             return;
 
-        var (heading, detail) = trace.GetProgress();
-        StatusText.Text = engine.IsPaused ? "Paused" : heading;
-        _runStatusWindow?.UpdateStatus(StatusText.Text, engine.IsPaused ? heading : detail);
+        var (status, activities) = trace.GetProgress();
+        StatusText.Text = engine.IsPaused ? "Paused" : activities.Length switch
+        {
+            0 => status,
+            1 => activities[0].Heading,
+            _ => $"{activities.Length} active steps"
+        };
+        _runStatusWindow?.UpdateStatus(status, activities, engine.IsPaused);
     }
 
     private void RunLogButton_Click(object sender, RoutedEventArgs e)
