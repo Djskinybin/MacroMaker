@@ -3510,7 +3510,8 @@ public partial class MainWindow : Window
     private void AddColorConditionFields(MacroCommand command)
     {
         AddComparePicker(command);
-        AddColorTargetsFields(command);
+        var searchMode = command.ColorSearchMode ?? ColorConditionSearchMode.Pixel;
+        AddColorTargetsFields(command, pickLocation: searchMode == ColorConditionSearchMode.Pixel);
         AddColorConditionSearchFields(command);
 
         var test = new Button { Content = "Test Color Search Now", Margin = new Thickness(0, 0, 0, 12) };
@@ -3899,11 +3900,11 @@ public partial class MainWindow : Window
         PropertiesPanel.Children.Add(combo);
     }
 
-    private void AddColorTargetsFields(MacroCommand command)
+    private void AddColorTargetsFields(MacroCommand command, bool pickLocation = false)
     {
         command.ColorAlternatives ??= new List<ColorMatchOption>();
         AddLabel(command.ColorAlternatives.Count == 0 ? "Color" : "Colors");
-        PropertiesPanel.Children.Add(CreateColorTargetCard(command, null));
+        PropertiesPanel.Children.Add(CreateColorTargetCard(command, null, pickLocation));
 
         for (var i = 0; i < command.ColorAlternatives.Count; i++)
         {
@@ -3927,7 +3928,7 @@ public partial class MainWindow : Window
         PropertiesPanel.Children.Add(add);
     }
 
-    private Border CreateColorTargetCard(MacroCommand command, ColorMatchOption? option)
+    private Border CreateColorTargetCard(MacroCommand command, ColorMatchOption? option, bool pickLocation = false)
     {
         var isPrimary = option is null;
         var panel = new StackPanel();
@@ -4006,27 +4007,40 @@ public partial class MainWindow : Window
                 box.Text = NormalizeColor(text);
         };
 
-        var pick = new Button { Content = "Pick Color", MinWidth = 82, Margin = new Thickness(7, 0, 0, 0) };
+        var picksPosition = pickLocation && command.CoordinateMode != CoordinateMode.RelativeToMouse;
+        var pick = new Button
+        {
+            Content = picksPosition ? "Pick Pixel" : "Pick Color",
+            MinWidth = 82,
+            Margin = new Thickness(7, 0, 0, 0),
+            ToolTip = picksPosition ? "Save this pixel's color and location" : "Sample a color"
+        };
         pick.Click += (_, _) =>
         {
+            var origin = default(ScreenRegion);
+            var canSavePosition = picksPosition && (command.CoordinateMode != CoordinateMode.ActiveWindow
+                || WindowTools.TryGetWindowRect(_lastExternalForeground, out origin));
+
             var picker = new PointPickerWindow(true);
             Hide();
             try
             {
-                if (picker.ShowDialog() == true)
-                {
-                    if (isPrimary) command.ColorHex = picker.PickedColor;
-                    else option!.ColorHex = picker.PickedColor;
-                    MarkDirty();
-                }
+                if (picker.ShowDialog() != true)
+                    return;
             }
             finally
             {
                 Show();
                 Activate();
             }
-            BuildProperties(command);
-            RefreshCommandList(command.Id);
+
+            (int X, int Y)? position = canSavePosition
+                ? (picker.PickedX - origin.X, picker.PickedY - origin.Y)
+                : null;
+            ApplyPickedColor(command, option, picker.PickedColor, position);
+            MarkDirtyAndRefresh(command.Id);
+            if (picksPosition && !canSavePosition)
+                StatusText.Text = "Color saved. Focus the target window first to pick its location.";
         };
 
         Grid.SetColumn(swatch, 0);
@@ -4138,6 +4152,26 @@ public partial class MainWindow : Window
             swatch.Background = new SolidColorBrush(Color.FromRgb((byte)r, (byte)g, (byte)b));
         else
             swatch.Background = Brushes.Transparent;
+    }
+
+    private static void ApplyPickedColor(MacroCommand command, ColorMatchOption? option, string color, (int X, int Y)? position)
+    {
+        if (option is not null)
+        {
+            option.ColorHex = color;
+            return;
+        }
+
+        command.ColorHex = color;
+        if (position is not { } point)
+            return;
+
+        command.X = point.X;
+        command.Y = point.Y;
+        command.XExpression = string.Empty;
+        command.YExpression = string.Empty;
+        command.ValueExpressions?.Remove(nameof(MacroCommand.X));
+        command.ValueExpressions?.Remove(nameof(MacroCommand.Y));
     }
 
     private void AddLocationFields(MacroCommand command, string label = "Location")
