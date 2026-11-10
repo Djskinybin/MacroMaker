@@ -939,7 +939,9 @@ public partial class MainWindow : Window
             TestSelectedButton_Click(this, new RoutedEventArgs());
             e.Handled = true;
         }
-        else if (e.Key == Key.Delete)
+        else if (e.Key == Key.Delete
+                 || (e.Key == Key.Back && modifiers == ModifierKeys.None
+                     && IsDescendantOf(e.OriginalSource as DependencyObject, CommandList)))
         {
             DeleteCommandButton_Click(this, new RoutedEventArgs());
             e.Handled = true;
@@ -2105,7 +2107,7 @@ public partial class MainWindow : Window
         enabled.Click += (_, _) => SetSelectedCommandsEnabled(!allEnabled);
         menu.Items.Add(enabled);
 
-        var delete = new MenuItem { Header = selected.Count == 1 ? "Delete Command" : $"Delete {selected.Count} Commands", InputGestureText = "Del" };
+        var delete = new MenuItem { Header = selected.Count == 1 ? "Delete Command" : $"Delete {selected.Count} Commands", InputGestureText = "Del / Backspace" };
         delete.Click += DeleteCommandButton_Click;
         menu.Items.Add(delete);
     }
