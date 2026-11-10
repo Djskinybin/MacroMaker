@@ -14,10 +14,10 @@ if errorlevel 1 (
     exit /b 1
 )
 
-if exist "dist\MacroMaker-Portable-v1.2.7.zip" del /q "dist\MacroMaker-Portable-v1.2.7.zip"
+if exist "dist\MacroMaker-Portable-v1.2.8.zip" del /q "dist\MacroMaker-Portable-v1.2.8.zip"
 if exist "dist\MacroMaker-Setup.exe" del /q "dist\MacroMaker-Setup.exe"
 echo Creating portable ZIP...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Compress-Archive -Path 'dist\MacroMaker.exe' -DestinationPath 'dist\MacroMaker-Portable-v1.2.7.zip' -Force"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Compress-Archive -Path 'dist\MacroMaker.exe' -DestinationPath 'dist\MacroMaker-Portable-v1.2.8.zip' -Force"
 if errorlevel 1 (
     echo WARNING: Portable ZIP could not be created.
 )
@@ -42,7 +42,7 @@ echo ========================================
 echo              RELEASE READY
 echo ========================================
 echo dist\MacroMaker.exe
-echo dist\MacroMaker-Portable-v1.2.7.zip
+echo dist\MacroMaker-Portable-v1.2.8.zip
 if exist "dist\MacroMaker-Setup.exe" echo dist\MacroMaker-Setup.exe
 
 echo.

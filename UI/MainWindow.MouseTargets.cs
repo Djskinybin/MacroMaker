@@ -53,7 +53,7 @@ public partial class MainWindow
                 return;
 
             command.MouseTargetArea = selected;
-            MarkDirtyAndRefresh(command.Id);
+            CommitPropertyEdit(command);
         };
         PropertiesPanel.Children.Add(button);
     }
@@ -87,7 +87,7 @@ public partial class MainWindow
 
             command.MouseTargetPoints ??= new List<MousePoint>();
             command.MouseTargetPoints.Add(point);
-            MarkDirtyAndRefresh(command.Id);
+            CommitPropertyEdit(command);
         };
         buttons.Children.Add(add);
 
@@ -100,7 +100,7 @@ public partial class MainWindow
                     return;
 
                 points.RemoveAt(list.SelectedIndex);
-                MarkDirtyAndRefresh(command.Id);
+                CommitPropertyEdit(command);
             };
             buttons.Children.Add(remove);
         }

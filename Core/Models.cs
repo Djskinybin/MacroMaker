@@ -834,7 +834,7 @@ public sealed class CommandRow : INotifyPropertyChanged
     public MacroCommand? ParentCommand { get; init; }
     public int Depth { get; init; }
     public string Label { get; init; } = string.Empty;
-    public string DisplayOverride { get; init; } = string.Empty;
+    public bool IsElseIfRow { get; init; }
     public bool IsHeader { get; init; }
     public bool CompactLabels { get; init; }
     public CommandBranch Branch { get; init; }
@@ -857,9 +857,19 @@ public sealed class CommandRow : INotifyPropertyChanged
             "EMPTY" => "No commands yet — use Quick Add or + Add Command",
             _ => Label
         }
-        : !string.IsNullOrWhiteSpace(DisplayOverride)
-            ? DisplayOverride
-            : Command?.DisplayText() ?? string.Empty;
+        : Command is { } command ? FormatCommandDisplay(command) : string.Empty;
+
+    private string FormatCommandDisplay(MacroCommand command)
+    {
+        var display = command.DisplayText();
+        if (!IsElseIfRow)
+            return display;
+
+        var index = display.IndexOf("If ", StringComparison.OrdinalIgnoreCase);
+        return index >= 0
+            ? display[..index] + "Else if " + display[(index + 3)..]
+            : "Else If — " + display;
+    }
 
     public event PropertyChangedEventHandler? PropertyChanged;
 
