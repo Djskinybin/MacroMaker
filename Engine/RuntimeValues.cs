@@ -383,6 +383,21 @@ internal static class CoordinateResolver
         };
     }
 
+    public static MousePoint ResolveMouseTarget(MacroCommand command, RuntimeValues values)
+    {
+        if (command.GetMouseTargetError() is { } error)
+            throw new InvalidOperationException(error);
+
+        if (command.MouseTargetMode == MouseTargetMode.RandomArea && command.MouseTargetArea is { } area)
+            return new MousePoint(area.X + Random.Shared.Next(area.Width), area.Y + Random.Shared.Next(area.Height));
+
+        if (command.MouseTargetMode == MouseTargetMode.RandomSavedPoint && command.MouseTargetPoints is { } points)
+            return points[Random.Shared.Next(points.Count)];
+
+        var (x, y) = ResolvePoint(command, values);
+        return new MousePoint(x, y);
+    }
+
     public static MacroCommand ResolveImageSearch(MacroCommand source, RuntimeValues values)
     {
         var command = source.DeepClone();

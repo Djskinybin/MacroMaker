@@ -3042,7 +3042,7 @@ public partial class MainWindow : Window
                 break;
 
             case CommandType.MoveMouse:
-                AddLocationFields(command);
+                AddMouseDestinationFields(command);
                 AddMouseMovementFields(command);
                 break;
 
@@ -3057,7 +3057,7 @@ public partial class MainWindow : Window
                 break;
 
             case CommandType.Scroll:
-                AddLocationFields(command);
+                AddMouseDestinationFields(command);
                 AddNumberField("Scroll amount (positive = up, negative = down)", command.ScrollAmount, -12000, 12000, value => command.ScrollAmount = value);
                 AddMouseMovementFields(command);
                 break;
@@ -3311,13 +3311,14 @@ public partial class MainWindow : Window
             if (selected == MouseMoveMode.Smooth && command.MoveDurationMs <= 0)
                 command.MoveDurationMs = 50;
             CommitPropertySelection(command, mode);
-            BuildProperties(command);
         };
         PropertiesPanel.Children.Add(mode);
 
         if (command.MouseMoveMode == MouseMoveMode.Smooth)
         {
             AddNumberField("Slide time (ms)", command.MoveDurationMs, 1, 60000, value => command.MoveDurationMs = value);
+            if (command.HasMouseDestination)
+                AddMouseCurveFields(command);
         }
     }
 
@@ -3502,7 +3503,7 @@ public partial class MainWindow : Window
 
         if (shouldMove)
         {
-            AddLocationFields(command, "Move to");
+            AddMouseDestinationFields(command, "Move to");
             AddMouseMovementFields(command);
         }
     }
@@ -5883,14 +5884,21 @@ public partial class MainWindow : Window
                     break;
             }
 
-            CheckNumber("X", command.XExpression);
-            CheckNumber("Y", command.YExpression);
+            var usesExactPoint = !command.HasMouseDestination || command.MouseTargetMode == MouseTargetMode.Exact;
+            if (usesExactPoint)
+            {
+                CheckNumber("X", command.XExpression);
+                CheckNumber("Y", command.YExpression);
+            }
             CheckNumber("End X", command.EndXExpression);
             CheckNumber("End Y", command.EndYExpression);
             CheckNumber("Wait", command.WaitExpression);
             CheckNumber("Repeat count", command.RepeatExpression);
             foreach (var pair in command.ValueExpressions ?? new Dictionary<string, string>())
-                CheckNumber(pair.Key, pair.Value);
+            {
+                if (usesExactPoint || pair.Key is not (nameof(MacroCommand.X) or nameof(MacroCommand.Y)))
+                    CheckNumber(pair.Key, pair.Value);
+            }
             foreach (var option in command.ColorAlternatives ?? new List<ColorMatchOption>())
                 CheckNumber("color tolerance", option.ToleranceExpression);
             foreach (var target in command.ColorSearchTargets ?? new List<ColorSearchTarget>())
@@ -5960,6 +5968,10 @@ public partial class MainWindow : Window
                         warnings.Add($"{sequenceName}: key or combo '{command.Key}' may not be recognized in {FriendlyName(command.Type)}.");
                 }
             }
+
+            if (command.HasMouseDestination
+                && command.GetMouseTargetError() is { } targetError)
+                errors.Add($"{sequenceName}: {FriendlyName(command.Type)}. {targetError}");
 
             if (command.Type is CommandType.IfImage or CommandType.WaitUntilImage or CommandType.WaitUntilImageGone
                 or CommandType.ClickImage or CommandType.DoubleClickImage or CommandType.MoveToImage

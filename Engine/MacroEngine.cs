@@ -298,11 +298,7 @@ public sealed class MacroEngine
 
                 case CommandType.MoveMouse:
                 {
-                    await WithInputGateAsync(async () =>
-                    {
-                        var point = CoordinateResolver.ResolvePoint(command, _values);
-                        await InputController.MoveMouseAsync(point.X, point.Y, EffectiveMoveDuration(command), token);
-                    }, token);
+                    await WithInputGateAsync(() => MoveToMouseTargetAsync(command, token), token);
                     break;
                 }
 
@@ -311,7 +307,7 @@ public sealed class MacroEngine
                     await WithInputGateAsync(async () =>
                     {
                         if (ShouldMoveBeforeClick(command))
-                            await MoveForClickAsync(command, token);
+                            await MoveToMouseTargetAsync(command, token);
                         InputController.LeftClick();
                     }, token);
                     break;
@@ -322,7 +318,7 @@ public sealed class MacroEngine
                     await WithInputGateAsync(async () =>
                     {
                         if (ShouldMoveBeforeClick(command))
-                            await MoveForClickAsync(command, token);
+                            await MoveToMouseTargetAsync(command, token);
                         InputController.LeftClick();
                         await DelayPausableAsync(Math.Clamp(command.ClickDelayMs, 20, 1000), token);
                         InputController.LeftClick();
@@ -334,7 +330,7 @@ public sealed class MacroEngine
                     await WithInputGateAsync(async () =>
                     {
                         if (ShouldMoveBeforeClick(command))
-                            await MoveForClickAsync(command, token);
+                            await MoveToMouseTargetAsync(command, token);
                         InputController.RightClick();
                     }, token);
                     break;
@@ -342,7 +338,7 @@ public sealed class MacroEngine
                 case CommandType.Scroll:
                     await WithInputGateAsync(async () =>
                     {
-                        await MoveForClickAsync(command, token);
+                        await MoveToMouseTargetAsync(command, token);
                         InputController.Scroll(command.ScrollAmount);
                     }, token);
                     break;
@@ -1285,10 +1281,17 @@ public sealed class MacroEngine
         return command.MoveBeforeClick ?? true;
     }
 
-    private async Task MoveForClickAsync(MacroCommand command, CancellationToken token)
+    private Task MoveToMouseTargetAsync(MacroCommand command, CancellationToken token)
     {
-        var point = CoordinateResolver.ResolvePoint(command, _values);
-        await InputController.MoveMouseAsync(point.X, point.Y, EffectiveMoveDuration(command), token);
+        var point = CoordinateResolver.ResolveMouseTarget(command, _values);
+        if (command.MouseTargetMode != MouseTargetMode.Exact)
+        {
+            if (!ScreenTools.VirtualScreenRegion().Contains(point))
+                throw new InvalidOperationException("The selected destination is outside the current desktop. Pick the area or points again.");
+
+            ReportResult($"Picked screen point {point.X}, {point.Y}.");
+        }
+        return InputController.MoveMouseAsync(point.X, point.Y, EffectiveMoveDuration(command), token, command.MouseCurvePoint);
     }
 
     private async Task<bool> WaitUntilAsync(

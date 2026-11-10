@@ -274,7 +274,7 @@ internal static class InputController
 
     public static readonly UIntPtr MacroMouseInputTag = new(0x4D4D4B52u);
 
-    public static async Task MoveMouseAsync(int x, int y, int durationMs, CancellationToken token)
+    public static async Task MoveMouseAsync(int x, int y, int durationMs, CancellationToken token, MousePoint? curvePoint = null)
     {
         if (!NativeMethods.GetCursorPos(out var start))
         {
@@ -288,10 +288,9 @@ internal static class InputController
             return;
         }
 
-        var dx = x - start.X;
-        var dy = y - start.Y;
-        var distance = Math.Sqrt((double)dx * dx + (double)dy * dy);
-        if (distance < 1)
+        var startPoint = new MousePoint(start.X, start.Y);
+        var endPoint = new MousePoint(x, y);
+        if (startPoint == endPoint && (!curvePoint.HasValue || curvePoint == startPoint))
             return;
 
         // Respect the duration the user selected. A 50 ms smooth move should take
@@ -314,8 +313,7 @@ internal static class InputController
                     var t = Math.Clamp(sw.Elapsed.TotalMilliseconds / smoothDurationMs, 0.0, 1.0);
                     // Smoothstep removes the harsh start/stop of a linear cursor path.
                     var eased = t * t * (3.0 - 2.0 * t);
-                    var nx = (int)Math.Round(start.X + dx * eased);
-                    var ny = (int)Math.Round(start.Y + dy * eased);
+                    var (nx, ny) = PointOnMousePath(startPoint, endPoint, eased, curvePoint);
 
                     if (nx != lastX || ny != lastY)
                     {
@@ -334,6 +332,24 @@ internal static class InputController
                 NativeMethods.timeEndPeriod(1);
             }
         }, token);
+    }
+
+    internal static MousePoint PointOnMousePath(MousePoint start, MousePoint end, double progress, MousePoint? curvePoint)
+    {
+        if (curvePoint is not { } bend)
+        {
+            return new MousePoint(
+                (int)Math.Round(start.X + ((double)end.X - start.X) * progress),
+                (int)Math.Round(start.Y + ((double)end.Y - start.Y) * progress));
+        }
+
+        var remaining = 1.0 - progress;
+        var startWeight = remaining * remaining;
+        var bendWeight = 2.0 * remaining * progress;
+        var endWeight = progress * progress;
+        return new MousePoint(
+            (int)Math.Round(start.X * startWeight + bend.X * bendWeight + end.X * endWeight),
+            (int)Math.Round(start.Y * startWeight + bend.Y * bendWeight + end.Y * endWeight));
     }
 
     private static void SendAbsoluteMouseMove(int x, int y)
