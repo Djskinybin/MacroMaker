@@ -1,5 +1,5 @@
 #define MyAppName "MacroMaker"
-#define MyAppVersion "1.2.6"
+#define MyAppVersion "1.2.7"
 #define MyAppPublisher "MacroMaker"
 #define MyAppExeName "MacroMaker.exe"
 
