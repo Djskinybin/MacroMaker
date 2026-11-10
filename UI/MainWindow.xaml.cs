@@ -3318,7 +3318,7 @@ public partial class MainWindow : Window
         {
             AddNumberField("Slide time (ms)", command.MoveDurationMs, 1, 60000, value => command.MoveDurationMs = value);
             if (command.HasMouseDestination)
-                AddMouseCurveFields(command);
+                AddMousePathField(command);
         }
     }
 

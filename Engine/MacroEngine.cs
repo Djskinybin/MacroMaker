@@ -1291,7 +1291,7 @@ public sealed class MacroEngine
 
             ReportResult($"Picked screen point {point.X}, {point.Y}.");
         }
-        return InputController.MoveMouseAsync(point.X, point.Y, EffectiveMoveDuration(command), token, command.MouseCurvePoint);
+        return InputController.MoveMouseAsync(point.X, point.Y, EffectiveMoveDuration(command), token, command.MousePathMode);
     }
 
     private async Task<bool> WaitUntilAsync(

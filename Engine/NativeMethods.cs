@@ -274,7 +274,7 @@ internal static class InputController
 
     public static readonly UIntPtr MacroMouseInputTag = new(0x4D4D4B52u);
 
-    public static async Task MoveMouseAsync(int x, int y, int durationMs, CancellationToken token, MousePoint? curvePoint = null)
+    public static async Task MoveMouseAsync(int x, int y, int durationMs, CancellationToken token, MousePathMode path = MousePathMode.Straight)
     {
         if (!NativeMethods.GetCursorPos(out var start))
         {
@@ -290,8 +290,12 @@ internal static class InputController
 
         var startPoint = new MousePoint(start.X, start.Y);
         var endPoint = new MousePoint(x, y);
-        if (startPoint == endPoint && (!curvePoint.HasValue || curvePoint == startPoint))
+        if (startPoint == endPoint)
             return;
+
+        var curvePoint = path == MousePathMode.GentleArc
+            ? GetGentleArcControlPoint(startPoint, endPoint, ScreenTools.VirtualScreenRegion())
+            : null;
 
         // Respect the duration the user selected. A 50 ms smooth move should take
         // about 50 ms even across a long distance. We still submit intermediate
@@ -332,6 +336,45 @@ internal static class InputController
                 NativeMethods.timeEndPeriod(1);
             }
         }, token);
+    }
+
+    internal static MousePoint? GetGentleArcControlPoint(MousePoint start, MousePoint end, ScreenRegion desktop)
+    {
+        if (start == end || !desktop.Contains(start) || !desktop.Contains(end))
+            return null;
+
+        var dx = (double)end.X - start.X;
+        var dy = (double)end.Y - start.Y;
+        var distance = Math.Sqrt(dx * dx + dy * dy);
+        var normalX = -dy / distance;
+        var normalY = dx / distance;
+        var middleX = start.X + dx / 2.0;
+        var middleY = start.Y + dy / 2.0;
+        var right = desktop.X + (double)desktop.Width - 1;
+        var bottom = desktop.Y + (double)desktop.Height - 1;
+
+        static double RoomOnAxis(double position, double direction, double min, double max) => direction switch
+        {
+            > 0 => (max - position) / direction,
+            < 0 => (min - position) / direction,
+            _ => double.PositiveInfinity
+        };
+
+        // Use the side with more room. Keeping the control point inside the
+        // desktop also keeps the entire quadratic path inside its bounds.
+        var positiveRoom = Math.Min(RoomOnAxis(middleX, normalX, desktop.X, right),
+            RoomOnAxis(middleY, normalY, desktop.Y, bottom));
+        var negativeRoom = Math.Min(RoomOnAxis(middleX, -normalX, desktop.X, right),
+            RoomOnAxis(middleY, -normalY, desktop.Y, bottom));
+        var offset = Math.Min(Math.Min(distance * 0.24, 160.0), Math.Max(positiveRoom, negativeRoom));
+        if (offset < 1.0)
+            return null;
+
+        if (negativeRoom > positiveRoom)
+            offset = -offset;
+
+        return new MousePoint((int)Math.Round(middleX + normalX * offset),
+            (int)Math.Round(middleY + normalY * offset));
     }
 
     internal static MousePoint PointOnMousePath(MousePoint start, MousePoint end, double progress, MousePoint? curvePoint)

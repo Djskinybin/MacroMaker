@@ -16,9 +16,9 @@
     <Company>MacroMaker</Company>
     <Authors>MacroMaker</Authors>
     <ApplicationIcon>Assets\MacroMaker.ico</ApplicationIcon>
-    <Version>1.2.5</Version>
-    <AssemblyVersion>1.2.5.0</AssemblyVersion>
-    <FileVersion>1.2.5.0</FileVersion>
+    <Version>1.2.6</Version>
+    <AssemblyVersion>1.2.6.0</AssemblyVersion>
+    <FileVersion>1.2.6.0</FileVersion>
 
     <!-- Release publishing: normal users only need MacroMaker.exe -->
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
