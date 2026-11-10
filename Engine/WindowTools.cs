@@ -65,8 +65,10 @@ internal static class WindowTools
     }
 
     public static bool TryGetForegroundRect(out ScreenRegion region)
+        => TryGetWindowRect(NativeMethods.GetForegroundWindow(), out region);
+
+    internal static bool TryGetWindowRect(IntPtr handle, out ScreenRegion region)
     {
-        var handle = NativeMethods.GetForegroundWindow();
         if (handle != IntPtr.Zero && NativeMethods.GetWindowRect(handle, out var rect))
         {
             region = new ScreenRegion(rect.Left, rect.Top, Math.Max(0, rect.Right - rect.Left), Math.Max(0, rect.Bottom - rect.Top));
