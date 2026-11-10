@@ -1301,9 +1301,7 @@ public partial class MainWindow : Window
             block.Children.Clear();
             block.Children.AddRange(captured);
 
-            MarkDirty();
-            RefreshCommandList(block.Id);
-            BuildProperties(block);
+            CommitPropertyEdit(block);
             StatusText.Text = $"Recorded {captured.Count} commands";
         }
         catch (Exception ex)
@@ -2119,11 +2117,14 @@ public partial class MainWindow : Window
             return;
 
         foreach (var row in rows)
+        {
             row.Command!.Enabled = enabled;
+            row.RefreshDisplay();
+        }
 
-        var ids = rows.Select(row => row.Command!.Id).ToList();
         MarkDirty();
-        RefreshCommandList(_selectedRow?.Command?.Id, ids);
+        if (CommandList.SelectedItems.Count == 1 && _selectedRow?.Command is { } command)
+            BuildProperties(command);
         StatusText.Text = enabled
             ? (rows.Count == 1 ? "Command enabled" : $"{rows.Count} commands enabled")
             : (rows.Count == 1 ? "Command disabled" : $"{rows.Count} commands disabled");
@@ -2814,7 +2815,6 @@ public partial class MainWindow : Window
         }
         else if (selectId.HasValue)
         {
-            // Keep a multi-selection together when a property refreshes the active command.
             idsToSelect = previousSelectedIds.Count > 1 && previousSelectedIds.Contains(selectId.Value)
                 ? previousSelectedIds
                 : new HashSet<Guid> { selectId.Value };
@@ -2976,7 +2976,7 @@ public partial class MainWindow : Window
                 Branch = CommandBranch.Else,
                 IsCollapsed = isCollapsed,
                 CompactLabels = _appSettings.CompactBlockLabels,
-                DisplayOverride = ElseIfDisplay(command)
+                IsElseIfRow = true
             });
 
             if (isCollapsed)
@@ -3014,15 +3014,6 @@ public partial class MainWindow : Window
             FlattenCommands(command.ElseChildren, rows, depth + 1, CommandBranch.Else, command);
             return;
         }
-    }
-
-    private static string ElseIfDisplay(MacroCommand command)
-    {
-        var display = command.DisplayText();
-        var index = display.IndexOf("If ", StringComparison.OrdinalIgnoreCase);
-        return index >= 0
-            ? display[..index] + "Else if " + display[(index + 3)..]
-            : "Else If — " + display;
     }
 
     // ---------------- PROPERTIES ----------------
@@ -3361,14 +3352,12 @@ public partial class MainWindow : Window
         mouseMovement.Checked += (_, _) =>
         {
             command.RecordMouseMovement = true;
-            MarkDirtyAndRefresh(command.Id);
-            BuildProperties(command);
+            CommitPropertyEdit(command);
         };
         mouseMovement.Unchecked += (_, _) =>
         {
             command.RecordMouseMovement = false;
-            MarkDirtyAndRefresh(command.Id);
-            BuildProperties(command);
+            CommitPropertyEdit(command);
         };
         PropertiesPanel.Children.Add(mouseMovement);
 
@@ -3437,9 +3426,7 @@ public partial class MainWindow : Window
                 var item = command.Children[index];
                 command.Children.RemoveAt(index);
                 command.Children.Insert(index - 1, item);
-                MarkDirty();
-                RefreshCommandList(command.Id);
-                BuildProperties(command);
+                CommitPropertyEdit(command);
             };
             down.Click += (_, _) =>
             {
@@ -3447,17 +3434,13 @@ public partial class MainWindow : Window
                 var item = command.Children[index];
                 command.Children.RemoveAt(index);
                 command.Children.Insert(index + 1, item);
-                MarkDirty();
-                RefreshCommandList(command.Id);
-                BuildProperties(command);
+                CommitPropertyEdit(command);
             };
             remove.Click += (_, _) =>
             {
                 if (index < 0 || index >= command.Children.Count) return;
                 command.Children.RemoveAt(index);
-                MarkDirty();
-                RefreshCommandList(command.Id);
-                BuildProperties(command);
+                CommitPropertyEdit(command);
             };
 
             Grid.SetColumn(text, 0);
@@ -3638,9 +3621,7 @@ public partial class MainWindow : Window
                 extra.SearchHeight = Math.Max(1, command.SearchHeight);
             }
             command.ColorSearchTargets.Add(extra);
-            MarkDirty();
-            BuildProperties(command);
-            RefreshCommandList(command.Id);
+            CommitPropertyEdit(command);
         };
         PropertiesPanel.Children.Add(add);
     }
@@ -3675,9 +3656,7 @@ public partial class MainWindow : Window
         remove.Click += (_, _) =>
         {
             command.ColorSearchTargets.Remove(target);
-            MarkDirty();
-            BuildProperties(command);
-            RefreshCommandList(command.Id);
+            CommitPropertyEdit(command);
         };
         panel.Children.Add(header);
 
@@ -3691,26 +3670,14 @@ public partial class MainWindow : Window
             var pick = new Button { Content = "Pick Location", Margin = new Thickness(0, 0, 0, 4) };
             pick.Click += (_, _) =>
             {
-                var picker = new PointPickerWindow(false);
-                Hide();
-                try
-                {
-                    if (picker.ShowDialog() == true)
-                    {
-                        target.X = picker.PickedX;
-                        target.Y = picker.PickedY;
-                        target.XExpression = string.Empty;
-                        target.YExpression = string.Empty;
-                        MarkDirty();
-                    }
-                }
-                finally
-                {
-                    Show();
-                    Activate();
-                }
-                BuildProperties(command);
-                RefreshCommandList(command.Id);
+                if (ReadMousePoint() is not { } point)
+                    return;
+
+                target.X = point.X;
+                target.Y = point.Y;
+                target.XExpression = string.Empty;
+                target.YExpression = string.Empty;
+                CommitPropertyEdit(command);
             };
             panel.Children.Add(pick);
         }
@@ -3729,30 +3696,18 @@ public partial class MainWindow : Window
             pick.Click += (_, _) =>
             {
                 var picker = new RegionPickerWindow();
-                Hide();
-                try
-                {
-                    if (picker.ShowDialog() == true)
-                    {
-                        target.SearchX = picker.Region.X;
-                        target.SearchY = picker.Region.Y;
-                        target.SearchWidth = picker.Region.Width;
-                        target.SearchHeight = picker.Region.Height;
-                        target.SearchXExpression = string.Empty;
-                        target.SearchYExpression = string.Empty;
-                        target.SearchWidthExpression = string.Empty;
-                        target.SearchHeightExpression = string.Empty;
-                        MarkDirty();
-                    }
-                }
-                finally
-                {
-                    Show();
-                    WindowState = System.Windows.WindowState.Normal;
-                    Activate();
-                }
-                BuildProperties(command);
-                RefreshCommandList(command.Id);
+                if (ReadMousePicker(picker, () => picker.Region) is not { } region)
+                    return;
+
+                target.SearchX = region.X;
+                target.SearchY = region.Y;
+                target.SearchWidth = region.Width;
+                target.SearchHeight = region.Height;
+                target.SearchXExpression = string.Empty;
+                target.SearchYExpression = string.Empty;
+                target.SearchWidthExpression = string.Empty;
+                target.SearchHeightExpression = string.Empty;
+                CommitPropertyEdit(command);
             };
             panel.Children.Add(pick);
         }
@@ -3922,9 +3877,7 @@ public partial class MainWindow : Window
         add.Click += (_, _) =>
         {
             command.ColorAlternatives.Add(new ColorMatchOption());
-            MarkDirty();
-            BuildProperties(command);
-            RefreshCommandList(command.Id);
+            CommitPropertyEdit(command);
         };
         PropertiesPanel.Children.Add(add);
     }
@@ -3959,9 +3912,7 @@ public partial class MainWindow : Window
                 if (option is null)
                     return;
                 command.ColorAlternatives.Remove(option);
-                MarkDirty();
-                BuildProperties(command);
-                RefreshCommandList(command.Id);
+                CommitPropertyEdit(command);
             };
         }
         panel.Children.Add(header);
@@ -4039,7 +3990,7 @@ public partial class MainWindow : Window
                 ? (picker.PickedX - origin.X, picker.PickedY - origin.Y)
                 : null;
             ApplyPickedColor(command, option, picker.PickedColor, position);
-            MarkDirtyAndRefresh(command.Id);
+            CommitPropertyEdit(command);
             if (picksPosition && !canSavePosition)
                 StatusText.Text = "Color saved. Focus the target window first to pick its location.";
         };
@@ -4225,26 +4176,14 @@ public partial class MainWindow : Window
         var set = new Button { Content = "Pick Location", Margin = new Thickness(0, 0, 0, 12) };
         set.Click += (_, _) =>
         {
-            var picker = new PointPickerWindow(false);
-            Hide();
-            try
-            {
-                if (picker.ShowDialog() == true)
-                {
-                    command.X = picker.PickedX;
-                    command.Y = picker.PickedY;
-                    command.XExpression = string.Empty;
-                    command.YExpression = string.Empty;
-                    MarkDirty();
-                }
-            }
-            finally
-            {
-                Show();
-                Activate();
-            }
-            BuildProperties(command);
-            RefreshCommandList(command.Id);
+            if (ReadMousePoint() is not { } point)
+                return;
+
+            command.X = point.X;
+            command.Y = point.Y;
+            command.XExpression = string.Empty;
+            command.YExpression = string.Empty;
+            CommitPropertyEdit(command);
         };
         PropertiesPanel.Children.Add(set);
         AddLocationOptionsExpander(command, command.Type == CommandType.DragMouse);
@@ -4323,26 +4262,14 @@ public partial class MainWindow : Window
         var set = new Button { Content = "Pick End Location", Margin = new Thickness(0, 0, 0, 12) };
         set.Click += (_, _) =>
         {
-            var picker = new PointPickerWindow(false);
-            Hide();
-            try
-            {
-                if (picker.ShowDialog() == true)
-                {
-                    command.EndX = picker.PickedX;
-                    command.EndY = picker.PickedY;
-                    command.EndXExpression = string.Empty;
-                    command.EndYExpression = string.Empty;
-                    MarkDirty();
-                }
-            }
-            finally
-            {
-                Show();
-                Activate();
-            }
-            BuildProperties(command);
-            RefreshCommandList(command.Id);
+            if (ReadMousePoint() is not { } point)
+                return;
+
+            command.EndX = point.X;
+            command.EndY = point.Y;
+            command.EndXExpression = string.Empty;
+            command.EndYExpression = string.Empty;
+            CommitPropertyEdit(command);
         };
         PropertiesPanel.Children.Add(set);
     }
@@ -4378,33 +4305,19 @@ public partial class MainWindow : Window
         setRegion.Click += (_, _) =>
         {
             var picker = new RegionPickerWindow();
-            Hide();
-            try
-            {
-                if (picker.ShowDialog() == true)
-                {
-                    command.SearchX = picker.Region.X;
-                    command.SearchY = picker.Region.Y;
-                    command.SearchWidth = picker.Region.Width;
-                    command.SearchHeight = picker.Region.Height;
-                    MarkDirty();
-                }
-            }
-            finally
-            {
-                Show();
-                WindowState = System.Windows.WindowState.Normal;
-                Activate();
-            }
-            BuildProperties(command);
-            RefreshCommandList(command.Id);
+            if (ReadMousePicker(picker, () => picker.Region) is not { } region)
+                return;
+
+            command.SearchX = region.X;
+            command.SearchY = region.Y;
+            command.SearchWidth = region.Width;
+            command.SearchHeight = region.Height;
+            CommitPropertyEdit(command);
         };
         fullRegion.Click += (_, _) =>
         {
             command.SearchX = command.SearchY = command.SearchWidth = command.SearchHeight = 0;
-            MarkDirty();
-            BuildProperties(command);
-            RefreshCommandList(command.Id);
+            CommitPropertyEdit(command);
         };
         Grid.SetColumn(setRegion, 0);
         buttons.Children.Add(setRegion);
@@ -4558,9 +4471,7 @@ public partial class MainWindow : Window
                         command.ImagePriority.Clear();
                     }
 
-                    MarkDirty();
-                    BuildProperties(command);
-                    RefreshCommandList(command.Id);
+                    CommitPropertyEdit(command);
                 };
                 PropertiesPanel.Children.Add(chooseLibrary);
             }
@@ -4603,9 +4514,7 @@ public partial class MainWindow : Window
                 command.ImagePath = ImportImageFile(dialog.FileName);
                 command.ImageFolder = string.Empty;
                 command.ImagePriority.Clear();
-                MarkDirty();
-                BuildProperties(command);
-                RefreshCommandList(command.Id);
+                CommitPropertyEdit(command);
             }
             catch (Exception ex)
             {
@@ -4632,9 +4541,7 @@ public partial class MainWindow : Window
                 command.ImagePath = string.Empty;
                 command.ImagePriority.Clear();
                 SyncImagePriority(command);
-                MarkDirty();
-                BuildProperties(command);
-                RefreshCommandList(command.Id);
+                CommitPropertyEdit(command);
             }
             catch (Exception ex)
             {
@@ -4687,9 +4594,7 @@ public partial class MainWindow : Window
             command.ImagePath = ProjectPaths.MakeRelative(destination);
             command.ImageFolder = string.Empty;
             command.ImagePriority.Clear();
-            MarkDirty();
-            BuildProperties(command);
-            RefreshCommandList(command.Id);
+            CommitPropertyEdit(command);
         };
 
         Grid.SetColumn(chooseImage, 0);
@@ -4725,32 +4630,19 @@ public partial class MainWindow : Window
         setRegion.Click += (_, _) =>
         {
             var picker = new RegionPickerWindow();
-            Hide();
-            try
-            {
-                if (picker.ShowDialog() == true)
-                {
-                    command.SearchX = picker.Region.X;
-                    command.SearchY = picker.Region.Y;
-                    command.SearchWidth = picker.Region.Width;
-                    command.SearchHeight = picker.Region.Height;
-                    MarkDirty();
-                }
-            }
-            finally
-            {
-                Show();
-                Activate();
-            }
-            BuildProperties(command);
-            RefreshCommandList(command.Id);
+            if (ReadMousePicker(picker, () => picker.Region) is not { } region)
+                return;
+
+            command.SearchX = region.X;
+            command.SearchY = region.Y;
+            command.SearchWidth = region.Width;
+            command.SearchHeight = region.Height;
+            CommitPropertyEdit(command);
         };
         fullRegion.Click += (_, _) =>
         {
             command.SearchX = command.SearchY = command.SearchWidth = command.SearchHeight = 0;
-            MarkDirty();
-            BuildProperties(command);
-            RefreshCommandList(command.Id);
+            CommitPropertyEdit(command);
         };
         Grid.SetColumn(setRegion, 0);
         Grid.SetColumn(fullRegion, 1);
@@ -4832,18 +4724,14 @@ public partial class MainWindow : Window
             command.ImageIncludeSubfolders = true;
             command.ImagePriority.Clear();
             SyncImagePriority(command);
-            MarkDirty();
-            BuildProperties(command);
-            RefreshCommandList(command.Id);
+            CommitPropertyEdit(command);
         };
         includeSubfolders.Unchecked += (_, _) =>
         {
             command.ImageIncludeSubfolders = false;
             command.ImagePriority.Clear();
             SyncImagePriority(command);
-            MarkDirty();
-            BuildProperties(command);
-            RefreshCommandList(command.Id);
+            CommitPropertyEdit(command);
         };
         PropertiesPanel.Children.Add(includeSubfolders);
 
@@ -4886,9 +4774,8 @@ public partial class MainWindow : Window
 
             (command.ImagePriority[index - 1], command.ImagePriority[index]) =
                 (command.ImagePriority[index], command.ImagePriority[index - 1]);
-            MarkDirty();
+            MarkDirtyAndRefreshCommandDisplay(command.Id);
             RefreshPriorityList(index - 1);
-            RefreshCommandList(command.Id);
         };
 
         down.Click += (_, _) =>
@@ -4899,18 +4786,16 @@ public partial class MainWindow : Window
 
             (command.ImagePriority[index + 1], command.ImagePriority[index]) =
                 (command.ImagePriority[index], command.ImagePriority[index + 1]);
-            MarkDirty();
+            MarkDirtyAndRefreshCommandDisplay(command.Id);
             RefreshPriorityList(index + 1);
-            RefreshCommandList(command.Id);
         };
 
         refresh.Click += (_, _) =>
         {
             var selected = list.SelectedIndex;
             SyncImagePriority(command);
-            MarkDirty();
+            MarkDirtyAndRefreshCommandDisplay(command.Id);
             RefreshPriorityList(Math.Min(selected, command.ImagePriority.Count - 1));
-            RefreshCommandList(command.Id);
         };
 
         Grid.SetColumn(up, 0);
@@ -5643,7 +5528,7 @@ public partial class MainWindow : Window
             Dispatcher.BeginInvoke(DispatcherPriority.Background, () =>
             {
                 if (_selectedRow?.Command == command && PropertiesPanel.IsAncestorOf(combo))
-                    RefreshCommandList(command.Id);
+                    BuildProperties(command);
             });
         }
 
@@ -5662,10 +5547,11 @@ public partial class MainWindow : Window
         combo.DropDownClosed += OnDropDownClosed;
     }
 
-    private void MarkDirtyAndRefresh(Guid? selectedId)
+    private void CommitPropertyEdit(MacroCommand command)
     {
-        MarkDirty();
-        RefreshCommandList(selectedId);
+        MarkDirtyAndRefreshCommandDisplay(command.Id);
+        if (_selectedRow?.Command == command && CommandList.SelectedItems.Count == 1)
+            BuildProperties(command);
     }
 
     private void MarkDirtyAndRefreshCommandDisplay(Guid? selectedId)

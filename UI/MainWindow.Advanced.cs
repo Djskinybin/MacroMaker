@@ -225,9 +225,7 @@ public partial class MainWindow
             return;
 
         command.CustomName = dialog.Value.Trim();
-        MarkDirty();
-        RefreshCommandList(command.Id);
-        BuildProperties(command);
+        CommitPropertyEdit(command);
     }
 
     private void CopySelectedProperties()
@@ -252,9 +250,7 @@ public partial class MainWindow
         }
 
         CopyCommandProperties(target, _copiedProperties);
-        MarkDirty();
-        RefreshCommandList(target.Id);
-        BuildProperties(target);
+        CommitPropertyEdit(target);
         StatusText.Text = "Properties pasted";
     }
 
@@ -305,8 +301,8 @@ public partial class MainWindow
             IsChecked = command.Enabled,
             Margin = new Thickness(0, 0, 0, 10)
         };
-        enabled.Checked += (_, _) => { if (!command.Enabled) { command.Enabled = true; MarkDirtyAndRefresh(command.Id); } };
-        enabled.Unchecked += (_, _) => { if (command.Enabled) { command.Enabled = false; MarkDirtyAndRefresh(command.Id); } };
+        enabled.Checked += (_, _) => { if (!command.Enabled) { command.Enabled = true; CommitPropertyEdit(command); } };
+        enabled.Unchecked += (_, _) => { if (command.Enabled) { command.Enabled = false; CommitPropertyEdit(command); } };
         PropertiesPanel.Children.Add(enabled);
 
         AddTextField("Custom name (optional)", command.CustomName, value => command.CustomName = value, allowVariables: false);
@@ -591,7 +587,7 @@ public partial class MainWindow
             if (!command.Enabled)
             {
                 command.Enabled = true;
-                MarkDirtyAndRefresh(command.Id);
+                CommitPropertyEdit(command);
             }
         };
         enabled.Unchecked += (_, _) =>
@@ -599,7 +595,7 @@ public partial class MainWindow
             if (command.Enabled)
             {
                 command.Enabled = false;
-                MarkDirtyAndRefresh(command.Id);
+                CommitPropertyEdit(command);
             }
         };
         panel.Children.Add(enabled);
@@ -763,8 +759,8 @@ public partial class MainWindow
         if (showAppend)
         {
             var append = new CheckBox { Content = "Append instead of replace", IsChecked = command.AppendFile, Margin = new Thickness(0, 0, 0, 10) };
-            append.Checked += (_, _) => { command.AppendFile = true; MarkDirtyAndRefresh(command.Id); };
-            append.Unchecked += (_, _) => { command.AppendFile = false; MarkDirtyAndRefresh(command.Id); };
+            append.Checked += (_, _) => { command.AppendFile = true; CommitPropertyEdit(command); };
+            append.Unchecked += (_, _) => { command.AppendFile = false; CommitPropertyEdit(command); };
             PropertiesPanel.Children.Add(append);
         }
     }
