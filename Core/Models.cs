@@ -142,6 +142,12 @@ public enum MouseTargetMode
     RandomSavedPoint
 }
 
+public enum MousePathMode
+{
+    Straight,
+    GentleArc
+}
+
 public readonly record struct MousePoint(int X, int Y);
 
 public enum CoordinateMode
@@ -310,8 +316,21 @@ public sealed class MacroCommand
     public ScreenRegion? MouseTargetArea { get; set; }
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public List<MousePoint>? MouseTargetPoints { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public MousePathMode MousePathMode { get; set; }
+
+    [JsonPropertyName("MouseCurvePoint")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public MousePoint? MouseCurvePoint { get; set; }
+    public MousePoint? LegacyMouseCurvePoint
+    {
+        get => null;
+        set
+        {
+            // v1.2.5 saved a manual control point. A non-null point opted into a curve.
+            if (value.HasValue)
+                MousePathMode = MousePathMode.GentleArc;
+        }
+    }
     public int ClickDelayMs { get; set; } = 100;
     // null means an older macro that used the legacy click-at-X/Y behavior.
     // New click commands explicitly default this to false so they click wherever
@@ -461,7 +480,7 @@ public sealed class MacroCommand
             MouseTargetMode = MouseTargetMode,
             MouseTargetArea = MouseTargetArea,
             MouseTargetPoints = MouseTargetPoints?.ToList(),
-            MouseCurvePoint = MouseCurvePoint,
+            MousePathMode = MousePathMode,
             ClickDelayMs = ClickDelayMs,
             MoveBeforeClick = MoveBeforeClick,
             ScrollAmount = ScrollAmount,
@@ -550,7 +569,7 @@ public sealed class MacroCommand
             CommandType.Comment => $"// {Text}",
             CommandType.MoveMouse => EffectiveMoveMode() == MouseMoveMode.Teleport
                 ? $"Move mouse to {MouseTargetDisplay(x, y)} (teleport){MouseTargetCoordinateSuffix()}"
-                : $"Move mouse to {MouseTargetDisplay(x, y)} {(MouseCurvePoint.HasValue ? "along a curve" : "smoothly")} over {NumberDisplay(nameof(MoveDurationMs), MoveDurationMs)} ms{MouseTargetCoordinateSuffix()}",
+                : $"Move mouse to {MouseTargetDisplay(x, y)} {(MousePathMode == MousePathMode.GentleArc ? "along a gentle arc" : "smoothly")} over {NumberDisplay(nameof(MoveDurationMs), MoveDurationMs)} ms{MouseTargetCoordinateSuffix()}",
             CommandType.Click => ClickDisplay("Click", x, y),
             CommandType.DoubleClick => ClickDisplay("Double click", x, y),
             CommandType.RightClick => ClickDisplay("Right click", x, y),
@@ -734,7 +753,7 @@ public sealed class MacroCommand
         : MouseMoveMode;
 
     private string MoveSuffix() => EffectiveMoveMode() == MouseMoveMode.Smooth
-        ? $" ({(HasMouseDestination && MouseCurvePoint.HasValue ? "curve" : "smooth")} {NumberDisplay(nameof(MoveDurationMs), MoveDurationMs)} ms)"
+        ? $" ({(HasMouseDestination && MousePathMode == MousePathMode.GentleArc ? "arc" : "smooth")} {NumberDisplay(nameof(MoveDurationMs), MoveDurationMs)} ms)"
         : " (teleport)";
 
     private string CoordinateSuffix() => CoordinateMode switch

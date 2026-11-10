@@ -108,34 +108,30 @@ public partial class MainWindow
         PropertiesPanel.Children.Add(buttons);
     }
 
-    private void AddMouseCurveFields(MacroCommand command)
+    private void AddMousePathField(MacroCommand command)
     {
-        AddInfo(command.MouseCurvePoint is { } point
-            ? $"Path curves toward screen point {point.X}, {point.Y}."
-            : "Path follows a straight line.");
-        var buttons = new WrapPanel { Margin = new Thickness(0, 0, 0, 10) };
-        var pick = new Button { Content = "Pick Curve Point", Margin = new Thickness(0, 0, 6, 0) };
-        pick.Click += (_, _) =>
+        AddLabel("Path");
+        var path = new ComboBox { Margin = new Thickness(0, 0, 0, 10) };
+        var straight = new ComboBoxItem { Content = "Straight", Tag = MousePathMode.Straight };
+        var arc = new ComboBoxItem
         {
-            if (ReadMousePoint() is not { } selected)
+            Content = "Gentle Arc",
+            Tag = MousePathMode.GentleArc,
+            ToolTip = "Choose a fresh, gentle bend for each move"
+        };
+        path.Items.Add(straight);
+        path.Items.Add(arc);
+        path.SelectedItem = command.MousePathMode == MousePathMode.GentleArc ? arc : straight;
+        AutomationProperties.SetName(path, "Path");
+        path.SelectionChanged += (_, _) =>
+        {
+            if (path.SelectedItem is not ComboBoxItem { Tag: MousePathMode selected } || selected == command.MousePathMode)
                 return;
 
-            command.MouseCurvePoint = selected;
-            MarkDirtyAndRefresh(command.Id);
+            command.MousePathMode = selected;
+            MarkDirtyAndRefreshCommandDisplay(command.Id);
         };
-        buttons.Children.Add(pick);
-        if (command.MouseCurvePoint.HasValue)
-        {
-            var clear = new Button { Content = "Use Straight Path" };
-            clear.Click += (_, _) =>
-            {
-                command.MouseCurvePoint = null;
-                MarkDirtyAndRefresh(command.Id);
-            };
-            buttons.Children.Add(clear);
-        }
-
-        PropertiesPanel.Children.Add(buttons);
+        PropertiesPanel.Children.Add(path);
     }
 
     private MousePoint? ReadMousePoint()
