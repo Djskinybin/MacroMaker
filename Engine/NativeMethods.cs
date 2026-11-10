@@ -338,7 +338,8 @@ internal static class InputController
         }, token);
     }
 
-    internal static MousePoint? GetGentleArcControlPoint(MousePoint start, MousePoint end, ScreenRegion desktop)
+    internal static MousePoint? GetGentleArcControlPoint(
+        MousePoint start, MousePoint end, ScreenRegion desktop, Random? random = null)
     {
         if (start == end || !desktop.Contains(start) || !desktop.Contains(end))
             return null;
@@ -360,17 +361,24 @@ internal static class InputController
             _ => double.PositiveInfinity
         };
 
-        // Use the side with more room. Keeping the control point inside the
-        // desktop also keeps the entire quadratic path inside its bounds.
+        // Keep the control point within the desktop so the entire path fits.
+        // Near an edge, favor the side with room for the full bend.
         var positiveRoom = Math.Min(RoomOnAxis(middleX, normalX, desktop.X, right),
             RoomOnAxis(middleY, normalY, desktop.Y, bottom));
         var negativeRoom = Math.Min(RoomOnAxis(middleX, -normalX, desktop.X, right),
             RoomOnAxis(middleY, -normalY, desktop.Y, bottom));
-        var offset = Math.Min(Math.Min(distance * 0.24, 160.0), Math.Max(positiveRoom, negativeRoom));
-        if (offset < 1.0)
+        var requestedMaximum = Math.Min(distance * 0.24, 160.0);
+        var maximum = Math.Min(requestedMaximum, Math.Max(positiveRoom, negativeRoom));
+        if (maximum < 1.0)
             return null;
 
-        if (negativeRoom > positiveRoom)
+        random ??= Random.Shared;
+        var minimum = Math.Max(1.0, maximum / 2.0);
+        var offset = minimum + (maximum - minimum) * random.NextDouble();
+        var usePositiveSide = positiveRoom >= requestedMaximum && negativeRoom >= requestedMaximum
+            ? random.Next(2) == 0
+            : positiveRoom >= negativeRoom;
+        if (!usePositiveSide)
             offset = -offset;
 
         return new MousePoint((int)Math.Round(middleX + normalX * offset),

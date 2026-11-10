@@ -117,7 +117,7 @@ public partial class MainWindow
         {
             Content = "Gentle Arc",
             Tag = MousePathMode.GentleArc,
-            ToolTip = "Curve automatically between the current cursor and the destination"
+            ToolTip = "Choose a fresh, gentle bend for each move"
         };
         path.Items.Add(straight);
         path.Items.Add(arc);
