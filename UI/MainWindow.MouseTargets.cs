@@ -117,7 +117,7 @@ public partial class MainWindow
         {
             Content = "Gentle Arc",
             Tag = MousePathMode.GentleArc,
-            ToolTip = "Choose a fresh, gentle bend for each move"
+            ToolTip = "Vary where and how much the path bends on each move"
         };
         path.Items.Add(straight);
         path.Items.Add(arc);

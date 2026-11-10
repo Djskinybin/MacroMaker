@@ -293,8 +293,8 @@ internal static class InputController
         if (startPoint == endPoint)
             return;
 
-        var curvePoint = path == MousePathMode.GentleArc
-            ? GetGentleArcControlPoint(startPoint, endPoint, ScreenTools.VirtualScreenRegion())
+        var arc = path == MousePathMode.GentleArc
+            ? GetGentleArcControlPoints(startPoint, endPoint, ScreenTools.VirtualScreenRegion())
             : null;
 
         // Respect the duration the user selected. A 50 ms smooth move should take
@@ -317,7 +317,7 @@ internal static class InputController
                     var t = Math.Clamp(sw.Elapsed.TotalMilliseconds / smoothDurationMs, 0.0, 1.0);
                     // Smoothstep removes the harsh start/stop of a linear cursor path.
                     var eased = t * t * (3.0 - 2.0 * t);
-                    var (nx, ny) = PointOnMousePath(startPoint, endPoint, eased, curvePoint);
+                    var (nx, ny) = PointOnMousePath(startPoint, endPoint, eased, arc);
 
                     if (nx != lastX || ny != lastY)
                     {
@@ -338,21 +338,21 @@ internal static class InputController
         }, token);
     }
 
-    internal static MousePoint? GetGentleArcControlPoint(
+    internal static (MousePoint First, MousePoint Second)? GetGentleArcControlPoints(
         MousePoint start, MousePoint end, ScreenRegion desktop, Random? random = null)
     {
         if (start == end || !desktop.Contains(start) || !desktop.Contains(end))
             return null;
 
+        random ??= Random.Shared;
         var dx = (double)end.X - start.X;
         var dy = (double)end.Y - start.Y;
         var distance = Math.Sqrt(dx * dx + dy * dy);
         var normalX = -dy / distance;
         var normalY = dx / distance;
-        var middleX = start.X + dx / 2.0;
-        var middleY = start.Y + dy / 2.0;
         var right = desktop.X + (double)desktop.Width - 1;
         var bottom = desktop.Y + (double)desktop.Height - 1;
+        var requestedMaximum = Math.Min(distance * 0.18, 120.0);
 
         static double RoomOnAxis(double position, double direction, double min, double max) => direction switch
         {
@@ -361,33 +361,47 @@ internal static class InputController
             _ => double.PositiveInfinity
         };
 
-        // Keep the control point within the desktop so the entire path fits.
-        // Near an edge, favor the side with room for the full bend.
-        var positiveRoom = Math.Min(RoomOnAxis(middleX, normalX, desktop.X, right),
-            RoomOnAxis(middleY, normalY, desktop.Y, bottom));
-        var negativeRoom = Math.Min(RoomOnAxis(middleX, -normalX, desktop.X, right),
-            RoomOnAxis(middleY, -normalY, desktop.Y, bottom));
-        var requestedMaximum = Math.Min(distance * 0.24, 160.0);
-        var maximum = Math.Min(requestedMaximum, Math.Max(positiveRoom, negativeRoom));
-        if (maximum < 1.0)
+        MousePoint? ChooseBend(double position)
+        {
+            var x = start.X + dx * position;
+            var y = start.Y + dy * position;
+            var positiveRoom = Math.Min(RoomOnAxis(x, normalX, desktop.X, right),
+                RoomOnAxis(y, normalY, desktop.Y, bottom));
+            var negativeRoom = Math.Min(RoomOnAxis(x, -normalX, desktop.X, right),
+                RoomOnAxis(y, -normalY, desktop.Y, bottom));
+            var maximum = Math.Min(requestedMaximum, Math.Max(positiveRoom, negativeRoom));
+            if (maximum < 1.0)
+                return null;
+
+            var minimum = Math.Max(1.0, maximum * 0.35);
+            var offset = minimum + (maximum - minimum) * random.NextDouble();
+            var usePositiveSide = positiveRoom >= requestedMaximum && negativeRoom >= requestedMaximum
+                ? random.Next(2) == 0
+                : positiveRoom >= negativeRoom;
+            if (!usePositiveSide)
+                offset = -offset;
+
+            return new MousePoint((int)Math.Round(x + normalX * offset),
+                (int)Math.Round(y + normalY * offset));
+        }
+
+        // Sample the early and late bends independently so paths can peak at
+        // different points or change sides, even with the same endpoints.
+        var firstPosition = 0.18 + 0.24 * random.NextDouble();
+        var secondPosition = 0.58 + 0.24 * random.NextDouble();
+        var first = ChooseBend(firstPosition);
+        var second = ChooseBend(secondPosition);
+        if (!first.HasValue && !second.HasValue)
             return null;
 
-        random ??= Random.Shared;
-        var minimum = Math.Max(1.0, maximum / 2.0);
-        var offset = minimum + (maximum - minimum) * random.NextDouble();
-        var usePositiveSide = positiveRoom >= requestedMaximum && negativeRoom >= requestedMaximum
-            ? random.Next(2) == 0
-            : positiveRoom >= negativeRoom;
-        if (!usePositiveSide)
-            offset = -offset;
-
-        return new MousePoint((int)Math.Round(middleX + normalX * offset),
-            (int)Math.Round(middleY + normalY * offset));
+        return (first ?? PointOnMousePath(start, end, firstPosition, null),
+            second ?? PointOnMousePath(start, end, secondPosition, null));
     }
 
-    internal static MousePoint PointOnMousePath(MousePoint start, MousePoint end, double progress, MousePoint? curvePoint)
+    internal static MousePoint PointOnMousePath(
+        MousePoint start, MousePoint end, double progress, (MousePoint First, MousePoint Second)? arc)
     {
-        if (curvePoint is not { } bend)
+        if (arc is not { } bends)
         {
             return new MousePoint(
                 (int)Math.Round(start.X + ((double)end.X - start.X) * progress),
@@ -395,12 +409,13 @@ internal static class InputController
         }
 
         var remaining = 1.0 - progress;
-        var startWeight = remaining * remaining;
-        var bendWeight = 2.0 * remaining * progress;
-        var endWeight = progress * progress;
+        var startWeight = remaining * remaining * remaining;
+        var firstWeight = 3.0 * remaining * remaining * progress;
+        var secondWeight = 3.0 * remaining * progress * progress;
+        var endWeight = progress * progress * progress;
         return new MousePoint(
-            (int)Math.Round(start.X * startWeight + bend.X * bendWeight + end.X * endWeight),
-            (int)Math.Round(start.Y * startWeight + bend.Y * bendWeight + end.Y * endWeight));
+            (int)Math.Round(start.X * startWeight + bends.First.X * firstWeight + bends.Second.X * secondWeight + end.X * endWeight),
+            (int)Math.Round(start.Y * startWeight + bends.First.Y * firstWeight + bends.Second.Y * secondWeight + end.Y * endWeight));
     }
 
     private static void SendAbsoluteMouseMove(int x, int y)
