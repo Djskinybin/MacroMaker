@@ -135,6 +135,15 @@ public enum MouseMoveMode
     Smooth
 }
 
+public enum MouseTargetMode
+{
+    Exact,
+    RandomArea,
+    RandomSavedPoint
+}
+
+public readonly record struct MousePoint(int X, int Y);
+
 public enum CoordinateMode
 {
     Screen,
@@ -295,6 +304,14 @@ public sealed class MacroCommand
     public CoordinateMode CoordinateMode { get; set; } = CoordinateMode.Screen;
     public MouseMoveMode MouseMoveMode { get; set; } = MouseMoveMode.Legacy;
     public int MoveDurationMs { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public MouseTargetMode MouseTargetMode { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public ScreenRegion? MouseTargetArea { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<MousePoint>? MouseTargetPoints { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public MousePoint? MouseCurvePoint { get; set; }
     public int ClickDelayMs { get; set; } = 100;
     // null means an older macro that used the legacy click-at-X/Y behavior.
     // New click commands explicitly default this to false so they click wherever
@@ -441,6 +458,10 @@ public sealed class MacroCommand
             CoordinateMode = CoordinateMode,
             MouseMoveMode = MouseMoveMode,
             MoveDurationMs = MoveDurationMs,
+            MouseTargetMode = MouseTargetMode,
+            MouseTargetArea = MouseTargetArea,
+            MouseTargetPoints = MouseTargetPoints?.ToList(),
+            MouseCurvePoint = MouseCurvePoint,
             ClickDelayMs = ClickDelayMs,
             MoveBeforeClick = MoveBeforeClick,
             ScrollAmount = ScrollAmount,
@@ -528,12 +549,13 @@ public sealed class MacroCommand
         {
             CommandType.Comment => $"// {Text}",
             CommandType.MoveMouse => EffectiveMoveMode() == MouseMoveMode.Teleport
-                ? $"Move mouse to {x}, {y} (teleport){CoordinateSuffix()}"
-                : $"Move mouse to {x}, {y} smoothly over {NumberDisplay(nameof(MoveDurationMs), MoveDurationMs)} ms{CoordinateSuffix()}",
+                ? $"Move mouse to {MouseTargetDisplay(x, y)} (teleport){MouseTargetCoordinateSuffix()}"
+                : $"Move mouse to {MouseTargetDisplay(x, y)} {(MouseCurvePoint.HasValue ? "along a curve" : "smoothly")} over {NumberDisplay(nameof(MoveDurationMs), MoveDurationMs)} ms{MouseTargetCoordinateSuffix()}",
             CommandType.Click => ClickDisplay("Click", x, y),
             CommandType.DoubleClick => ClickDisplay("Double click", x, y),
             CommandType.RightClick => ClickDisplay("Right click", x, y),
-            CommandType.Scroll => $"Scroll {NumberDisplay(nameof(ScrollAmount), ScrollAmount)} at {x}, {y}" + MoveSuffix() + CoordinateSuffix(),
+            CommandType.Scroll => $"Scroll {NumberDisplay(nameof(ScrollAmount), ScrollAmount)} at {MouseTargetDisplay(x, y)}"
+                + MoveSuffix() + MouseTargetCoordinateSuffix(),
             CommandType.DragMouse => $"Drag {x}, {y} → {ex}, {ey} over {NumberDisplay(nameof(DragDurationMs), DragDurationMs)} ms{CoordinateSuffix()}",
             CommandType.LeftMouseDown => "Left mouse down",
             CommandType.LeftMouseUp => "Left mouse up",
@@ -617,8 +639,37 @@ public sealed class MacroCommand
         // with false are intentionally location-free.
         if (MoveBeforeClick == false)
             return action;
-        return $"{action} {x}, {y}" + MoveSuffix() + CoordinateSuffix();
+        return $"{action} {MouseTargetDisplay(x, y)}" + MoveSuffix() + MouseTargetCoordinateSuffix();
     }
+
+    internal bool HasMouseDestination => Type switch
+    {
+        CommandType.MoveMouse or CommandType.Scroll => true,
+        CommandType.Click or CommandType.DoubleClick or CommandType.RightClick => MoveBeforeClick != false,
+        _ => false
+    };
+
+    internal string? GetMouseTargetError() => MouseTargetMode switch
+    {
+        MouseTargetMode.Exact => null,
+        MouseTargetMode.RandomArea when MouseTargetArea is { IsEmpty: false } area
+            && (long)area.X + area.Width - 1 <= int.MaxValue
+            && (long)area.Y + area.Height - 1 <= int.MaxValue => null,
+        MouseTargetMode.RandomArea => "Pick a valid destination area first.",
+        MouseTargetMode.RandomSavedPoint when MouseTargetPoints is { Count: > 0 } => null,
+        MouseTargetMode.RandomSavedPoint => "Add at least one destination point first.",
+        _ => "Choose a valid mouse destination."
+    };
+
+    private string MouseTargetDisplay(string x, string y) => MouseTargetMode switch
+    {
+        MouseTargetMode.RandomArea => "a random point in area",
+        MouseTargetMode.RandomSavedPoint => "a random saved point",
+        _ => $"{x}, {y}"
+    };
+
+    private string MouseTargetCoordinateSuffix()
+        => MouseTargetMode == MouseTargetMode.Exact ? CoordinateSuffix() : string.Empty;
 
     private string ColorOrSuffix()
     {
@@ -683,7 +734,7 @@ public sealed class MacroCommand
         : MouseMoveMode;
 
     private string MoveSuffix() => EffectiveMoveMode() == MouseMoveMode.Smooth
-        ? $" (smooth {NumberDisplay(nameof(MoveDurationMs), MoveDurationMs)} ms)"
+        ? $" ({(HasMouseDestination && MouseCurvePoint.HasValue ? "curve" : "smooth")} {NumberDisplay(nameof(MoveDurationMs), MoveDurationMs)} ms)"
         : " (teleport)";
 
     private string CoordinateSuffix() => CoordinateMode switch
@@ -803,7 +854,11 @@ public sealed class CommandRow : INotifyPropertyChanged
 
 public readonly record struct ScreenRegion(int X, int Y, int Width, int Height)
 {
+    [JsonIgnore]
     public bool IsEmpty => Width <= 0 || Height <= 0;
+
+    internal bool Contains(MousePoint point) => point.X >= X && point.Y >= Y
+        && point.X < (long)X + Width && point.Y < (long)Y + Height;
 }
 
 public readonly record struct ImageMatch(int X, int Y, int Width, int Height)
